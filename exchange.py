@@ -754,6 +754,28 @@ def get_all_open_positions():
         return []
 
 
+def get_open_interest(symbol):
+    """Current total open interest (in contracts) for a symbol. Binance
+    has no public OI websocket stream, so this is REST-polled - see
+    open_interest.py, which turns a series of these into a % change."""
+    try:
+        data = _public_rest_call(
+            f"futures_open_interest:{symbol}",
+            client.futures_open_interest,
+            symbol=symbol,
+            weight=1,
+        )
+        return float(data["openInterest"])
+
+    except Exception as exc:
+        if _is_public_rest_backoff_error(exc):
+            return None
+
+        _set_public_rest_backoff(exc, f"futures_open_interest:{symbol}")
+        log_error(f"{symbol} open interest error: {exc}")
+        return None
+
+
 def get_open_algo_orders(symbol):
     """Every open algo/conditional order (our SL/TP1/TP2) for a symbol -
     used to rebuild position tracking on startup reconciliation."""

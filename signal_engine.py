@@ -24,7 +24,10 @@ def _reject(reason, **extra):
     return {"signal": None, "reason": reason, **extra}
 
 
-def evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot):
+def evaluate(
+    symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
+    oi_snapshot=None, liquidation_snapshot=None,
+):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
 
@@ -100,6 +103,43 @@ def evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot):
                 latest_price > ema_value if side == "BUY" else latest_price < ema_value
             )
 
+    # Open Interest: informational only, NOT a gate - see
+    # config.OI_CONFIRMATION_ENABLED for rationale. Rising OI during this
+    # break points at fresh positioning, not just the other side closing.
+    oi_snapshot = oi_snapshot or {}
+    oi_change_pct = None
+    oi_rising = None
+
+    if config.OI_CONFIRMATION_ENABLED and oi_snapshot.get("available"):
+        oi_change_pct = oi_snapshot.get("oi_change_pct")
+
+        if oi_change_pct is not None:
+            oi_rising = oi_change_pct > 0
+
+    # Liquidation clustering: informational only, NOT a gate - see
+    # config.LIQUIDATION_CONFIRMATION_ENABLED for rationale. A BULLISH
+    # break aligns with long-liquidation flow (forced SELL orders as the
+    # swept low was hit); a BEARISH break aligns with short-liquidation
+    # flow (forced BUY orders as the swept high was hit).
+    liquidation_snapshot = liquidation_snapshot or {}
+    liquidation_notional_net = None
+    liquidation_cluster = None
+    liquidation_aligned = None
+
+    if config.LIQUIDATION_CONFIRMATION_ENABLED and liquidation_snapshot.get("available"):
+        liquidation_notional_net = liquidation_snapshot.get("net_liquidation_notional")
+        total_notional = (
+            liquidation_snapshot.get("long_liquidation_notional", 0)
+            + liquidation_snapshot.get("short_liquidation_notional", 0)
+        )
+        liquidation_cluster = total_notional >= config.LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT
+
+        if liquidation_notional_net is not None:
+            liquidation_aligned = (
+                liquidation_notional_net > 0 if direction == "BULLISH"
+                else liquidation_notional_net < 0
+            )
+
     if not cvd_snapshot.get("available"):
         return _reject("ORDER_FLOW_DATA_UNAVAILABLE")
 
@@ -151,4 +191,9 @@ def evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot):
         "liquidity_pools": pools,
         "ema_value": ema_value,
         "ema_aligned": ema_aligned,
+        "oi_change_pct": oi_change_pct,
+        "oi_rising": oi_rising,
+        "liquidation_notional_net": liquidation_notional_net,
+        "liquidation_cluster": liquidation_cluster,
+        "liquidation_aligned": liquidation_aligned,
     }

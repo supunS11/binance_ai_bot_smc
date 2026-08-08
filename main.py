@@ -69,8 +69,13 @@ def _evaluate_symbol(feed, symbol, positions, balance):
 
     cvd_snapshot = feed.cvd.snapshot(symbol)
     depth_snapshot = feed.depth.snapshot(symbol)
+    oi_snapshot = feed.open_interest.snapshot(symbol)
+    liquidation_snapshot = feed.liquidations.snapshot(symbol)
 
-    result = signal_engine.evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot)
+    result = signal_engine.evaluate(
+        symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
+        oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
+    )
 
     if not result.get("signal"):
         return

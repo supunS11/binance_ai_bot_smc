@@ -124,6 +124,32 @@ REQUIRE_ORDER_BLOCK_OR_FVG = env_bool("REQUIRE_ORDER_BLOCK_OR_FVG", "True")
 # accumulate before this is ever turned into a hard gate.
 EMA_CONFIRMATION_ENABLED = env_bool("EMA_CONFIRMATION_ENABLED", "True")
 EMA_CONFIRMATION_PERIOD = env_int("EMA_CONFIRMATION_PERIOD", 20)
+# Open Interest - informational only, NOT a gate (same treatment as EMA
+# above). OI rising during a directional break points at fresh
+# positioning behind the move (new longs on a bullish break, new shorts
+# on a bearish one); OI falling on the same break points at the opposite
+# side closing out instead (short-covering / long-liquidation) - a real
+# distinction, but with no evidence yet on how much it separates winners
+# from losers here. Polled via REST since Binance has no public OI
+# websocket stream (it changes far slower than kline/aggTrade anyway).
+OI_CONFIRMATION_ENABLED = env_bool("OI_CONFIRMATION_ENABLED", "True")
+OI_POLL_INTERVAL_SECONDS = env_int("OI_POLL_INTERVAL_SECONDS", 60)
+OI_LOOKBACK_SECONDS = env_int("OI_LOOKBACK_SECONDS", 900)
+OI_HISTORY_MAX_SAMPLES = env_int("OI_HISTORY_MAX_SAMPLES", 60)
+# Liquidation clustering - informational only, NOT a gate. Real forced
+# liquidations at/around a detected sweep are the closest confirmation
+# ICT's "stop hunt" concept has to actual ground truth: a BULLISH break
+# (stops below a low swept, then price reverses up) should show real
+# long-liquidation flow if it was a genuine stop hunt, not just a wick.
+# Ported from v7's proven liquidation_shadow.py (`!forceOrder@arr`
+# combined stream), simplified to this bot's direct-lock engine style
+# (order_flow.py/orderbook.py) instead of v7's queue+worker-thread
+# version, which existed for a heavier multi-symbol shadow monitor than
+# this bot's single evaluate-on-tick usage needs.
+LIQUIDATION_CONFIRMATION_ENABLED = env_bool("LIQUIDATION_CONFIRMATION_ENABLED", "True")
+LIQUIDATION_WINDOW_SECONDS = env_int("LIQUIDATION_WINDOW_SECONDS", 120)
+LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT = env_float("LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000)
+LIQUIDATION_MAX_EVENTS_PER_SYMBOL = env_int("LIQUIDATION_MAX_EVENTS_PER_SYMBOL", 200)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

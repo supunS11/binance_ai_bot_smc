@@ -34,6 +34,13 @@ LTF_BEARISH_BREAK = {
     "fair_value_gaps": [{"type": "BEARISH", "top": 110, "bottom": 105, "index": 0}],
     "atr": 1.0,
 }
+OI_RISING = {"available": True, "oi_change_pct": 5.0}
+LIQUIDATION_LONG_CLUSTER = {
+    "available": True,
+    "long_liquidation_notional": 80000,
+    "short_liquidation_notional": 10000,
+    "net_liquidation_notional": 70000,
+}
 
 
 class SignalEngineTests(unittest.TestCase):
@@ -48,6 +55,8 @@ class SignalEngineTests(unittest.TestCase):
         order_block=None,
         sweep_direction="BULLISH",
         ema_value=85.0,
+        oi_snapshot=None,
+        liquidation_snapshot=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -55,6 +64,10 @@ class SignalEngineTests(unittest.TestCase):
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
         sweep = {"direction": sweep_direction} if sweep_direction else None
+        oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
+        liquidation_snapshot = (
+            LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
+        )
 
         with patch.object(market_structure, "structure_state", return_value=htf_structure), \
              patch.object(market_structure, "premium_discount_zone", return_value=zone), \
@@ -65,7 +78,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
              patch.object(liquidity_sweep, "detect_sweep", return_value=sweep):
             return signal_engine.evaluate(
-                "BTCUSDT", ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth
+                "BTCUSDT", ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
+                oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
             )
 
     def test_full_buy_signal_when_everything_aligns(self):
@@ -179,6 +193,86 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertIsNone(result["ema_value"])
         self.assertIsNone(result["ema_aligned"])
+
+    def test_oi_rising_is_recorded_but_does_not_block_a_signal(self):
+        result = self._run(oi_snapshot={"available": True, "oi_change_pct": 8.0})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["oi_change_pct"], 8.0)
+        self.assertTrue(result["oi_rising"])
+
+    def test_oi_falling_is_recorded_but_does_not_block_a_signal(self):
+        result = self._run(oi_snapshot={"available": True, "oi_change_pct": -3.0})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse(result["oi_rising"])
+
+    def test_oi_unavailable_leaves_fields_none(self):
+        result = self._run(oi_snapshot={"available": False})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["oi_change_pct"])
+        self.assertIsNone(result["oi_rising"])
+
+    def test_oi_fields_are_none_when_confirmation_disabled(self):
+        with patch.object(config, "OI_CONFIRMATION_ENABLED", False):
+            result = self._run(oi_snapshot={"available": True, "oi_change_pct": 8.0})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["oi_change_pct"])
+        self.assertIsNone(result["oi_rising"])
+
+    def test_liquidation_cluster_aligned_with_bullish_break_is_recorded(self):
+        result = self._run(liquidation_snapshot={
+            "available": True, "long_liquidation_notional": 80000,
+            "short_liquidation_notional": 5000, "net_liquidation_notional": 75000,
+        })
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertTrue(result["liquidation_cluster"])
+        self.assertTrue(result["liquidation_aligned"])
+
+    def test_liquidation_opposite_side_is_recorded_as_not_aligned(self):
+        # Short-liquidation-dominant flow during a BULLISH break doesn't
+        # match the "stops below the low got run" story - recorded as
+        # ema_aligned=False equivalent, still not gating.
+        result = self._run(liquidation_snapshot={
+            "available": True, "long_liquidation_notional": 5000,
+            "short_liquidation_notional": 80000, "net_liquidation_notional": -75000,
+        })
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse(result["liquidation_aligned"])
+
+    def test_liquidation_below_cluster_threshold_is_not_a_cluster(self):
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000):
+            result = self._run(liquidation_snapshot={
+                "available": True, "long_liquidation_notional": 1000,
+                "short_liquidation_notional": 500, "net_liquidation_notional": 500,
+            })
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse(result["liquidation_cluster"])
+
+    def test_liquidation_unavailable_leaves_fields_none(self):
+        result = self._run(liquidation_snapshot={"available": False})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["liquidation_notional_net"])
+        self.assertIsNone(result["liquidation_cluster"])
+        self.assertIsNone(result["liquidation_aligned"])
+
+    def test_liquidation_fields_are_none_when_confirmation_disabled(self):
+        with patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False):
+            result = self._run(liquidation_snapshot={
+                "available": True, "long_liquidation_notional": 80000,
+                "short_liquidation_notional": 5000, "net_liquidation_notional": 75000,
+            })
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["liquidation_notional_net"])
+        self.assertIsNone(result["liquidation_cluster"])
+        self.assertIsNone(result["liquidation_aligned"])
 
     def test_no_signal_when_order_flow_data_unavailable(self):
         result = self._run(cvd={"available": False})

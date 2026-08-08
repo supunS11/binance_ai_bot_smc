@@ -45,6 +45,20 @@ class OrderParameterTests(unittest.TestCase):
         self.assertEqual(kwargs["closePosition"], "true")
 
 
+class OpenInterestTests(unittest.TestCase):
+    def test_returns_open_interest_as_float(self):
+        with patch.object(exchange.client, "futures_open_interest", return_value={"symbol": "BTCUSDT", "openInterest": "12345.67"}):
+            result = exchange.get_open_interest("BTCUSDT")
+
+        self.assertEqual(result, 12345.67)
+
+    def test_returns_none_on_error_instead_of_raising(self):
+        with patch.object(exchange.client, "futures_open_interest", side_effect=RuntimeError("boom")):
+            result = exchange.get_open_interest("BTCUSDT")
+
+        self.assertIsNone(result)
+
+
 class CancelAllOpenOrdersTests(unittest.TestCase):
     """Binance treats regular orders and algo/conditional orders (which is
     what our SL/TP1/TP2 actually are) as two separate cancel-all

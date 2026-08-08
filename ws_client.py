@@ -19,9 +19,11 @@ import time
 
 import config
 from logger import log_error, log_info, log_warning
-from exchange import get_klines
+from exchange import get_klines, get_open_interest
 from order_flow import CVDEngine
 from orderbook import DepthImbalanceEngine
+from open_interest import OpenInterestEngine
+from liquidation_tracker import LiquidationEngine, LIQUIDATION_STREAM_URL
 
 
 FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
@@ -132,6 +134,8 @@ class RealtimeMarketData:
         self.htf_candles = CandleStore(maxlen=config.HTF_KLINE_HISTORY_LIMIT)
         self.cvd = CVDEngine()
         self.depth = DepthImbalanceEngine()
+        self.open_interest = OpenInterestEngine()
+        self.liquidations = LiquidationEngine()
 
         self.running = False
         self.resetting = False
@@ -144,6 +148,9 @@ class RealtimeMarketData:
         self.market_websockets = {}
         self.depth_websockets = {}
         self.watchdog_thread = None
+        self.oi_poll_thread = None
+        self.liquidation_thread = None
+        self.liquidation_websocket = None
 
     # =========================
     # LIFECYCLE
@@ -175,6 +182,8 @@ class RealtimeMarketData:
 
         self._start_market_streams()
         self._start_depth_streams()
+        self._start_oi_poll()
+        self._start_liquidation_stream()
 
         log_info(
             f"Realtime market data websocket started | SYMBOLS={len(self.symbols)} | "
@@ -190,10 +199,12 @@ class RealtimeMarketData:
             self.generation += 1
             market_sockets = list(self.market_websockets.values())
             depth_sockets = list(self.depth_websockets.values())
+            liquidation_sockets = [self.liquidation_websocket] if self.liquidation_websocket else []
             self.market_websockets = {}
             self.depth_websockets = {}
+            self.liquidation_websocket = None
 
-        self._close_websockets(market_sockets + depth_sockets)
+        self._close_websockets(market_sockets + depth_sockets + liquidation_sockets)
 
     def _seed_history(self):
         for symbol in self.symbols:
@@ -543,3 +554,89 @@ class RealtimeMarketData:
             self.last_depth_message_at = time.time()
 
         self.depth.record_depth(symbol, bids, asks)
+
+    # =========================
+    # OPEN INTEREST (REST-polled - no public OI websocket stream exists)
+    # =========================
+    def _start_oi_poll(self):
+        if not config.OI_CONFIRMATION_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._oi_poll_loop,
+            args=(generation,),
+            name="realtime-oi-poll",
+            daemon=True,
+        )
+        thread.start()
+        self.oi_poll_thread = thread
+
+    def _oi_poll_loop(self, generation):
+        interval = max(float(config.OI_POLL_INTERVAL_SECONDS), 5)
+
+        while self._worker_active(generation):
+            for symbol in self.symbols:
+                if not self._worker_active(generation):
+                    return
+
+                self.open_interest.record(symbol, get_open_interest(symbol))
+
+            if self.stop_event.wait(interval):
+                return
+
+    # =========================
+    # LIQUIDATIONS (combined `!forceOrder@arr` stream - every symbol on
+    # one connection, no chunking needed)
+    # =========================
+    def _start_liquidation_stream(self):
+        if not config.LIQUIDATION_CONFIRMATION_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._liquidation_stream_loop,
+            args=(generation,),
+            name="realtime-liquidation-stream",
+            daemon=True,
+        )
+        thread.start()
+        self.liquidation_thread = thread
+
+    def _liquidation_stream_loop(self, generation):
+        from websockets.sync.client import connect
+
+        while self._worker_active(generation):
+            try:
+                with connect(
+                    LIQUIDATION_STREAM_URL,
+                    open_timeout=10,
+                    close_timeout=2,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as websocket:
+                    with self.lock:
+                        if generation != self.generation:
+                            return
+                        self.liquidation_websocket = websocket
+
+                    while self._worker_active(generation):
+                        try:
+                            message = websocket.recv(timeout=2)
+                        except TimeoutError:
+                            continue
+
+                        self.liquidations.handle_message(json.loads(message))
+
+            except Exception as exc:
+                if self._worker_active(generation):
+                    log_warning(f"Realtime liquidation websocket reconnecting: {exc}")
+                    self.stop_event.wait(3)
+            finally:
+                with self.lock:
+                    if self.liquidation_websocket is not None:
+                        self.liquidation_websocket = None
