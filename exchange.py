@@ -22,6 +22,15 @@ from logger import log_error, log_info, log_warning
 
 client = Client(config.API_KEY, config.SECRET_KEY, ping=False)
 
+if config.BINANCE_TESTNET:
+    # python-binance's own `testnet=` constructor flag does NOT redirect
+    # USDS-M futures REST calls in this version - it only affects a
+    # separate websocket-API client, and FUTURES_URL is left pointed at
+    # production regardless (verified empirically: client.FUTURES_URL
+    # stays "https://fapi.binance.com/fapi" even with testnet=True).
+    # Overriding it directly is the only way that actually works.
+    client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+
 _exchange_info_cache = None
 _exchange_info_cache_at = 0.0
 _exchange_info_ttl_seconds = 3600

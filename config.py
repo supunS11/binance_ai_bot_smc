@@ -36,6 +36,12 @@ def env_str_list(name, default):
 # =========================
 API_KEY = os.getenv("API_KEY", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
+# When True, every REST call and websocket stream targets Binance's
+# Futures Testnet (testnet.binancefuture.com / stream.binancefuture.com)
+# instead of production - put your testnet API_KEY/SECRET_KEY above (they
+# are a different key pair than your real account, generated separately
+# at https://testnet.binancefuture.com).
+BINANCE_TESTNET = env_bool("BINANCE_TESTNET", "False")
 
 # =========================
 # RATE LIMITING (ported convention from v7/v8 exchange.py)

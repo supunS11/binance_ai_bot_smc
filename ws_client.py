@@ -26,6 +26,16 @@ from orderbook import DepthImbalanceEngine
 
 FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
 FUTURES_PUBLIC_STREAM_BASE = "wss://fstream.binance.com/public/stream?streams="
+TESTNET_MARKET_STREAM_BASE = "wss://stream.binancefuture.com/market/stream?streams="
+TESTNET_PUBLIC_STREAM_BASE = "wss://stream.binancefuture.com/public/stream?streams="
+
+
+def _market_stream_base():
+    return TESTNET_MARKET_STREAM_BASE if config.BINANCE_TESTNET else FUTURES_MARKET_STREAM_BASE
+
+
+def _public_stream_base():
+    return TESTNET_PUBLIC_STREAM_BASE if config.BINANCE_TESTNET else FUTURES_PUBLIC_STREAM_BASE
 
 
 def _safe_float(value, default=0.0):
@@ -351,7 +361,7 @@ class RealtimeMarketData:
         from websockets.sync.client import connect
 
         streams = "/".join(self._market_stream_names(symbols))
-        url = f"{FUTURES_MARKET_STREAM_BASE}{streams}"
+        url = f"{_market_stream_base()}{streams}"
         worker_id = threading.get_ident()
 
         while self._worker_active(generation):
@@ -480,7 +490,7 @@ class RealtimeMarketData:
         from websockets.sync.client import connect
 
         streams = "/".join(self._depth_stream_names(symbols))
-        url = f"{FUTURES_PUBLIC_STREAM_BASE}{streams}"
+        url = f"{_public_stream_base()}{streams}"
         worker_id = threading.get_ident()
 
         while self._worker_active(generation):
