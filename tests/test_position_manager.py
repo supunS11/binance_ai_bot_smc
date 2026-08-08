@@ -280,6 +280,7 @@ class PollLiveTests(unittest.TestCase):
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
              patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}) as new_sl:
             outcome = manager.poll_live("BTCUSDT")
@@ -290,6 +291,28 @@ class PollLiveTests(unittest.TestCase):
         self.assertEqual(position["sl_order_id"], "sl2")
         cancel.assert_called_once_with("BTCUSDT", "sl1")
         new_sl.assert_called_once_with("BTCUSDT", "BUY", position["breakeven_price"])
+
+    def test_breakeven_promotion_cancels_the_real_sl_not_a_stale_local_id(self):
+        # Real bug seen live: local tracking's sl_order_id can be stale
+        # (e.g. from a reconciliation mismatch) while a real SL is still
+        # open under a different id - cancelling the stale id cancels
+        # nothing, and the new placement then fails with -4130 forever.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["sl_order_id"] = "stale_local_id"
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        real_sl_order = {"type": "STOP_MARKET", "closePosition": True, "algoId": "real_sl_on_exchange"}
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[real_sl_order]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}):
+            manager.poll_live("BTCUSDT")
+
+        cancel.assert_called_once_with("BTCUSDT", "real_sl_on_exchange")
 
     def test_tp1_finished_but_position_already_closed_gives_up_cleanly(self):
         # TP1 filling can coincide with the original SL also having fired
@@ -347,6 +370,7 @@ class PollLiveTests(unittest.TestCase):
                  "_fetch_open_position_detail",
                  return_value={"quantity": 0.5},
              ), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
              patch.object(
@@ -439,6 +463,7 @@ class PollLiveTests(unittest.TestCase):
         manager.positions["BTCUSDT"]["tp1_order_id"] = ""
 
         with patch.object(exchange, "get_algo_order_status", return_value="NEW") as status, \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": ""}):
             manager.poll_live("BTCUSDT")
 
@@ -450,6 +475,7 @@ class PollLiveTests(unittest.TestCase):
         manager.positions["BTCUSDT"]["tp1_order_id"] = ""
 
         with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(
                  exchange, "place_take_profit_partial", return_value={"algoId": "tp1_new"}
              ) as recover:
@@ -458,12 +484,29 @@ class PollLiveTests(unittest.TestCase):
         recover.assert_called_once()
         self.assertEqual(manager.positions["BTCUSDT"]["tp1_order_id"], "tp1_new")
 
+    def test_missing_tp1_order_already_exists_on_exchange_is_resynced_not_duplicated(self):
+        # The real bug seen live: local tracking lost the id while the
+        # real order is still there - placing another gets rejected with
+        # -4130 forever. Must adopt the real id instead of duplicating.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp1_order_id"] = ""
+        real_tp1 = {"type": "TAKE_PROFIT_MARKET", "closePosition": False, "algoId": "real_tp1"}
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[real_tp1]), \
+             patch.object(exchange, "place_take_profit_partial") as place:
+            manager.poll_live("BTCUSDT")
+
+        place.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["tp1_order_id"], "real_tp1")
+
     def test_missing_tp2_order_is_recovered_in_either_stage(self):
         manager = self._manager_with_position()
         manager.positions["BTCUSDT"]["tp2_order_id"] = ""
         manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
 
         with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(
                  exchange, "place_take_profit_full", return_value={"algoId": "tp2_new"}
              ) as recover:
@@ -471,6 +514,28 @@ class PollLiveTests(unittest.TestCase):
 
         recover.assert_called_once()
         self.assertEqual(manager.positions["BTCUSDT"]["tp2_order_id"], "tp2_new")
+
+    def test_tp1_market_close_instead_when_price_already_passed_it(self):
+        # -2021 on TP1 specifically means price already passed that level -
+        # take the partial at market instead of retrying a placement that
+        # can never succeed.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp1_order_id"] = ""
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(
+                 exchange,
+                 "place_take_profit_partial",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}):
+            manager.poll_live("BTCUSDT")
+
+        market_close.assert_called_once_with("BTCUSDT", "BUY", 0.5)
 
     def test_tp1_recovery_is_not_attempted_once_in_breakeven_stage(self):
         # TP1 is already resolved by the time BREAKEVEN_ACTIVE is reached -
@@ -490,6 +555,7 @@ class PollLiveTests(unittest.TestCase):
         manager.positions["BTCUSDT"]["tp1_order_id"] = ""
 
         with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(
                  exchange, "place_take_profit_partial", side_effect=RuntimeError("rejected")
              ):

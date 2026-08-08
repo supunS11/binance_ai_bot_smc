@@ -234,7 +234,16 @@ class PositionManager:
             return self._close(symbol, "TP1_THEN_POSITION_ALREADY_CLOSED")
 
         try:
-            if position["sl_order_id"]:
+            # Cancel whatever SL is *actually* sitting on the exchange,
+            # not just whatever id local tracking happens to have - a
+            # stale/wrong local id cancels nothing, leaves the real order
+            # in place, and the placement below then fails with -4130
+            # ("already existing") every single poll forever.
+            existing_sl = self._find_open_order(symbol, "STOP_MARKET", close_position=True)
+
+            if existing_sl:
+                exchange.cancel_algo_order(symbol, exchange._accepted_order_id(existing_sl))
+            elif position["sl_order_id"]:
                 exchange.cancel_algo_order(symbol, position["sl_order_id"])
 
             new_sl_order = exchange.place_stop_loss(
@@ -356,28 +365,93 @@ class PositionManager:
         side = position["side"]
 
         if position["stage"] == TP1_PENDING and not position["tp1_order_id"]:
-            try:
-                order = exchange.place_take_profit_partial(
-                    symbol, side, position["tp1_quantity"], position["tp1_price"]
-                )
-                position["tp1_order_id"] = exchange._accepted_order_id(order)
+            # Check the exchange for a real TP1-shaped order before
+            # attempting to place one - if local tracking merely lost the
+            # id (a reconciliation mismatch, for instance) while the real
+            # order is still there, placing another one gets rejected
+            # with -4130 ("already existing") on every single poll
+            # forever. Re-sync from the real order instead of duplicating.
+            existing = self._find_open_order(symbol, "TAKE_PROFIT_MARKET", close_position=False)
 
-                if position["tp1_order_id"]:
-                    log_info(f"{symbol} TP1 order recovered")
-            except Exception as exc:
-                log_warning(f"{symbol} TP1 recovery attempt failed: {exc}")
+            if existing:
+                position["tp1_order_id"] = exchange._accepted_order_id(existing)
+                log_info(f"{symbol} TP1 order tracking re-synced from exchange")
+            else:
+                try:
+                    order = exchange.place_take_profit_partial(
+                        symbol, side, position["tp1_quantity"], position["tp1_price"]
+                    )
+                    position["tp1_order_id"] = exchange._accepted_order_id(order)
+
+                    if position["tp1_order_id"]:
+                        log_info(f"{symbol} TP1 order recovered")
+                except Exception as exc:
+                    if "-2021" in str(exc):
+                        # Price has already passed the TP1 level entirely -
+                        # a conditional order there would fire instantly,
+                        # which is exactly what "take profit" means here.
+                        # Take it at market instead of leaving TP1
+                        # permanently unplaceable and retried forever.
+                        log_warning(
+                            f"{symbol} TP1 level already passed by price - "
+                            "closing TP1 quantity at market instead"
+                        )
+                        self._market_close_tp1(position)
+                    else:
+                        log_warning(f"{symbol} TP1 recovery attempt failed: {exc}")
 
         if not position["tp2_order_id"]:
-            try:
-                order = exchange.place_take_profit_full(
-                    symbol, side, position["tp2_price"]
-                )
-                position["tp2_order_id"] = exchange._accepted_order_id(order)
+            existing = self._find_open_order(symbol, "TAKE_PROFIT_MARKET", close_position=True)
 
-                if position["tp2_order_id"]:
-                    log_info(f"{symbol} TP2 order recovered")
-            except Exception as exc:
-                log_warning(f"{symbol} TP2 recovery attempt failed: {exc}")
+            if existing:
+                position["tp2_order_id"] = exchange._accepted_order_id(existing)
+                log_info(f"{symbol} TP2 order tracking re-synced from exchange")
+            else:
+                try:
+                    order = exchange.place_take_profit_full(
+                        symbol, side, position["tp2_price"]
+                    )
+                    position["tp2_order_id"] = exchange._accepted_order_id(order)
+
+                    if position["tp2_order_id"]:
+                        log_info(f"{symbol} TP2 order recovered")
+                except Exception as exc:
+                    log_warning(f"{symbol} TP2 recovery attempt failed: {exc}")
+
+    @staticmethod
+    def _find_open_order(symbol, order_type, close_position):
+        """Ground truth from the exchange: is there already a matching
+        order sitting there, regardless of what local tracking thinks?
+        Used before both placing a "missing" order (self-heal without
+        creating a duplicate) and before cancelling a "known" order
+        (cancel the real one, not a possibly-stale local id)."""
+        for order in exchange.get_open_algo_orders(symbol):
+            if order.get("type") != order_type:
+                continue
+
+            is_close_position = str(order.get("closePosition")).lower() == "true"
+
+            if is_close_position == close_position:
+                return order
+
+        return None
+
+    def _market_close_tp1(self, position):
+        """TP1's price was already passed by the market before the order
+        could be placed - close that quantity at market (the position is
+        still SL-protected throughout) and promote the remainder to
+        breakeven, the same outcome a genuine TP1 fill would have led to."""
+        symbol = position["symbol"]
+        side = position["side"]
+
+        try:
+            exchange.close_position_market(symbol, side, position["tp1_quantity"])
+        except Exception as exc:
+            log_error(f"{symbol} TP1 market-close-instead error: {exc}")
+            return
+
+        log_info(f"{symbol} TP1 quantity closed at market (price already past TP1)")
+        self._promote_to_breakeven(position)
 
     def poll_shadow(self, symbol, latest_candle):
         """Simulates the same TP1 -> breakeven -> TP2/SL sequence against
