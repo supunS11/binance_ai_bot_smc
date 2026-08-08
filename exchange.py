@@ -776,8 +776,11 @@ def get_open_algo_orders(symbol):
                 data={"symbol": symbol},
             )
 
-        if isinstance(response, dict) and isinstance(response.get("data"), list):
-            return response["data"]
+        if isinstance(response, dict):
+            # v7's proven-working _normalise_algo_orders checks both keys -
+            # the wrapper key isn't consistently "data".
+            wrapped = response.get("orders") or response.get("data")
+            return wrapped if isinstance(wrapped, list) else []
 
         return response if isinstance(response, list) else []
 

@@ -23,6 +23,14 @@ TP1_PENDING = "TP1_PENDING"
 BREAKEVEN_ACTIVE = "BREAKEVEN_ACTIVE"
 
 
+def _order_type(order):
+    """The algo-order list endpoint returns the order type under
+    `orderType`, not `type` (confirmed against v7's proven-working
+    find_matching_open_algo_order) - checking `type` alone silently
+    matches nothing, ever."""
+    return str((order or {}).get("orderType") or (order or {}).get("type") or "").upper()
+
+
 def _safe_float(value, default=None):
     try:
         return float(value)
@@ -109,8 +117,8 @@ class PositionManager:
         quantity = live_position["quantity"]
 
         open_orders = exchange.get_open_algo_orders(symbol)
-        sl_order = next((o for o in open_orders if o.get("type") == "STOP_MARKET"), None)
-        tp_orders = [o for o in open_orders if o.get("type") == "TAKE_PROFIT_MARKET"]
+        sl_order = next((o for o in open_orders if _order_type(o) == "STOP_MARKET"), None)
+        tp_orders = [o for o in open_orders if _order_type(o) == "TAKE_PROFIT_MARKET"]
         tp1_order = next(
             (o for o in tp_orders if str(o.get("closePosition")).lower() != "true"), None
         )
@@ -145,7 +153,10 @@ class PositionManager:
         tp1_price = _trigger_price(tp1_order) or fallback_tp1
         tp2_price = _trigger_price(tp2_order) or fallback_tp2
 
-        tp1_quantity = _safe_float(tp1_order.get("origQty")) if tp1_order else None
+        tp1_quantity = (
+            _safe_float(tp1_order.get("quantity") or tp1_order.get("origQty"))
+            if tp1_order else None
+        )
         if tp1_quantity is None:
             tp1_quantity = round(quantity * min(max(float(config.TP1_CLOSE_PCT), 0), 100) / 100, 8)
         tp2_quantity = max(round(quantity - tp1_quantity, 8), 0)
@@ -426,7 +437,7 @@ class PositionManager:
         creating a duplicate) and before cancelling a "known" order
         (cancel the real one, not a possibly-stale local id)."""
         for order in exchange.get_open_algo_orders(symbol):
-            if order.get("type") != order_type:
+            if _order_type(order) != order_type:
                 continue
 
             is_close_position = str(order.get("closePosition")).lower() == "true"

@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import config
 import exchange
-from position_manager import BREAKEVEN_ACTIVE, TP1_PENDING, PositionManager
+from position_manager import BREAKEVEN_ACTIVE, TP1_PENDING, PositionManager, _order_type
 
 
 # _close() journals every outcome for real (signal_journal.append_outcome)
@@ -56,6 +56,34 @@ def _candle(high, low):
     return {"open_time": 0, "open": high, "high": high, "low": low, "close": high, "volume": 1, "closed": False}
 
 
+class OrderTypeFieldTests(unittest.TestCase):
+    """Real bug, confirmed against v7's proven-working
+    find_matching_open_algo_order: the algo-order list endpoint returns
+    the type under `orderType`, not `type`. Checking `type` alone matches
+    nothing, ever - every "missing order" self-heal attempt then tries to
+    place a genuine duplicate and gets rejected with -4130 forever."""
+
+    def test_prefers_the_real_orderType_field(self):
+        self.assertEqual(_order_type({"orderType": "STOP_MARKET"}), "STOP_MARKET")
+
+    def test_falls_back_to_type_if_orderType_is_absent(self):
+        self.assertEqual(_order_type({"type": "TAKE_PROFIT_MARKET"}), "TAKE_PROFIT_MARKET")
+
+    def test_missing_both_fields_is_empty_not_a_crash(self):
+        self.assertEqual(_order_type({}), "")
+        self.assertEqual(_order_type(None), "")
+
+    def test_find_open_order_matches_against_the_real_field_shape(self):
+        # No "type" key at all - only what Binance actually returns.
+        real_tp2 = {"orderType": "TAKE_PROFIT_MARKET", "closePosition": True, "algoId": "real_tp2"}
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[real_tp2]):
+            found = PositionManager._find_open_order("BTCUSDT", "TAKE_PROFIT_MARKET", close_position=True)
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["algoId"], "real_tp2")
+
+
 class ReconcileOnStartupTests(unittest.TestCase):
     def _live_position(self, symbol="BTCUSDT", side="BUY", entry=100.0, qty=1.0):
         return {"symbol": symbol, "side": side, "entry_price": entry, "quantity": qty}
@@ -94,6 +122,30 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["sl_price"], 98.0)
         self.assertEqual(position["tp1_price"], 102.0)
         self.assertEqual(position["tp2_price"], 104.0)
+
+    def test_adopts_correctly_against_the_real_orderType_field_shape(self):
+        # No "type" key, no "origQty" key - only what Binance's algo-order
+        # endpoint actually returns (confirmed against v7's proven-working
+        # parsing), so this proves the fix against reality, not a guess.
+        manager = PositionManager()
+        open_orders = [
+            {"orderType": "STOP_MARKET", "stopPrice": "98", "algoId": "sl1"},
+            {"orderType": "TAKE_PROFIT_MARKET", "closePosition": False, "stopPrice": "102", "quantity": "0.8", "algoId": "tp1_1"},
+            {"orderType": "TAKE_PROFIT_MARKET", "closePosition": True, "stopPrice": "104", "algoId": "tp2_1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["sl_price"], 98.0)
+        self.assertEqual(position["tp1_price"], 102.0)
+        self.assertEqual(position["tp2_price"], 104.0)
+        self.assertEqual(position["tp1_quantity"], 0.8)
+        self.assertEqual(position["sl_order_id"], "sl1")
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+        self.assertEqual(position["tp2_order_id"], "tp2_1")
         self.assertEqual(position["sl_order_id"], "sl1")
         self.assertEqual(position["tp1_order_id"], "tp1_1")
         self.assertEqual(position["tp2_order_id"], "tp2_1")
