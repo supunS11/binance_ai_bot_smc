@@ -19,18 +19,23 @@ import config
 from risk_management import calculate_position_size
 
 
-def _find_structure_target(pools, entry_price, side, min_r_multiple, risk_distance):
+def _find_structure_target(pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance):
     """Nearest real liquidity-pool price in the trade's favorable
-    direction that clears `min_r_multiple` R of room, or None if no pool
-    qualifies. BUY targets BUY_SIDE pools (resistance above entry - where
-    breakout-buy stops sit); SELL targets SELL_SIDE pools (support below
-    entry - where long stops sit) - the same pools liquidity_sweep.py
-    already uses, just on the opposite side of price from where a sweep
-    would be found."""
+    direction that clears `min_r_multiple` R of room *and* stays within
+    `max_r_multiple` R, or None if no pool qualifies. The max bound
+    matters: without it, the "nearest qualifying pool" can still be
+    absurdly far away if nothing closer exists (a real case seen live -
+    a ~20R target that's realistically never going to be reached, which
+    defeats the point of TP1 as an achievable first partial). BUY targets
+    BUY_SIDE pools (resistance above entry - where breakout-buy stops
+    sit); SELL targets SELL_SIDE pools (support below entry - where long
+    stops sit) - the same pools liquidity_sweep.py already uses, just on
+    the opposite side of price from where a sweep would be found."""
     if risk_distance <= 0:
         return None
 
     min_distance = min_r_multiple * risk_distance
+    max_distance = max_r_multiple * risk_distance if max_r_multiple else None
     pool_type = "BUY_SIDE" if side == "BUY" else "SELL_SIDE"
     candidates = []
 
@@ -42,8 +47,13 @@ def _find_structure_target(pools, entry_price, side, min_r_multiple, risk_distan
 
         distance = (price - entry_price) if side == "BUY" else (entry_price - price)
 
-        if distance >= min_distance:
-            candidates.append((distance, price))
+        if distance < min_distance:
+            continue
+
+        if max_distance is not None and distance > max_distance:
+            continue
+
+        candidates.append((distance, price))
 
     if not candidates:
         return None
@@ -52,9 +62,9 @@ def _find_structure_target(pools, entry_price, side, min_r_multiple, risk_distan
     return candidates[0][1]
 
 
-def _resolve_target(pools, entry_price, side, min_r_multiple, risk_distance):
+def _resolve_target(pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance):
     structure_price = _find_structure_target(
-        pools, entry_price, side, min_r_multiple, risk_distance
+        pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance
     )
 
     if structure_price is not None:
@@ -105,18 +115,21 @@ def compute_targets(entry_price, sl_price, side, pools=None):
     if risk_distance <= 0:
         return None, None
 
-    tp1_multiple = max(float(config.TP1_R_MULTIPLE), 0)
-    tp2_multiple = max(float(config.TP2_R_MULTIPLE), tp1_multiple)
+    tp1_min = max(float(config.TP1_R_MULTIPLE), 0)
+    tp2_min = max(float(config.TP2_R_MULTIPLE), tp1_min)
+    tp1_max = max(float(config.TP1_MAX_R_MULTIPLE), tp1_min)
+    tp2_max = max(float(config.TP2_MAX_R_MULTIPLE), tp2_min)
 
-    tp1_price = _resolve_target(pools, entry_price, side, tp1_multiple, risk_distance)
+    tp1_price = _resolve_target(pools, entry_price, side, tp1_min, tp1_max, risk_distance)
     tp1_actual_multiple = abs(tp1_price - entry_price) / risk_distance
 
     # TP2 must clear whichever is further out: the configured floor, or
     # at least 1R beyond wherever TP1 actually landed - guarantees TP2
     # always sits meaningfully beyond TP1 regardless of whether either
-    # came from a real structure level or the fallback.
-    tp2_min_multiple = max(tp2_multiple, tp1_actual_multiple + 1.0)
-    tp2_price = _resolve_target(pools, entry_price, side, tp2_min_multiple, risk_distance)
+    # came from a real structure level or the fallback. Capped at its own
+    # max the same way TP1 is, for the same reason.
+    tp2_min_multiple = min(max(tp2_min, tp1_actual_multiple + 1.0), tp2_max)
+    tp2_price = _resolve_target(pools, entry_price, side, tp2_min_multiple, tp2_max, risk_distance)
 
     return tp1_price, tp2_price
 

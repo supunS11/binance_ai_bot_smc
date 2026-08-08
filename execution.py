@@ -32,6 +32,18 @@ def enter_trade(plan):
             "tp2_order": None,
         }
 
+    # Leverage must actually be confirmed before risking an entry attempt -
+    # some symbols cap out below config.LEVERAGE (Binance rejects with
+    # -4028 for that symbol/notional bracket). Proceeding anyway used to
+    # place a doomed entry order against whatever leverage happened to
+    # already be active on the account, failing a second time with a
+    # confusing, unrelated-looking -2027. Abort cleanly instead - no
+    # entry order is ever attempted, so there's nothing to unwind.
+    if not exchange.setup_leverage(symbol):
+        error = f"leverage {config.LEVERAGE}x not available for {symbol}"
+        log_error(f"{symbol} entry aborted | {error}")
+        return {"ok": False, "shadow": False, "error": error}
+
     # Entry + SL are treated as one atomic unit: once the entry order
     # fills, a real position exists on the exchange, so a failure from
     # here on must never be allowed to leave it both naked (no stop) and
@@ -39,7 +51,6 @@ def enter_trade(plan):
     # ok=True) - that combination is how a position silently loses its
     # protection with the bot having no idea it exists.
     try:
-        exchange.setup_leverage(symbol)
         entry_order = exchange.place_market_order(symbol, side, plan["quantity"])
     except Exception as exc:
         log_error(f"{symbol} entry order error: {exc}")

@@ -142,6 +142,15 @@ MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
 TP1_CLOSE_PCT = env_float("TP1_CLOSE_PCT", 50)
 TP1_R_MULTIPLE = env_float("TP1_R_MULTIPLE", 2.0)
 TP2_R_MULTIPLE = env_float("TP2_R_MULTIPLE", 4.0)
+# Upper bound on how far a real structure target is allowed to be. The
+# R-multiples above are a MINIMUM room requirement - without a maximum
+# too, "nearest qualifying pool" can still land absurdly far away if
+# nothing closer exists (seen live: a ~20R target that's realistically
+# never reached), silently turning TP1 into an unreachable target instead
+# of an achievable first partial. Beyond this, the plain R-multiple
+# fallback is used instead of the distant pool.
+TP1_MAX_R_MULTIPLE = env_float("TP1_MAX_R_MULTIPLE", 6.0)
+TP2_MAX_R_MULTIPLE = env_float("TP2_MAX_R_MULTIPLE", 10.0)
 MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )

@@ -61,6 +61,20 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("boom", result["error"])
 
+    def test_leverage_failure_aborts_before_any_entry_attempt(self):
+        # Some symbols cap out below config.LEVERAGE - proceeding anyway
+        # used to place a doomed entry order and fail a second time with
+        # an unrelated-looking error. Must abort cleanly with no entry
+        # order attempted at all.
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=False), \
+             patch.object(exchange, "place_market_order") as market_order:
+            result = execution.enter_trade(_plan())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("leverage", result["error"])
+        market_order.assert_not_called()
+
     def test_sl_placement_failure_closes_the_just_opened_position(self):
         # A real position now exists on the exchange (entry filled) - if
         # SL can't be attached, it must be closed immediately rather than

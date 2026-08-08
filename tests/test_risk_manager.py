@@ -145,6 +145,32 @@ class StructureBasedTargetTests(unittest.TestCase):
 
         self.assertEqual(tp1, 102)  # fallback, the pool was never eligible
 
+    def test_pool_beyond_the_max_bound_is_rejected_not_used(self):
+        # Real bug seen live: the nearest *qualifying* pool can still be
+        # absurdly far away (~20R) if nothing closer exists - that's not
+        # an achievable TP1, so it must be rejected in favor of the
+        # bounded fallback instead of blindly taking "nearest that clears
+        # the floor" with no ceiling.
+        pools = [{"type": "BUY_SIDE", "price": 140}]  # 20R away
+
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0):
+            tp1, tp2 = risk_manager.compute_targets(100, 98, "BUY", pools=pools)
+
+        self.assertEqual(tp1, 102)  # fallback: 100 + 1R, the 20R pool rejected
+        self.assertEqual(tp2, 104)  # fallback: 100 + 2R
+
+    def test_pool_within_bounds_is_still_used_normally(self):
+        pools = [{"type": "BUY_SIDE", "price": 106}]  # 3R - within [1, 6]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools)
+
+        self.assertEqual(tp1, 106)
+
     def test_tp2_still_clears_tp1_when_tp1_used_a_far_structure_pool(self):
         # TP1 lands on a pool at 4R (well beyond its 1R floor); TP2's
         # floor must adapt to sit beyond that, not just the configured 2R.
