@@ -274,6 +274,54 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["liquidation_cluster"])
         self.assertIsNone(result["liquidation_aligned"])
 
+    def test_confluence_score_full_agreement_gives_ratio_one(self):
+        # Defaults: sweep=BULLISH (matches direction), ema_value=85 <
+        # ltf_close=93 (aligned for BUY), OI_RISING, LIQUIDATION_LONG_CLUSTER
+        # (net positive, aligned for a BULLISH break) - all four agree.
+        result = self._run()
+
+        self.assertEqual(result["confluence_score"], 4)
+        self.assertEqual(result["confluence_total"], 4)
+        self.assertAlmostEqual(result["confluence_ratio"], 1.0)
+
+    def test_confluence_score_counts_only_disagreeing_fields_against_it(self):
+        result = self._run(
+            ema_value=95.0,  # 93 < 95 -> misaligned for a BUY
+            oi_snapshot={"available": True, "oi_change_pct": -3.0},  # falling
+            liquidation_snapshot={
+                "available": True, "long_liquidation_notional": 1000,
+                "short_liquidation_notional": 9000, "net_liquidation_notional": -8000,
+            },  # short-dominant during a BULLISH break -> not aligned
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["confluence_score"], 1)  # only sweep agrees
+        self.assertEqual(result["confluence_total"], 4)
+        self.assertAlmostEqual(result["confluence_ratio"], 0.25)
+
+    def test_unavailable_fields_are_excluded_from_the_denominator(self):
+        result = self._run(
+            ema_value=None,
+            oi_snapshot={"available": False},
+            liquidation_snapshot={"available": False},
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["confluence_score"], 1)  # sweep only
+        self.assertEqual(result["confluence_total"], 1)
+        self.assertAlmostEqual(result["confluence_ratio"], 1.0)
+
+    def test_disabled_confirmations_shrink_the_denominator_not_the_score(self):
+        with patch.object(config, "EMA_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["confluence_score"], 1)
+        self.assertEqual(result["confluence_total"], 1)
+        self.assertAlmostEqual(result["confluence_ratio"], 1.0)
+
     def test_no_signal_when_order_flow_data_unavailable(self):
         result = self._run(cvd={"available": False})
         self.assertEqual(result["reason"], "ORDER_FLOW_DATA_UNAVAILABLE")

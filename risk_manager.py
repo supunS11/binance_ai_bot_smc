@@ -16,7 +16,7 @@ out that far - same shape as v7's ENTRY_MIN_TP_ROOM_ROI/STRUCTURE_TP_MIN_ROI
 fallback.
 """
 import config
-from risk_management import calculate_position_size
+from risk_management import calculate_position_size, get_position_risk_budget
 
 
 def _find_structure_target(pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance):
@@ -146,6 +146,27 @@ def compute_breakeven_price(entry_price, side):
     return entry_price * (1 - buffer_pct)
 
 
+def _confluence_size_multiplier(signal):
+    """Scales risk per trade by how much of sweep/EMA/OI/liquidation
+    confluence agrees with this signal (signal_engine's confluence_ratio),
+    instead of gating entry on any of them individually - every signal
+    that reaches build_trade_plan still trades, only the size adapts.
+    Linear between CONFLUENCE_SIZING_MIN_MULTIPLIER (no confluence) and
+    CONFLUENCE_SIZING_MAX_MULTIPLIER (full confluence). See
+    config.CONFLUENCE_SIZING_ENABLED for the rationale."""
+    if not config.CONFLUENCE_SIZING_ENABLED:
+        return 1.0
+
+    ratio = signal.get("confluence_ratio")
+
+    if ratio is None:
+        return 1.0
+
+    min_mult = float(config.CONFLUENCE_SIZING_MIN_MULTIPLIER)
+    max_mult = float(config.CONFLUENCE_SIZING_MAX_MULTIPLIER)
+    return min_mult + (max_mult - min_mult) * ratio
+
+
 def build_trade_plan(signal, balance):
     """`signal` is a dict from signal_engine.evaluate() where
     signal["signal"] is "BUY" or "SELL" (never call this for a rejected
@@ -175,7 +196,18 @@ def build_trade_plan(signal, balance):
     if tp1_price is None:
         return None, "TARGETS_UNAVAILABLE"
 
-    quantity = calculate_position_size(balance, entry_price, sl_price, symbol)
+    size_multiplier = _confluence_size_multiplier(signal)
+
+    if config.RISK_BASED_POSITION_SIZING_ENABLED:
+        risk_budget = get_position_risk_budget(balance) * size_multiplier
+        quantity = calculate_position_size(
+            balance, entry_price, sl_price, symbol, risk_budget_override=risk_budget
+        )
+    else:
+        margin = max(float(config.MARGIN_PER_TRADE), 0) * size_multiplier
+        quantity = calculate_position_size(
+            balance, entry_price, sl_price, symbol, margin_override=margin
+        )
 
     if quantity <= 0:
         return None, "POSITION_SIZE_ZERO"
@@ -199,4 +231,5 @@ def build_trade_plan(signal, balance):
         "tp1_quantity": tp1_quantity,
         "tp2_quantity": tp2_quantity,
         "risk_distance": abs(entry_price - sl_price),
+        "size_multiplier": size_multiplier,
     }, "OK"

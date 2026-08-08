@@ -183,6 +183,21 @@ STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # floor active (observed average stop distance on SL-hit trades was only
 # ~0.45%). Raised from 0.3 -> 0.6 on that evidence.
 MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.6)
+# Confluence-weighted position sizing - see signal_engine.py's
+# confluence_ratio (how many of sweep/EMA/OI/liquidation agree with the
+# signal, out of how many were actually available to check). Scales the
+# risk taken per trade instead of gating entry on any of these
+# individually: every signal that qualifies today still trades, a
+# 0-confluence one just risks less and a fully-aligned one risks more.
+# Chosen over a hard gate specifically because it's testable against the
+# existing trade count immediately (every trade gets sized, not just a
+# rejected subset), reversible at zero cost if the score turns out
+# uncorrelated with outcome, and can extract information from these
+# fields collectively even before any one of them individually clears a
+# significance bar on its own.
+CONFLUENCE_SIZING_ENABLED = env_bool("CONFLUENCE_SIZING_ENABLED", "True")
+CONFLUENCE_SIZING_MIN_MULTIPLIER = env_float("CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5)
+CONFLUENCE_SIZING_MAX_MULTIPLIER = env_float("CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25)
 MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
 # After ANY position closes (win, loss, or breakeven), that symbol is
 # skipped for this long before it can be re-entered. Evidence (same

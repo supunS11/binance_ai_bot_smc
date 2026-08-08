@@ -174,6 +174,20 @@ def evaluate(
     sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
     sweep_confluence = bool(sweep and sweep["direction"] == direction)
 
+    # Confluence score: how many of the informational fields above agree
+    # with this signal's direction, out of how many were actually
+    # available to check (a field that's None - e.g. liquidation, still
+    # silent for most alts - is excluded from the denominator rather than
+    # counted against the signal). Feeds risk_manager's confluence-weighted
+    # position sizing instead of gating entry on any of these individually
+    # - every signal that reaches here still trades, only the size adapts.
+    # See config.CONFLUENCE_SIZING_ENABLED.
+    confluence_fields = [sweep_confluence, ema_aligned, oi_rising, liquidation_aligned]
+    confluence_available = [value for value in confluence_fields if value is not None]
+    confluence_total = len(confluence_available)
+    confluence_score = sum(1 for value in confluence_available if value)
+    confluence_ratio = confluence_score / confluence_total if confluence_total else None
+
     return {
         "signal": side,
         "reason": "OK",
@@ -196,4 +210,7 @@ def evaluate(
         "liquidation_notional_net": liquidation_notional_net,
         "liquidation_cluster": liquidation_cluster,
         "liquidation_aligned": liquidation_aligned,
+        "confluence_score": confluence_score,
+        "confluence_total": confluence_total,
+        "confluence_ratio": confluence_ratio,
     }

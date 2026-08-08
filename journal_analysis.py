@@ -123,6 +123,7 @@ def summarize(journal_path=None):
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")
     lines += _breakdown_lines(resolved, "liquidation cluster (informational)", lambda t: t.get("liquidation_cluster", "unknown") or "False")
     lines += _breakdown_lines(resolved, "liquidation aligned (informational)", lambda t: t.get("liquidation_aligned", "unknown") or "False")
+    lines += _breakdown_lines(resolved, "confluence score (drives position sizing)", lambda t: t.get("confluence_score", "unknown") or "0")
     lines += _breakdown_lines(resolved, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "order block present", lambda t: t.get("order_block_present", "unknown") or "False")
     lines += _breakdown_lines(resolved, "FVG present", lambda t: t.get("fvg_present", "unknown") or "False")

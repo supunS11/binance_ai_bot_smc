@@ -29,7 +29,8 @@ FIELDNAMES = [
     "structure_level", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
-    "liquidation_cluster", "liquidation_aligned", "tp1_r_multiple", "tp2_r_multiple",
+    "liquidation_cluster", "liquidation_aligned", "confluence_score", "confluence_total",
+    "confluence_ratio", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "outcome",
 ]
 
@@ -124,6 +125,10 @@ def append_signal(signal, plan):
         "liquidation_notional_net": signal.get("liquidation_notional_net"),
         "liquidation_cluster": signal.get("liquidation_cluster"),
         "liquidation_aligned": signal.get("liquidation_aligned"),
+        "confluence_score": signal.get("confluence_score"),
+        "confluence_total": signal.get("confluence_total"),
+        "confluence_ratio": signal.get("confluence_ratio"),
+        "size_multiplier": plan.get("size_multiplier"),
         "tp1_r_multiple": config.TP1_R_MULTIPLE,
         "tp2_r_multiple": config.TP2_R_MULTIPLE,
         "execution_mode": config.EXECUTION_MODE,
