@@ -114,6 +114,16 @@ ATR_PERIOD = env_int("ATR_PERIOD", 14)
 SIGNAL_MIN_CVD_SCORE = env_float("SIGNAL_MIN_CVD_SCORE", 0.15)
 SIGNAL_MIN_DEPTH_IMBALANCE = env_float("SIGNAL_MIN_DEPTH_IMBALANCE", 0.10)
 REQUIRE_ORDER_BLOCK_OR_FVG = env_bool("REQUIRE_ORDER_BLOCK_OR_FVG", "True")
+# EMA alignment - the same direction-confirmation concept v7 uses (its
+# EMA_WRONG_SIDE live-entry guard). Informational only, NOT a gate: an
+# EMA is a lagging/smoothed indicator by construction, so requiring price
+# already on its correct side can delay entry on a sharp move until price
+# has run further - a real cost against this bot's real-time premise,
+# and not yet backed by evidence it's worth paying. Computed and logged
+# on every signal (ema_value, ema_aligned) so that evidence can
+# accumulate before this is ever turned into a hard gate.
+EMA_CONFIRMATION_ENABLED = env_bool("EMA_CONFIRMATION_ENABLED", "True")
+EMA_CONFIRMATION_PERIOD = env_int("EMA_CONFIRMATION_PERIOD", 20)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)
@@ -130,9 +140,22 @@ STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # Hard floor: SL is never allowed closer to entry than this % of entry
 # price, regardless of how close the structure level happened to land -
 # prevents a pathologically tight stop (and the oversized position that
-# risk-based sizing would produce to compensate for it).
-MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.3)
+# risk-based sizing would produce to compensate for it). Evidence
+# (2026-08-08, 79 resolved live trades): 68% hit SL despite CVD/sweep
+# confirmation being statistically identical between winners and losers -
+# ruling out signal-selection quality as the driver and pointing at the
+# stop still being too tight for normal price movement even with the
+# floor active (observed average stop distance on SL-hit trades was only
+# ~0.45%). Raised from 0.3 -> 0.6 on that evidence.
+MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.6)
 MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
+# After ANY position closes (win, loss, or breakeven), that symbol is
+# skipped for this long before it can be re-entered. Evidence (same
+# 2026-08-08 review): RSRUSDT/SANDUSDT/TAIKOUSDT/SUSHIUSDT each hit SL
+# repeatedly within seconds-to-minutes of the previous close, at nearly
+# the same level - immediate re-entry into a symbol that's actively
+# chopping instead of waiting for the picture to change.
+SYMBOL_REENTRY_COOLDOWN_SECONDS = env_int("SYMBOL_REENTRY_COOLDOWN_SECONDS", 900)
 
 # =========================
 # TP1 / TP2 (mirrors v7's partial-TP + full-close ladder: TP1 closes

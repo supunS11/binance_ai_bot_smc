@@ -41,9 +41,25 @@ def _safe_float(value, default=None):
 class PositionManager:
     def __init__(self):
         self.positions = {}
+        self._closed_at = {}  # symbol -> timestamp of its most recent close
 
     def has_open_position(self, symbol):
         return symbol in self.positions
+
+    def is_in_cooldown(self, symbol):
+        """After ANY close (win, loss, or breakeven), skip that symbol for
+        SYMBOL_REENTRY_COOLDOWN_SECONDS. Evidence (2026-08-08): several
+        symbols hit SL repeatedly within seconds-to-minutes of the
+        previous close, at nearly the same level - immediate re-entry
+        into an actively chopping symbol instead of waiting for the
+        picture to actually change."""
+        closed_at = self._closed_at.get(symbol)
+
+        if closed_at is None:
+            return False
+
+        cooldown = max(int(config.SYMBOL_REENTRY_COOLDOWN_SECONDS), 0)
+        return (time.time() - closed_at) < cooldown
 
     def open_count(self):
         return len(self.positions)
@@ -208,6 +224,7 @@ class PositionManager:
         position = self.positions.pop(symbol, None)
 
         if position:
+            self._closed_at[symbol] = time.time()
             log_info(f"{symbol} position closed | OUTCOME={outcome}")
             signal_journal.append_outcome(symbol, outcome, position.get("trade_id"))
 

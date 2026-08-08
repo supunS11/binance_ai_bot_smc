@@ -82,6 +82,24 @@ def evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot):
     if config.REQUIRE_ORDER_BLOCK_OR_FVG and not order_block and not matching_fvg:
         return _reject("NO_ORDER_BLOCK_OR_FVG")
 
+    # Informational only, not gating: an EMA is a lagging/smoothed
+    # indicator by construction, so requiring price to already be on its
+    # correct side can delay entry on a sharp move until price has run
+    # further - a real cost against this bot's real-time premise, and one
+    # not yet backed by evidence it's worth paying. Computed and logged
+    # here so that evidence can accumulate (same treatment as
+    # sweep_confluence below) before this is ever turned into a hard gate.
+    ema_value = None
+    ema_aligned = None
+
+    if config.EMA_CONFIRMATION_ENABLED:
+        ema_value = market_structure.exponential_moving_average(ltf_candles)
+
+        if ema_value is not None:
+            ema_aligned = (
+                latest_price > ema_value if side == "BUY" else latest_price < ema_value
+            )
+
     if not cvd_snapshot.get("available"):
         return _reject("ORDER_FLOW_DATA_UNAVAILABLE")
 
@@ -131,4 +149,6 @@ def evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot):
         "atr": ltf_analysis.get("atr"),
         "premium_discount_zone": price_zone,
         "liquidity_pools": pools,
+        "ema_value": ema_value,
+        "ema_aligned": ema_aligned,
     }

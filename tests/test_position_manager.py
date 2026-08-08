@@ -1,3 +1,4 @@
+import time
 import unittest
 from unittest.mock import patch
 
@@ -207,6 +208,43 @@ class ReconcileOnStartupTests(unittest.TestCase):
 
         self.assertTrue(manager.has_open_position("BTCUSDT"))
         self.assertEqual(manager.positions["BTCUSDT"]["sl_order_id"], "")
+
+
+class ReentryCooldownTests(unittest.TestCase):
+    def test_symbol_never_closed_is_not_in_cooldown(self):
+        manager = PositionManager()
+        self.assertFalse(manager.is_in_cooldown("BTCUSDT"))
+
+    def test_symbol_closed_recently_is_in_cooldown(self):
+        manager = PositionManager()
+        manager._closed_at["BTCUSDT"] = time.time()
+
+        with patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 900):
+            self.assertTrue(manager.is_in_cooldown("BTCUSDT"))
+
+    def test_close_starts_the_cooldown(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True})
+
+        with patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 900), \
+             patch("position_manager.signal_journal.append_outcome"):
+            manager._close("BTCUSDT", "SHADOW_SL_HIT")
+
+        self.assertTrue(manager.is_in_cooldown("BTCUSDT"))
+
+    def test_cooldown_expires_after_the_configured_window(self):
+        manager = PositionManager()
+        manager._closed_at["BTCUSDT"] = 0.0  # far in the past
+
+        with patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 1):
+            self.assertFalse(manager.is_in_cooldown("BTCUSDT"))
+
+    def test_zero_cooldown_disables_it(self):
+        manager = PositionManager()
+        manager._closed_at["BTCUSDT"] = time.time()
+
+        with patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 0):
+            self.assertFalse(manager.is_in_cooldown("BTCUSDT"))
 
 
 class RegisterTests(unittest.TestCase):

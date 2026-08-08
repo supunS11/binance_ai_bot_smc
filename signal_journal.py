@@ -18,6 +18,7 @@ from pathlib import Path
 import time
 
 import config
+from logger import log_warning
 
 
 JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
@@ -25,17 +26,51 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "atr", "htf_trend", "premium_discount_zone",
+    "structure_level", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "outcome",
 ]
 
 
+def _existing_header(path):
+    try:
+        with open(path, newline="") as handle:
+            return next(csv.reader(handle), None)
+    except (OSError, StopIteration):
+        return None
+
+
 def _ensure_header():
     JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not JOURNAL_PATH.exists():
+        with open(JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=FIELDNAMES).writeheader()
+        return
+
+    # A schema change (new diagnostic fields, most recently ema_value)
+    # while a journal already exists leaves the OLD header sitting above
+    # NEW-shaped rows - csv.DictReader then keys everything off the stale
+    # header, so trade_id and every newer field silently stop resolving
+    # for every row (confirmed live: journal_analysis.py reported zero
+    # resolved trades despite real matching data being in the file).
+    # Back the mismatched file up - matching this project's existing
+    # signal_journal.bak_* convention - and start a fresh, correctly
+    # headered file rather than let analysis silently break again on the
+    # next field added.
+    existing = _existing_header(JOURNAL_PATH)
+
+    if existing is not None and existing != FIELDNAMES:
+        backup_path = JOURNAL_PATH.with_name(
+            f"signal_journal.bak_{int(time.time())}.csv"
+        )
+        JOURNAL_PATH.rename(backup_path)
+        log_warning(
+            f"signal_journal.csv header didn't match the current schema - "
+            f"backed up to {backup_path.name} and started a fresh file"
+        )
+
         with open(JOURNAL_PATH, "w", newline="") as handle:
             csv.DictWriter(handle, fieldnames=FIELDNAMES).writeheader()
 
@@ -74,6 +109,8 @@ def append_signal(signal, plan):
         ),
         "structure_level": signal.get("structure_level"),
         "atr": signal.get("atr"),
+        "ema_value": signal.get("ema_value"),
+        "ema_aligned": signal.get("ema_aligned"),
         "htf_trend": signal.get("htf_trend"),
         "premium_discount_zone": signal.get("premium_discount_zone"),
         "order_block_present": bool(signal.get("order_block")),

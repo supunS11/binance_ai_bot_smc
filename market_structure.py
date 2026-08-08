@@ -339,6 +339,28 @@ def average_true_range(candles, period=None):
     return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
 
 
+def exponential_moving_average(candles, period=None):
+    """Standard EMA of closes - the same direction-confirmation concept
+    as v7's EMA_WRONG_SIDE guard: a structure break that immediately sits
+    on the wrong side of recent average price is a weaker signal than one
+    that breaks and holds. Returns None with too little history rather
+    than a misleading value seeded from a short window."""
+    period = int(config.EMA_CONFIRMATION_PERIOD if period is None else period)
+
+    if len(candles) < period:
+        return None
+
+    closes = [c["close"] for c in candles[-period * 3:]] if len(candles) > period * 3 else [c["close"] for c in candles]
+    seed = sum(closes[:period]) / period
+    multiplier = 2 / (period + 1)
+    ema = seed
+
+    for close in closes[period:]:
+        ema = (close - ema) * multiplier + ema
+
+    return ema
+
+
 def analyze(candles):
     """Consolidated structure snapshot for a candle list - what
     signal_engine.py actually consumes."""

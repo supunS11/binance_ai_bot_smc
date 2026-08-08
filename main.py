@@ -55,6 +55,9 @@ def _evaluate_symbol(feed, symbol, positions, balance):
     if positions.has_open_position(symbol):
         return
 
+    if positions.is_in_cooldown(symbol):
+        return
+
     if positions.open_count() >= config.MAX_TOTAL_POSITIONS:
         return
 

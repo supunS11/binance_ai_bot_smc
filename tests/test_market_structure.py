@@ -284,6 +284,23 @@ class AverageTrueRangeTests(unittest.TestCase):
         self.assertEqual(atr, 0.0)
 
 
+class ExponentialMovingAverageTests(unittest.TestCase):
+    def test_none_with_too_few_candles(self):
+        candles = [_candle(i, high=101, low=99, close=100) for i in range(5)]
+        self.assertIsNone(ms.exponential_moving_average(candles, period=20))
+
+    def test_flat_price_series_converges_to_that_price(self):
+        candles = [_candle(i, high=101, low=99, close=100) for i in range(60)]
+        ema = ms.exponential_moving_average(candles, period=20)
+        self.assertAlmostEqual(ema, 100, places=6)
+
+    def test_rising_prices_pull_ema_up_but_below_the_latest_close(self):
+        candles = [_candle(i, high=i + 1, low=i - 1, close=float(i)) for i in range(1, 61)]
+        ema = ms.exponential_moving_average(candles, period=20)
+        self.assertLess(ema, candles[-1]["close"])
+        self.assertGreater(ema, candles[0]["close"])
+
+
 class AnalyzeTests(unittest.TestCase):
     def test_unavailable_with_too_few_candles(self):
         result = ms.analyze([_candle(0, 10, 9)])

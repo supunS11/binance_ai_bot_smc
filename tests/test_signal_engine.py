@@ -47,6 +47,7 @@ class SignalEngineTests(unittest.TestCase):
         ltf_analysis=None,
         order_block=None,
         sweep_direction="BULLISH",
+        ema_value=85.0,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -61,6 +62,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_order_block", return_value=order_block), \
              patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
              patch.object(liquidity_sweep, "detect_sweep", return_value=sweep):
             return signal_engine.evaluate(
                 "BTCUSDT", ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth
@@ -81,6 +83,7 @@ class SignalEngineTests(unittest.TestCase):
             htf_structure=HTF_BEARISH,
             ltf_analysis=LTF_BEARISH_BREAK,
             sweep_direction="BEARISH",
+            ema_value=115.0,
         )
 
         self.assertEqual(result["signal"], "SELL")
@@ -136,6 +139,46 @@ class SignalEngineTests(unittest.TestCase):
             result = self._run(ltf_analysis=analysis, order_block=None)
 
         self.assertEqual(result["signal"], "BUY")
+
+    def test_ema_wrong_side_is_logged_but_does_not_block_a_buy(self):
+        # Informational only: price below EMA on a BUY is recorded as
+        # ema_aligned=False, but must NOT reject the signal - an EMA is a
+        # lagging indicator, so gating on it would delay real-time entries
+        # on sharp moves without evidence it's actually worth the cost.
+        result = self._run(ema_value=95.0)  # ltf_close defaults to 93 < 95
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse(result["ema_aligned"])
+        self.assertEqual(result["ema_value"], 95.0)
+
+    def test_ema_aligned_true_for_sell_when_price_is_below_ema(self):
+        result = self._run(
+            ltf_close=108.0,
+            cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH,
+            ltf_analysis=LTF_BEARISH_BREAK,
+            sweep_direction="BEARISH",
+            ema_value=115.0,  # 108 < 115 -> aligned for a SELL
+        )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertTrue(result["ema_aligned"])
+
+    def test_ema_unavailable_does_not_block_the_signal(self):
+        result = self._run(ema_value=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["ema_aligned"])
+        self.assertIsNone(result["ema_value"])
+
+    def test_ema_fields_are_none_when_confirmation_disabled(self):
+        with patch.object(config, "EMA_CONFIRMATION_ENABLED", False):
+            result = self._run(ema_value=95.0)  # would be misaligned if computed
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["ema_value"])
+        self.assertIsNone(result["ema_aligned"])
 
     def test_no_signal_when_order_flow_data_unavailable(self):
         result = self._run(cvd={"available": False})
