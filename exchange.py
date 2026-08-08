@@ -918,6 +918,34 @@ def cancel_algo_order(symbol, algo_id):
         return None
 
 
+def cancel_all_open_orders(symbol):
+    """Cancel every open order for a symbol - both regular orders and
+    algo/conditional orders, which is what our SL/TP1/TP2 actually are
+    (Binance treats these as two separate cancel-all endpoints, not one -
+    calling only the regular one silently leaves SL/TP orders in place).
+    Used whenever a position closes, so a stray or improperly-tracked
+    order can never survive on the exchange regardless of whether this
+    bot's own order-id bookkeeping is accurate at that moment."""
+    try:
+        _private_rest_call(
+            f"futures_cancel_all_open_orders:{symbol}",
+            client.futures_cancel_all_open_orders,
+            symbol=symbol,
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} cancel-all regular orders warning: {exc}")
+
+    try:
+        _private_rest_call(
+            f"futures_cancel_all_open_orders:{symbol}:conditional",
+            client.futures_cancel_all_open_orders,
+            symbol=symbol,
+            conditional=True,
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} cancel-all algo orders warning: {exc}")
+
+
 def get_algo_order_status(symbol, algo_id):
     """`FINISHED` = genuinely triggered. `CANCELED`/`EXPIRED` = removed
     without triggering (e.g. the other leg of the OCO pair filled first).

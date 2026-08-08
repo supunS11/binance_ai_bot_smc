@@ -130,4 +130,5 @@ def evaluate(symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot):
         "depth_imbalance": depth_imbalance,
         "atr": ltf_analysis.get("atr"),
         "premium_discount_zone": price_zone,
+        "liquidity_pools": pools,
     }

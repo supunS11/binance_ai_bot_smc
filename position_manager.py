@@ -14,6 +14,7 @@ import time
 
 import config
 import exchange
+import signal_journal
 from logger import log_error, log_info, log_warning
 
 
@@ -31,12 +32,13 @@ class PositionManager:
     def open_count(self):
         return len(self.positions)
 
-    def register(self, plan, execution_result):
+    def register(self, plan, execution_result, trade_id=None):
         symbol = plan["symbol"]
         shadow = execution_result.get("shadow", True)
 
         position = {
             "symbol": symbol,
+            "trade_id": trade_id,
             "side": plan["side"],
             "entry_price": plan["entry_price"],
             "sl_price": plan["sl_price"],
@@ -70,6 +72,7 @@ class PositionManager:
 
         if position:
             log_info(f"{symbol} position closed | OUTCOME={outcome}")
+            signal_journal.append_outcome(symbol, outcome, position.get("trade_id"))
 
         return outcome
 
@@ -101,8 +104,7 @@ class PositionManager:
             # TP1 filling coincided with the position closing entirely
             # (e.g. the original SL also triggered) - nothing left to
             # promote. Stop retrying a doomed replacement.
-            if position["tp2_order_id"]:
-                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+            exchange.cancel_all_open_orders(symbol)
             return self._close(symbol, "TP1_THEN_POSITION_ALREADY_CLOSED")
 
         try:
@@ -146,17 +148,14 @@ class PositionManager:
             return None
 
         if live_position is None:
-            if position["tp2_order_id"]:
-                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+            exchange.cancel_all_open_orders(symbol)
             return self._close(symbol, "TP1_THEN_POSITION_ALREADY_CLOSED")
 
         try:
             exchange.close_position_market(
                 symbol, position["side"], live_position["quantity"]
             )
-
-            if position["tp2_order_id"]:
-                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+            exchange.cancel_all_open_orders(symbol)
 
             return self._close(symbol, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
 
@@ -181,15 +180,13 @@ class PositionManager:
             sl_status = exchange.get_algo_order_status(symbol, position["sl_order_id"])
 
             if sl_status == "FINISHED":
-                exchange.cancel_algo_order(symbol, position["tp1_order_id"])
-                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+                exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "SL_HIT")
 
             tp2_status = exchange.get_algo_order_status(symbol, position["tp2_order_id"])
 
             if tp2_status == "FINISHED":
-                exchange.cancel_algo_order(symbol, position["sl_order_id"])
-                exchange.cancel_algo_order(symbol, position["tp1_order_id"])
+                exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "TP2_HIT_DIRECT")
 
             return None
@@ -198,13 +195,13 @@ class PositionManager:
             sl_status = exchange.get_algo_order_status(symbol, position["sl_order_id"])
 
             if sl_status == "FINISHED":
-                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+                exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "BREAKEVEN_STOP_HIT")
 
             tp2_status = exchange.get_algo_order_status(symbol, position["tp2_order_id"])
 
             if tp2_status == "FINISHED":
-                exchange.cancel_algo_order(symbol, position["sl_order_id"])
+                exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "TP2_HIT")
 
         return None

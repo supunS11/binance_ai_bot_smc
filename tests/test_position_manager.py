@@ -6,6 +6,23 @@ import exchange
 from position_manager import BREAKEVEN_ACTIVE, TP1_PENDING, PositionManager
 
 
+# _close() journals every outcome for real (signal_journal.append_outcome)
+# so it can associate a trade_id with its result - none of these tests
+# care about that side effect, so it's patched out for the whole module
+# rather than in every single test that reaches a close.
+_journal_patcher = None
+
+
+def setUpModule():
+    global _journal_patcher
+    _journal_patcher = patch("position_manager.signal_journal.append_outcome")
+    _journal_patcher.start()
+
+
+def tearDownModule():
+    _journal_patcher.stop()
+
+
 def _plan(side="BUY"):
     if side == "SELL":
         return {
@@ -49,6 +66,17 @@ class RegisterTests(unittest.TestCase):
         self.assertTrue(position["shadow"])
         self.assertIsNone(position["sl_order_id"])
         self.assertEqual(position["stage"], TP1_PENDING)
+
+    def test_trade_id_is_stored_and_threaded_through_to_the_outcome_journal(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True}, trade_id="BTCUSDT_123456")
+        self.assertEqual(manager.positions["BTCUSDT"]["trade_id"], "BTCUSDT_123456")
+
+        with patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            outcome = manager._close("BTCUSDT", "SHADOW_SL_HIT")
+
+        self.assertEqual(outcome, "SHADOW_SL_HIT")
+        append_outcome.assert_called_once_with("BTCUSDT", "SHADOW_SL_HIT", "BTCUSDT_123456")
 
     def test_live_registration_extracts_order_ids(self):
         manager = PositionManager()
@@ -173,14 +201,14 @@ class PollLiveTests(unittest.TestCase):
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
              patch.object(exchange, "_fetch_open_position_detail", return_value=None), \
-             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
              patch.object(exchange, "place_stop_loss") as new_sl:
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertEqual(outcome, "TP1_THEN_POSITION_ALREADY_CLOSED")
         self.assertFalse(manager.has_open_position("BTCUSDT"))
         new_sl.assert_not_called()
-        cancel.assert_called_once_with("BTCUSDT", "tp2_1")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_tp1_finished_but_position_check_fails_retries_next_poll(self):
         # A transient network/backoff error while checking ground truth
@@ -219,6 +247,7 @@ class PollLiveTests(unittest.TestCase):
                  return_value={"quantity": 0.5},
              ), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
              patch.object(
                  exchange,
                  "place_stop_loss",
@@ -230,24 +259,25 @@ class PollLiveTests(unittest.TestCase):
         self.assertEqual(outcome, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
         self.assertFalse(manager.has_open_position("BTCUSDT"))
         market_close.assert_called_once_with("BTCUSDT", "BUY", 0.5)
-        # Both the original SL and TP2 must be cleaned up.
-        cancelled_ids = {call.args[1] for call in cancel.call_args_list}
-        self.assertIn("sl1", cancelled_ids)
-        self.assertIn("tp2_1", cancelled_ids)
+        # The original SL (via the targeted cancel before the failed
+        # replace attempt) and everything else on the symbol (via the
+        # comprehensive cancel-all after the market close) get cleaned up.
+        cancel.assert_called_once_with("BTCUSDT", "sl1")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
-    def test_sl_finished_closes_and_cancels_targets(self):
+    def test_sl_finished_closes_and_cancels_all_open_orders(self):
         manager = self._manager_with_position()
 
         def status_side_effect(symbol, order_id):
             return "FINISHED" if order_id == "sl1" else "NEW"
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
-             patch.object(exchange, "cancel_algo_order") as cancel:
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertEqual(outcome, "SL_HIT")
         self.assertFalse(manager.has_open_position("BTCUSDT"))
-        self.assertEqual(cancel.call_count, 2)
+        cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_tp2_finished_directly_closes_as_tp2_hit_direct(self):
         manager = self._manager_with_position()
@@ -256,10 +286,11 @@ class PollLiveTests(unittest.TestCase):
             return "FINISHED" if order_id == "tp2_1" else "NEW"
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
-             patch.object(exchange, "cancel_algo_order"):
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertEqual(outcome, "TP2_HIT_DIRECT")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_breakeven_stage_sl_finished_closes(self):
         manager = self._manager_with_position()
@@ -269,11 +300,11 @@ class PollLiveTests(unittest.TestCase):
             return "FINISHED" if order_id == "sl1" else "NEW"
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
-             patch.object(exchange, "cancel_algo_order") as cancel:
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertEqual(outcome, "BREAKEVEN_STOP_HIT")
-        cancel.assert_called_once_with("BTCUSDT", "tp2_1")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_breakeven_stage_tp2_finished_closes(self):
         manager = self._manager_with_position()
@@ -283,11 +314,11 @@ class PollLiveTests(unittest.TestCase):
             return "FINISHED" if order_id == "tp2_1" else "NEW"
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
-             patch.object(exchange, "cancel_algo_order") as cancel:
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertEqual(outcome, "TP2_HIT")
-        cancel.assert_called_once_with("BTCUSDT", "sl1")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_shadow_position_is_ignored_by_poll_live(self):
         manager = PositionManager()

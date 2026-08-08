@@ -4,13 +4,86 @@ a position size.
 The stop comes first - beyond the structure level that triggered the
 entry, plus a small ATR buffer - and everything else derives from it:
 position size is solved from the risk distance (the "1% rule", via
-risk_management.calculate_position_size), and TP1/TP2 are expressed as
-R-multiples of that same distance. This mirrors v7's ordering (stop
-distance drives size) rather than picking a size first and hoping the
-stop fits.
+risk_management.calculate_position_size).
+
+TP1/TP2 target real liquidity pools when one exists with enough room,
+matching v7's find_structure_take_profit (price is drawn toward real
+liquidity, not an arbitrary multiple of the stop - that's the actual
+premise of SMC). The R-multiple (2R/4R) is a floor, not the primary
+target: it sets the *minimum* acceptable distance a structure target must
+clear, and is used directly as a fallback only when no real level exists
+out that far - same shape as v7's ENTRY_MIN_TP_ROOM_ROI/STRUCTURE_TP_MIN_ROI
+fallback.
 """
 import config
 from risk_management import calculate_position_size
+
+
+def _find_structure_target(pools, entry_price, side, min_r_multiple, risk_distance):
+    """Nearest real liquidity-pool price in the trade's favorable
+    direction that clears `min_r_multiple` R of room, or None if no pool
+    qualifies. BUY targets BUY_SIDE pools (resistance above entry - where
+    breakout-buy stops sit); SELL targets SELL_SIDE pools (support below
+    entry - where long stops sit) - the same pools liquidity_sweep.py
+    already uses, just on the opposite side of price from where a sweep
+    would be found."""
+    if risk_distance <= 0:
+        return None
+
+    min_distance = min_r_multiple * risk_distance
+    pool_type = "BUY_SIDE" if side == "BUY" else "SELL_SIDE"
+    candidates = []
+
+    for pool in pools or []:
+        price = pool.get("price")
+
+        if price is None or pool.get("type") != pool_type:
+            continue
+
+        distance = (price - entry_price) if side == "BUY" else (entry_price - price)
+
+        if distance >= min_distance:
+            candidates.append((distance, price))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda candidate: candidate[0])
+    return candidates[0][1]
+
+
+def _resolve_target(pools, entry_price, side, min_r_multiple, risk_distance):
+    structure_price = _find_structure_target(
+        pools, entry_price, side, min_r_multiple, risk_distance
+    )
+
+    if structure_price is not None:
+        return structure_price
+
+    distance = min_r_multiple * risk_distance
+    return entry_price + distance if side == "BUY" else entry_price - distance
+
+
+def _apply_min_stop_distance(sl_price, entry_price, side):
+    """Structure can occasionally land pathologically close to entry - a
+    fast/noisy market, or a tight fractal window finding a swing point
+    right next to current price. Left alone, that produces a stop that's
+    essentially inside normal noise (gets hit immediately) and, because
+    position size is solved from the stop distance, an oversized position
+    to match. Widen the stop out to a minimum distance from entry rather
+    than let one through at a size ordinary noise will trigger."""
+    entry_price = float(entry_price or 0)
+    min_pct = max(float(config.MIN_STOP_DISTANCE_PCT), 0) / 100
+
+    if entry_price <= 0 or min_pct <= 0:
+        return sl_price
+
+    min_distance = entry_price * min_pct
+
+    if abs(entry_price - sl_price) >= min_distance:
+        return sl_price
+
+    return entry_price - min_distance if side == "BUY" else entry_price + min_distance
 
 
 def compute_stop_loss(signal, side):
@@ -21,14 +94,12 @@ def compute_stop_loss(signal, side):
 
     atr = signal.get("atr") or 0
     buffer = atr * max(float(config.STRUCTURE_STOP_ATR_BUFFER), 0)
+    sl_price = level - buffer if side == "BUY" else level + buffer
 
-    if side == "BUY":
-        return level - buffer
-
-    return level + buffer
+    return _apply_min_stop_distance(sl_price, signal.get("entry_price"), side)
 
 
-def compute_targets(entry_price, sl_price, side):
+def compute_targets(entry_price, sl_price, side, pools=None):
     risk_distance = abs(entry_price - sl_price)
 
     if risk_distance <= 0:
@@ -37,16 +108,17 @@ def compute_targets(entry_price, sl_price, side):
     tp1_multiple = max(float(config.TP1_R_MULTIPLE), 0)
     tp2_multiple = max(float(config.TP2_R_MULTIPLE), tp1_multiple)
 
-    if side == "BUY":
-        return (
-            entry_price + risk_distance * tp1_multiple,
-            entry_price + risk_distance * tp2_multiple,
-        )
+    tp1_price = _resolve_target(pools, entry_price, side, tp1_multiple, risk_distance)
+    tp1_actual_multiple = abs(tp1_price - entry_price) / risk_distance
 
-    return (
-        entry_price - risk_distance * tp1_multiple,
-        entry_price - risk_distance * tp2_multiple,
-    )
+    # TP2 must clear whichever is further out: the configured floor, or
+    # at least 1R beyond wherever TP1 actually landed - guarantees TP2
+    # always sits meaningfully beyond TP1 regardless of whether either
+    # came from a real structure level or the fallback.
+    tp2_min_multiple = max(tp2_multiple, tp1_actual_multiple + 1.0)
+    tp2_price = _resolve_target(pools, entry_price, side, tp2_min_multiple, risk_distance)
+
+    return tp1_price, tp2_price
 
 
 def compute_breakeven_price(entry_price, side):
@@ -83,7 +155,9 @@ def build_trade_plan(signal, balance):
     if side == "SELL" and sl_price <= entry_price:
         return None, "SL_ON_WRONG_SIDE"
 
-    tp1_price, tp2_price = compute_targets(entry_price, sl_price, side)
+    tp1_price, tp2_price = compute_targets(
+        entry_price, sl_price, side, pools=signal.get("liquidity_pools")
+    )
 
     if tp1_price is None:
         return None, "TARGETS_UNAVAILABLE"

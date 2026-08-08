@@ -45,6 +45,39 @@ class OrderParameterTests(unittest.TestCase):
         self.assertEqual(kwargs["closePosition"], "true")
 
 
+class CancelAllOpenOrdersTests(unittest.TestCase):
+    """Binance treats regular orders and algo/conditional orders (which is
+    what our SL/TP1/TP2 actually are) as two separate cancel-all
+    endpoints - calling only one silently leaves the other kind in place."""
+
+    def test_calls_both_the_regular_and_conditional_cancel_all_endpoints(self):
+        with patch.object(exchange.client, "futures_cancel_all_open_orders") as mock_cancel:
+            exchange.cancel_all_open_orders("BTCUSDT")
+
+        self.assertEqual(mock_cancel.call_count, 2)
+        calls = mock_cancel.call_args_list
+        self.assertEqual(calls[0].kwargs, {"symbol": "BTCUSDT"})
+        self.assertEqual(calls[1].kwargs, {"symbol": "BTCUSDT", "conditional": True})
+
+    def test_a_failure_on_the_regular_endpoint_does_not_skip_the_conditional_one(self):
+        with patch.object(
+            exchange.client,
+            "futures_cancel_all_open_orders",
+            side_effect=[Exception("regular failed"), {"ok": True}],
+        ) as mock_cancel:
+            exchange.cancel_all_open_orders("BTCUSDT")
+
+        self.assertEqual(mock_cancel.call_count, 2)
+
+    def test_never_raises_even_if_both_calls_fail(self):
+        with patch.object(
+            exchange.client,
+            "futures_cancel_all_open_orders",
+            side_effect=Exception("boom"),
+        ):
+            exchange.cancel_all_open_orders("BTCUSDT")  # must not raise
+
+
 class ClosePositionMarketTests(unittest.TestCase):
     def test_closing_a_buy_position_sends_a_sell_reduce_only_order(self):
         with patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \

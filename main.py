@@ -91,11 +91,14 @@ def _evaluate_symbol(feed, symbol, positions, balance):
         log_warning(f"{symbol} entry failed | {execution_result.get('error')}")
         return
 
-    positions.register(plan, execution_result)
-    signal_journal.append_signal(result, plan)
+    trade_id = signal_journal.append_signal(result, plan)
+    positions.register(plan, execution_result, trade_id=trade_id)
 
 
 def _poll_positions(feed, positions):
+    # Outcome journaling happens inside PositionManager._close() itself
+    # (it's the only place that still has the trade_id after a position
+    # is popped from tracking), not here.
     for symbol in list(positions.positions.keys()):
         position = positions.positions.get(symbol)
 
@@ -104,12 +107,9 @@ def _poll_positions(feed, positions):
 
         if position["shadow"]:
             latest_candle = feed.candles.latest(symbol)
-            outcome = positions.poll_shadow(symbol, latest_candle)
+            positions.poll_shadow(symbol, latest_candle)
         else:
-            outcome = positions.poll_live(symbol)
-
-        if outcome:
-            signal_journal.append_outcome(symbol, outcome)
+            positions.poll_live(symbol)
 
 
 def _log_heartbeat(feed, symbols, positions):

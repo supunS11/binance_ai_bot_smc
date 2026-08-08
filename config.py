@@ -126,7 +126,12 @@ RISK_BASED_POSITION_SIZING_ENABLED = env_bool(
 )
 POSITION_RISK_PCT = env_float("POSITION_RISK_PCT", 1.0)
 POSITION_RISK_MAX_USDT = env_float("POSITION_RISK_MAX_USDT", 0)
-STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.15)
+STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
+# Hard floor: SL is never allowed closer to entry than this % of entry
+# price, regardless of how close the structure level happened to land -
+# prevents a pathologically tight stop (and the oversized position that
+# risk-based sizing would produce to compensate for it).
+MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.3)
 MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
 
 # =========================
@@ -135,8 +140,8 @@ MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
 # breakeven; TP2 closes what's left)
 # =========================
 TP1_CLOSE_PCT = env_float("TP1_CLOSE_PCT", 50)
-TP1_R_MULTIPLE = env_float("TP1_R_MULTIPLE", 1.0)
-TP2_R_MULTIPLE = env_float("TP2_R_MULTIPLE", 2.0)
+TP1_R_MULTIPLE = env_float("TP1_R_MULTIPLE", 2.0)
+TP2_R_MULTIPLE = env_float("TP2_R_MULTIPLE", 4.0)
 MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )
