@@ -232,4 +232,5 @@ def build_trade_plan(signal, balance):
         "tp2_quantity": tp2_quantity,
         "risk_distance": abs(entry_price - sl_price),
         "size_multiplier": size_multiplier,
+        "confluence_ratio": signal.get("confluence_ratio"),
     }, "OK"

@@ -228,6 +228,20 @@ MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )
 BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.02)
+# Early breakeven for low-confluence trades - the "optional follow-up" to
+# confluence-weighted sizing above. Instead of waiting for the full TP1
+# target before protecting capital, a trade whose confluence_ratio (at
+# signal time) is at or below EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD gets
+# its SL pulled to breakeven as soon as price has moved
+# EARLY_BREAKEVEN_R_MULTIPLE R in its favor - protects capital faster on
+# the setups with the least evidence behind them, while a high-confluence
+# trade is untouched and keeps the normal TP1-triggered promotion with
+# full room to run. Does not change entry/trade count - same principle as
+# the sizing feature: adapt what happens to a trade that's already
+# happening, not whether it happens.
+EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "True")
+EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD = env_float("EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5)
+EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 1.0)
 
 # =========================
 # EXECUTION

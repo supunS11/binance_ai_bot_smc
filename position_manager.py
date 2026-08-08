@@ -106,6 +106,8 @@ class PositionManager:
             "stage": TP1_PENDING,
             "shadow": shadow,
             "opened_at": time.time(),
+            "confluence_ratio": plan.get("confluence_ratio"),
+            "early_breakeven_applied": False,
         }
         self.positions[symbol] = position
         return position
@@ -211,6 +213,10 @@ class PositionManager:
             "stage": stage,
             "shadow": False,
             "opened_at": time.time(),
+            # No original signal to read confluence from - never eligible
+            # for early breakeven (see _is_early_breakeven_candidate).
+            "confluence_ratio": None,
+            "early_breakeven_applied": False,
         }
 
         if not sl_order:
@@ -241,9 +247,11 @@ class PositionManager:
 
         return outcome
 
-    def _promote_to_breakeven(self, position):
-        """Runs once TP1 is detected as filled. This is where a position
-        can legitimately have already closed entirely (the original SL
+    def _promote_to_breakeven(self, position, reason="TP1 filled"):
+        """Runs once TP1 is detected as filled (or, via `reason`, when a
+        low-confluence trade earns an early promotion before TP1 - see
+        _is_early_breakeven_candidate). This is where a position can
+        legitimately have already closed entirely (the original SL
         firing in the same window as TP1, or manual intervention) - so the
         ground truth is checked on the exchange first rather than assuming
         the remainder is still there. Returns an outcome string if the
@@ -291,7 +299,7 @@ class PositionManager:
             position["sl_order_id"] = exchange._accepted_order_id(new_sl_order)
             position["stage"] = BREAKEVEN_ACTIVE
             log_info(
-                f"{symbol} TP1 filled | SL moved to breakeven="
+                f"{symbol} {reason} | SL moved to breakeven="
                 f"{position['breakeven_price']}"
             )
             return None
@@ -337,6 +345,46 @@ class PositionManager:
             log_error(f"{symbol} market-close-remainder error: {exc}")
             return None
 
+    def _is_early_breakeven_candidate(self, position):
+        """Cheap, no-network pre-check for confluence-weighted early
+        breakeven (config.EARLY_BREAKEVEN_ENABLED) - only fetch a current
+        price at all (an extra REST call in poll_live) for a position that
+        could actually qualify: TP1 still pending, not already promoted,
+        and its signal-time confluence_ratio at or below the configured
+        threshold. A position with no confluence_ratio at all (e.g. one
+        adopted via startup reconciliation, which has no original signal
+        to read it from) is never a candidate - no evidence, no early
+        promotion."""
+        if not config.EARLY_BREAKEVEN_ENABLED or position.get("early_breakeven_applied"):
+            return False
+
+        if position["stage"] != TP1_PENDING:
+            return False
+
+        confluence_ratio = position.get("confluence_ratio")
+
+        if confluence_ratio is None or confluence_ratio > config.EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD:
+            return False
+
+        return abs(position["entry_price"] - position["sl_price"]) > 0
+
+    @staticmethod
+    def _early_breakeven_price_reached(position, current_price):
+        """Has price moved EARLY_BREAKEVEN_R_MULTIPLE R in the position's
+        favor yet? Shared by poll_live (real mark price) and poll_shadow
+        (simulated candle close)."""
+        if current_price is None or current_price <= 0:
+            return False
+
+        side = position["side"]
+        entry_price = position["entry_price"]
+        risk_distance = abs(entry_price - position["sl_price"])
+        trigger_distance = risk_distance * max(float(config.EARLY_BREAKEVEN_R_MULTIPLE), 0)
+        favorable_move = (
+            current_price - entry_price if side == "BUY" else entry_price - current_price
+        )
+        return favorable_move >= trigger_distance
+
     def poll_live(self, symbol):
         """Returns an outcome string if the position closed this call,
         otherwise None."""
@@ -348,6 +396,16 @@ class PositionManager:
         self._ensure_protection_orders(position)
 
         if position["stage"] == TP1_PENDING:
+            if self._is_early_breakeven_candidate(position):
+                current_price = exchange.get_mark_price(symbol)
+
+                if self._early_breakeven_price_reached(position, current_price):
+                    position["early_breakeven_applied"] = True
+                    self._promote_to_breakeven(
+                        position, reason="Confluence-weighted early breakeven"
+                    )
+                    return None
+
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
 
             if tp1_status == "FINISHED":
@@ -516,6 +574,15 @@ class PositionManager:
 
             if hit_sl:
                 return self._close(symbol, "SHADOW_SL_HIT")
+
+            if self._is_early_breakeven_candidate(position) and self._early_breakeven_price_reached(
+                position, latest_candle["close"]
+            ):
+                position["early_breakeven_applied"] = True
+                position["stage"] = BREAKEVEN_ACTIVE
+                position["sl_price"] = position["breakeven_price"]
+                log_info(f"{symbol} [SHADOW] confluence-weighted early breakeven | SL -> breakeven")
+                return None
 
             hit_tp1 = (
                 high >= position["tp1_price"]

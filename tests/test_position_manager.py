@@ -53,8 +53,11 @@ def _plan(side="BUY"):
     }
 
 
-def _candle(high, low):
-    return {"open_time": 0, "open": high, "high": high, "low": low, "close": high, "volume": 1, "closed": False}
+def _candle(high, low, close=None):
+    return {
+        "open_time": 0, "open": high, "high": high, "low": low,
+        "close": high if close is None else close, "volume": 1, "closed": False,
+    }
 
 
 class OrderTypeFieldTests(unittest.TestCase):
@@ -296,11 +299,127 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(position["tp1_order_id"], "tp1_1")
         self.assertEqual(position["tp2_order_id"], "tp2_1")
 
+    def test_confluence_ratio_is_carried_from_the_plan(self):
+        manager = PositionManager()
+        position = manager.register(dict(_plan(), confluence_ratio=0.25), {"shadow": True})
+
+        self.assertEqual(position["confluence_ratio"], 0.25)
+        self.assertFalse(position["early_breakeven_applied"])
+
+
+class EarlyBreakevenEligibilityTests(unittest.TestCase):
+    """config.EARLY_BREAKEVEN_ENABLED - low-confluence trades get pulled
+    to breakeven before TP1, instead of gating entry on confluence at
+    all. These test the eligibility check in isolation from any exchange
+    or shadow-candle mechanics."""
+
+    def _position(self, **overrides):
+        position = {
+            "side": "BUY",
+            "entry_price": 100,
+            "sl_price": 98,
+            "breakeven_price": 100.02,
+            "stage": TP1_PENDING,
+            "confluence_ratio": 0.25,
+            "early_breakeven_applied": False,
+        }
+        position.update(overrides)
+        return position
+
+    def test_disabled_config_is_never_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", False):
+            self.assertFalse(manager._is_early_breakeven_candidate(self._position()))
+
+    def test_already_applied_is_never_a_candidate_again(self):
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
+            self.assertFalse(manager._is_early_breakeven_candidate(
+                self._position(early_breakeven_applied=True)
+            ))
+
+    def test_wrong_stage_is_not_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
+            self.assertFalse(manager._is_early_breakeven_candidate(
+                self._position(stage=BREAKEVEN_ACTIVE)
+            ))
+
+    def test_missing_confluence_ratio_is_not_a_candidate(self):
+        # No original signal to read confluence from (e.g. a position
+        # adopted via startup reconciliation) - no evidence, no early
+        # promotion.
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
+            self.assertFalse(manager._is_early_breakeven_candidate(
+                self._position(confluence_ratio=None)
+            ))
+
+    def test_confluence_above_threshold_is_not_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5):
+            self.assertFalse(manager._is_early_breakeven_candidate(
+                self._position(confluence_ratio=0.75)
+            ))
+
+    def test_confluence_at_or_below_threshold_is_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5):
+            self.assertTrue(manager._is_early_breakeven_candidate(
+                self._position(confluence_ratio=0.5)
+            ))
+            self.assertTrue(manager._is_early_breakeven_candidate(
+                self._position(confluence_ratio=0.25)
+            ))
+
+
+class EarlyBreakevenPriceReachedTests(unittest.TestCase):
+    def _position(self, side="BUY", entry_price=100, sl_price=98):
+        return {"side": side, "entry_price": entry_price, "sl_price": sl_price}
+
+    def test_none_price_is_not_reached(self):
+        with patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0):
+            self.assertFalse(
+                PositionManager._early_breakeven_price_reached(self._position(), None)
+            )
+
+    def test_buy_reaches_trigger_at_full_r_multiple(self):
+        # risk_distance = 2 (100 - 98), R multiple 1.0 -> needs +2 favorable
+        with patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0):
+            self.assertTrue(
+                PositionManager._early_breakeven_price_reached(self._position(), 102)
+            )
+            self.assertFalse(
+                PositionManager._early_breakeven_price_reached(self._position(), 101)
+            )
+
+    def test_sell_reaches_trigger_at_full_r_multiple(self):
+        position = self._position(side="SELL", entry_price=100, sl_price=102)
+
+        with patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0):
+            self.assertTrue(PositionManager._early_breakeven_price_reached(position, 98))
+            self.assertFalse(PositionManager._early_breakeven_price_reached(position, 99))
+
+    def test_smaller_r_multiple_triggers_earlier(self):
+        with patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
+            # only +1 favorable needed now (0.5 * risk_distance 2)
+            self.assertTrue(
+                PositionManager._early_breakeven_price_reached(self._position(), 101)
+            )
+
 
 class PollShadowTests(unittest.TestCase):
-    def _manager_with_position(self, side="BUY"):
+    def _manager_with_position(self, side="BUY", confluence_ratio=None):
         manager = PositionManager()
-        manager.register(_plan(side), {"shadow": True})
+        manager.register(dict(_plan(side), confluence_ratio=confluence_ratio), {"shadow": True})
         return manager
 
     def test_tp1_pending_sl_hit_closes_as_sl(self):
@@ -362,9 +481,51 @@ class PollShadowTests(unittest.TestCase):
         outcome = manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))
         self.assertEqual(outcome, "SHADOW_SL_HIT")
 
+    def test_low_confluence_early_breakeven_triggers_before_tp1_reached(self):
+        # entry=100, sl=98 (risk=2), R multiple 0.5 -> trigger at close=101,
+        # well below tp1(102) - isolates the early trigger from a genuine
+        # TP1 hit.
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
+            manager = self._manager_with_position(confluence_ratio=0.25)
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["early_breakeven_applied"])
+        self.assertEqual(position["sl_price"], position["breakeven_price"])
+
+    def test_low_confluence_but_price_not_moved_enough_stays_pending(self):
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
+            manager = self._manager_with_position(confluence_ratio=0.25)
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=100.8, low=99, close=100.5))
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertFalse(position["early_breakeven_applied"])
+
+    def test_high_confluence_never_triggers_early_breakeven(self):
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
+            manager = self._manager_with_position(confluence_ratio=0.75)
+            # Same favorable close as the triggering test above, but this
+            # trade has enough confluence to not qualify.
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertFalse(position["early_breakeven_applied"])
+
 
 class PollLiveTests(unittest.TestCase):
-    def _manager_with_position(self):
+    def _manager_with_position(self, confluence_ratio=None):
         manager = PositionManager()
         execution_result = {
             "shadow": False,
@@ -372,7 +533,7 @@ class PollLiveTests(unittest.TestCase):
             "tp1_order": {"algoId": "tp1_1"},
             "tp2_order": {"algoId": "tp2_1"},
         }
-        manager.register(_plan(), execution_result)
+        manager.register(dict(_plan(), confluence_ratio=confluence_ratio), execution_result)
         return manager
 
     def test_tp1_finished_promotes_to_breakeven(self):
@@ -666,6 +827,55 @@ class PollLiveTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["tp1_order_id"], "")
+
+    def test_low_confluence_triggers_early_breakeven_before_the_normal_tp1_check(self):
+        manager = self._manager_with_position(confluence_ratio=0.25)
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
+             patch.object(exchange, "get_mark_price", return_value=102.0), \
+             patch.object(exchange, "get_algo_order_status") as status_mock, \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["early_breakeven_applied"])
+        self.assertEqual(position["sl_order_id"], "sl2")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", position["breakeven_price"])
+        cancel.assert_called_once_with("BTCUSDT", "sl1")
+        # Never reached the normal TP1/SL/TP2 status checks this cycle.
+        status_mock.assert_not_called()
+
+    def test_high_confluence_never_fetches_mark_price_or_triggers_early(self):
+        manager = self._manager_with_position(confluence_ratio=0.75)
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
+             patch.object(exchange, "get_mark_price") as mark_price_mock, \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        mark_price_mock.assert_not_called()
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertFalse(position["early_breakeven_applied"])
+
+    def test_early_breakeven_disabled_never_fetches_mark_price(self):
+        manager = self._manager_with_position(confluence_ratio=0.25)
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", False), \
+             patch.object(exchange, "get_mark_price") as mark_price_mock, \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            manager.poll_live("BTCUSDT")
+
+        mark_price_mock.assert_not_called()
 
 
 if __name__ == "__main__":
