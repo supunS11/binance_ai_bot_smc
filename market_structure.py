@@ -1,0 +1,368 @@
+"""ICT/SMC market-structure engine: swing points, BOS/CHoCH, order blocks,
+fair value gaps, liquidity pools, and premium/discount + OTE zones.
+
+Every function here is pure - a candle list in, structure out - so it runs
+identically against closed history and a live/forming last candle. That's
+what makes `live_break_check` meaningful: it re-evaluates against the
+*current* candle on every websocket tick, not only once a candle closes.
+
+Terminology (standard ICT/SMC):
+- BOS (break of structure): price breaks a swing point in the direction of
+  the prevailing trend - continuation.
+- CHoCH (change of character): price breaks a swing point *against* the
+  prevailing trend - the first warning of a reversal.
+- Order block: the last opposite-colour candle before an impulsive move
+  that caused a structure break - presumed origin of the move.
+- FVG (fair value gap): a 3-candle imbalance where candle 1's wick and
+  candle 3's wick don't overlap.
+- Buy-side / sell-side liquidity: clusters of equal highs / equal lows,
+  where breakout-buy orders and long stops respectively tend to sit.
+- Premium / discount: the top half / bottom half of the current dealing
+  range, split at its midpoint; OTE is a deeper retracement zone within
+  that half used to time entries.
+"""
+from dataclasses import dataclass
+
+import config
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass
+class SwingPoint:
+    index: int
+    open_time: int
+    price: float
+    kind: str  # "HIGH" or "LOW"
+
+
+def find_swing_points(candles, left=None, right=None):
+    """Fractal swing points: a HIGH at i where candles[i]'s high is the max
+    over the window [i-left, i+right]; symmetric for LOW. The most recent
+    `right` candles never produce a swing yet - there's nothing after them
+    to compare against - which is the correct causal behaviour for live
+    data (a swing is only confirmed once price has moved away from it)."""
+    left = int(config.SWING_LEFT if left is None else left)
+    right = int(config.SWING_RIGHT if right is None else right)
+    swings = []
+    n = len(candles)
+
+    for i in range(left, n - right):
+        window = candles[i - left:i + right + 1]
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+
+        if high == max(c["high"] for c in window):
+            swings.append(SwingPoint(i, candles[i]["open_time"], high, "HIGH"))
+
+        if low == min(c["low"] for c in window):
+            swings.append(SwingPoint(i, candles[i]["open_time"], low, "LOW"))
+
+    return swings
+
+
+def _zigzag(swings):
+    """Collapse consecutive same-kind swings, keeping the more extreme
+    one, so the sequence alternates HIGH/LOW in time order."""
+    filtered = []
+
+    for swing in sorted(swings, key=lambda s: s.index):
+        if filtered and filtered[-1].kind == swing.kind:
+            if swing.kind == "HIGH" and swing.price >= filtered[-1].price:
+                filtered[-1] = swing
+            elif swing.kind == "LOW" and swing.price <= filtered[-1].price:
+                filtered[-1] = swing
+        else:
+            filtered.append(swing)
+
+    return filtered
+
+
+def _classify_swings(swings):
+    """Walk an already-alternating (post-zigzag) swing sequence and
+    classify the current trend plus the most recent BOS/CHoCH event. A
+    trend break is defined as the newest confirmed pivot exceeding the
+    *previous* confirmed pivot in the same direction (a higher high, or a
+    lower low). Split out from structure_state so the classification logic
+    can be unit-tested against hand-built swing sequences directly."""
+    if len(swings) < 2:
+        return {"available": False}
+
+    trend = None
+    last_high = None
+    last_low = None
+    last_event = None
+
+    for swing in swings:
+        if swing.kind == "HIGH":
+            if last_high is not None and swing.price > last_high.price:
+                event_type = (
+                    "CHoCH" if trend == "BEARISH" else "BOS"
+                )
+                trend = "BULLISH"
+                last_event = {
+                    "type": event_type,
+                    "direction": "BULLISH",
+                    "index": swing.index,
+                    "price": swing.price,
+                }
+            last_high = swing
+        else:
+            if last_low is not None and swing.price < last_low.price:
+                event_type = (
+                    "CHoCH" if trend == "BULLISH" else "BOS"
+                )
+                trend = "BEARISH"
+                last_event = {
+                    "type": event_type,
+                    "direction": "BEARISH",
+                    "index": swing.index,
+                    "price": swing.price,
+                }
+            last_low = swing
+
+    return {
+        "available": True,
+        "trend": trend,
+        "last_event": last_event,
+        "last_swing_high": last_high.price if last_high else None,
+        "last_swing_low": last_low.price if last_low else None,
+        "swings": swings,
+    }
+
+
+def structure_state(candles, left=None, right=None):
+    swings = _zigzag(find_swing_points(candles, left, right))
+    return _classify_swings(swings)
+
+
+def live_break_check(candles, structure):
+    """Has the *current, possibly still-forming* candle already broken the
+    last confirmed swing level? This is the real-time advantage over
+    waiting for the candle to close before reacting."""
+    if not structure.get("available") or not candles:
+        return {"broken": False}
+
+    latest = candles[-1]
+    close = latest["close"]
+    last_high = structure.get("last_swing_high")
+    last_low = structure.get("last_swing_low")
+
+    broke_up = last_high is not None and close > last_high
+    broke_down = last_low is not None and close < last_low
+
+    return {
+        "broken": bool(broke_up or broke_down),
+        "direction": "BULLISH" if broke_up else "BEARISH" if broke_down else None,
+        "level": last_high if broke_up else last_low if broke_down else None,
+        "candle_closed": latest["closed"],
+    }
+
+
+def find_order_block(candles, index, direction):
+    """The order block for a bullish break is the last bearish (red)
+    candle before the impulsive move up; for a bearish break, the last
+    bullish (green) candle before the move down."""
+    index = min(max(index, 0), len(candles) - 1)
+
+    for i in range(index, max(index - 10, -1), -1):
+        candle = candles[i]
+        is_bullish_candle = candle["close"] > candle["open"]
+
+        if direction == "BULLISH" and not is_bullish_candle:
+            return {
+                "index": i,
+                "high": candle["high"],
+                "low": candle["low"],
+                "open_time": candle["open_time"],
+            }
+
+        if direction == "BEARISH" and is_bullish_candle:
+            return {
+                "index": i,
+                "high": candle["high"],
+                "low": candle["low"],
+                "open_time": candle["open_time"],
+            }
+
+    return None
+
+
+def find_fair_value_gaps(candles, lookback=None):
+    lookback = int(config.FVG_LOOKBACK_CANDLES if lookback is None else lookback)
+    gaps = []
+    start = max(len(candles) - lookback, 2)
+
+    for i in range(start, len(candles)):
+        first = candles[i - 2]
+        third = candles[i]
+
+        if third["low"] > first["high"]:
+            gaps.append({
+                "type": "BULLISH",
+                "top": third["low"],
+                "bottom": first["high"],
+                "index": i,
+            })
+        elif third["high"] < first["low"]:
+            gaps.append({
+                "type": "BEARISH",
+                "top": first["low"],
+                "bottom": third["high"],
+                "index": i,
+            })
+
+    return gaps
+
+
+def find_liquidity_pools(swings, tolerance_pct=None):
+    """Cluster equal highs into BUY_SIDE liquidity (above the market -
+    short stops + breakout buyers) and equal lows into SELL_SIDE liquidity
+    (below the market - long stops), requiring at least 2 touches."""
+    tolerance_pct = float(
+        config.LIQUIDITY_POOL_TOLERANCE_PCT if tolerance_pct is None else tolerance_pct
+    )
+    pools = []
+
+    for kind, label in (("HIGH", "BUY_SIDE"), ("LOW", "SELL_SIDE")):
+        points = sorted(
+            (s for s in swings if s.kind == kind),
+            key=lambda s: s.price,
+        )
+        cluster = []
+
+        for point in points:
+            if cluster and abs(point.price - cluster[-1].price) / cluster[-1].price <= tolerance_pct:
+                cluster.append(point)
+                continue
+
+            if len(cluster) >= 2:
+                pools.append({
+                    "type": label,
+                    "price": sum(p.price for p in cluster) / len(cluster),
+                    "touches": len(cluster),
+                })
+
+            cluster = [point]
+
+        if len(cluster) >= 2:
+            pools.append({
+                "type": label,
+                "price": sum(p.price for p in cluster) / len(cluster),
+                "touches": len(cluster),
+            })
+
+    return pools
+
+
+def premium_discount_zone(candles, lookback=None):
+    lookback = int(
+        config.PREMIUM_DISCOUNT_LOOKBACK_CANDLES if lookback is None else lookback
+    )
+    window = candles[-lookback:] if len(candles) > lookback else candles
+
+    if not window:
+        return {"available": False}
+
+    high = max(c["high"] for c in window)
+    low = min(c["low"] for c in window)
+
+    if high <= low:
+        return {"available": False}
+
+    midpoint = (high + low) / 2
+    range_size = high - low
+    ote_min = float(config.OTE_RETRACEMENT_MIN)
+    ote_max = float(config.OTE_RETRACEMENT_MAX)
+
+    return {
+        "available": True,
+        "range_high": high,
+        "range_low": low,
+        "midpoint": midpoint,
+        # Bullish OTE: a deep pullback down into discount before continuing
+        # up - measured as a retracement from the range high.
+        "bullish_ote_zone": (
+            high - range_size * ote_max,
+            high - range_size * ote_min,
+        ),
+        # Bearish OTE: a deep pullback up into premium before continuing
+        # down - measured as a retracement from the range low.
+        "bearish_ote_zone": (
+            low + range_size * ote_min,
+            low + range_size * ote_max,
+        ),
+    }
+
+
+def zone_for_price(zone, price):
+    if not zone.get("available"):
+        return None
+
+    return "DISCOUNT" if price < zone["midpoint"] else "PREMIUM"
+
+
+def in_ote(zone, price, direction):
+    if not zone.get("available"):
+        return False
+
+    low, high = (
+        zone["bullish_ote_zone"] if direction == "BULLISH" else zone["bearish_ote_zone"]
+    )
+    return low <= price <= high
+
+
+def average_true_range(candles, period=None):
+    period = int(config.ATR_PERIOD if period is None else period)
+
+    if len(candles) < period + 1:
+        return 0.0
+
+    window = candles[-(period + 1):]
+    true_ranges = []
+
+    for i in range(1, len(window)):
+        high = window[i]["high"]
+        low = window[i]["low"]
+        prev_close = window[i - 1]["close"]
+        true_ranges.append(max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        ))
+
+    return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+
+
+def analyze(candles):
+    """Consolidated structure snapshot for a candle list - what
+    signal_engine.py actually consumes."""
+    structure = structure_state(candles)
+
+    if not structure.get("available"):
+        return {"available": False}
+
+    swings = structure["swings"]
+    zone = premium_discount_zone(candles)
+    live_break = live_break_check(candles, structure)
+    pools = find_liquidity_pools(swings)
+    fvgs = find_fair_value_gaps(candles)
+    atr = average_true_range(candles)
+
+    return {
+        "available": True,
+        "trend": structure["trend"],
+        "last_event": structure["last_event"],
+        "last_swing_high": structure["last_swing_high"],
+        "last_swing_low": structure["last_swing_low"],
+        "zone": zone,
+        "live_break": live_break,
+        "liquidity_pools": pools,
+        "fair_value_gaps": fvgs,
+        "atr": atr,
+    }

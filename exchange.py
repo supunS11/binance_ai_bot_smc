@@ -1,0 +1,941 @@
+"""Generic Binance USDT-M futures REST plumbing.
+
+Ported from v7/v8's exchange.py: only the parts that are pure exchange
+mechanics (rate limiting, backoff, exchange-info/symbol-rules, historical
+kline fetch) - not the trend-following strategy's order-lifecycle/DCA
+reconciliation logic, which belongs to a strategy-specific execution layer
+built in a later phase, not here.
+"""
+from collections import deque
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+import re
+import threading
+import time
+
+import pandas as pd
+from binance.client import Client
+from binance.enums import SIDE_BUY, SIDE_SELL
+
+import config
+from logger import log_error, log_info, log_warning
+
+
+client = Client(config.API_KEY, config.SECRET_KEY, ping=False)
+
+_exchange_info_cache = None
+_exchange_info_cache_at = 0.0
+_exchange_info_ttl_seconds = 3600
+
+_public_request_weights = deque()
+_public_request_lock = threading.Lock()
+
+_public_rest_backoff_until = 0.0
+_public_rest_lock = threading.Lock()
+_public_rest_log_times = {}
+
+_kline_cache = {}
+_kline_cache_lock = threading.RLock()
+_kline_cache_ttl_seconds = 5
+
+_BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(r"(code=-1003|too many requests)", re.IGNORECASE)
+
+
+def sync_client_time():
+    try:
+        server_time = client.get_server_time()
+        client.timestamp_offset = (
+            server_time["serverTime"] - int(time.time() * 1000)
+        )
+        return True
+
+    except Exception as exc:
+        client.timestamp_offset = 0
+        log_warning(
+            "Binance startup time sync unavailable; "
+            "using zero timestamp offset | "
+            f"ERROR={exc}"
+        )
+        return False
+
+
+# =========================
+# RATE LIMITING / BACKOFF (ported convention from v7/v8)
+# =========================
+def _rate_limit_public_request(weight=1):
+    max_weight = float(config.BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE)
+
+    if max_weight <= 0:
+        return
+
+    window_seconds = max(float(config.BINANCE_PUBLIC_RATE_WINDOW_SECONDS), 1.0)
+    weight = max(float(weight or 1), 0.1)
+
+    while True:
+        now = time.time()
+
+        with _public_request_lock:
+            while (
+                _public_request_weights
+                and now - _public_request_weights[0][0] >= window_seconds
+            ):
+                _public_request_weights.popleft()
+
+            used_weight = sum(item[1] for item in _public_request_weights)
+
+            if used_weight + weight <= max_weight:
+                _public_request_weights.append((now, weight))
+                return
+
+            oldest_at = _public_request_weights[0][0]
+            wait_seconds = window_seconds - (now - oldest_at) + 0.05
+
+        time.sleep(min(max(wait_seconds, 0.05), 5.0))
+
+
+def _public_rest_log_allowed(key, cooldown=30):
+    now = time.time()
+
+    with _public_rest_lock:
+        last_logged_at = _public_rest_log_times.get(key, 0.0)
+
+        if now - last_logged_at < cooldown:
+            return False
+
+        _public_rest_log_times[key] = now
+        return True
+
+
+def _extract_public_rest_backoff_seconds(error):
+    message = str(error)
+    buffer_seconds = 60.0
+    match = _BAN_UNTIL_RE.search(message)
+
+    if match:
+        try:
+            banned_until_ms = int(match.group(1))
+            banned_until_seconds = banned_until_ms / 1000
+            return max(
+                banned_until_seconds - time.time() + buffer_seconds,
+                buffer_seconds,
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if _RATE_LIMIT_RE.search(message):
+        return 300.0
+
+    return 0.0
+
+
+def _set_public_rest_backoff(error, context):
+    global _public_rest_backoff_until
+
+    pause_seconds = _extract_public_rest_backoff_seconds(error)
+
+    if pause_seconds <= 0:
+        return
+
+    until = time.time() + pause_seconds
+
+    with _public_rest_lock:
+        _public_rest_backoff_until = max(_public_rest_backoff_until, until)
+
+    if _public_rest_log_allowed("public_rest_backoff_set"):
+        log_warning(
+            "Binance public REST backoff active | "
+            f"CALL={context} | PAUSE_SECONDS={round(pause_seconds, 1)} | "
+            f"ERROR={error}"
+        )
+
+
+def get_public_rest_backoff_remaining():
+    with _public_rest_lock:
+        return max(_public_rest_backoff_until - time.time(), 0.0)
+
+
+def is_public_rest_backoff_active():
+    return get_public_rest_backoff_remaining() > 0
+
+
+def _raise_if_public_rest_backoff(context):
+    remaining = get_public_rest_backoff_remaining()
+
+    if remaining <= 0:
+        return
+
+    raise RuntimeError(
+        "Binance public REST backoff active | "
+        f"CALL={context} | WAIT_SECONDS={round(remaining, 1)}"
+    )
+
+
+def _is_public_rest_backoff_error(error):
+    return "Binance public REST backoff active" in str(error)
+
+
+def _public_rest_call(context, func, *args, weight=1, **kwargs):
+    _raise_if_public_rest_backoff(context)
+    _rate_limit_public_request(weight)
+
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        if not _is_public_rest_backoff_error(exc):
+            _set_public_rest_backoff(exc, context)
+        raise
+
+
+# =========================
+# EXCHANGE INFO / SYMBOL RULES
+# =========================
+def get_exchange_info(force=False):
+    global _exchange_info_cache, _exchange_info_cache_at
+
+    now = time.time()
+
+    if (
+        force
+        or _exchange_info_cache is None
+        or now - _exchange_info_cache_at >= _exchange_info_ttl_seconds
+    ):
+        _exchange_info_cache = _public_rest_call(
+            "futures_exchange_info",
+            client.futures_exchange_info,
+            weight=config.EXCHANGE_INFO_REQUEST_WEIGHT,
+        )
+        _exchange_info_cache_at = now
+
+    return _exchange_info_cache
+
+
+def get_supported_symbols(quote_asset=None):
+    quote_asset = (quote_asset or config.QUOTE_ASSET).upper()
+
+    try:
+        symbols = set()
+
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("status") != "TRADING":
+                continue
+
+            if item.get("contractType") != "PERPETUAL":
+                continue
+
+            if item.get("quoteAsset") != quote_asset:
+                continue
+
+            symbols.add(item["symbol"])
+
+        return symbols
+
+    except Exception as exc:
+        log_error(f"supported symbols error: {exc}")
+        return set()
+
+
+def get_symbol_precision(symbol):
+    info = get_exchange_info()
+
+    for item in info.get("symbols", []):
+        if item.get("symbol") == symbol:
+            return item.get("quantityPrecision", 3)
+
+    return 3
+
+
+def get_price_precision(symbol):
+    info = get_exchange_info()
+
+    for item in info.get("symbols", []):
+        if item.get("symbol") == symbol:
+            return int(item.get("pricePrecision", 4))
+
+    return 4
+
+
+def get_symbol_price_rules(symbol):
+    try:
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+
+            filters = {
+                entry.get("filterType"): entry
+                for entry in item.get("filters", [])
+            }
+            price_filter = filters.get("PRICE_FILTER") or {}
+            return {
+                "available": True,
+                "tick_size": price_filter.get("tickSize", "0"),
+                "min_price": price_filter.get("minPrice", "0"),
+                "max_price": price_filter.get("maxPrice", "0"),
+                "precision": int(item.get("pricePrecision", 4)),
+            }
+
+    except Exception as exc:
+        log_warning(f"{symbol} price rule lookup warning: {exc}")
+
+    return {
+        "available": False,
+        "tick_size": "0",
+        "min_price": "0",
+        "max_price": "0",
+        "precision": 8,
+    }
+
+
+# =========================
+# KLINES (REST - used to seed history before the websocket feed catches
+# up; the live/forming candle for signal detection comes from ws_client)
+# =========================
+def _kline_cache_key(symbol, interval, limit):
+    return (symbol, interval, int(limit))
+
+
+def _get_cached_kline_df(key):
+    with _kline_cache_lock:
+        entry = _kline_cache.get(key)
+
+    if entry is None:
+        return None
+
+    stored_at, df = entry
+
+    if time.time() - stored_at >= _kline_cache_ttl_seconds:
+        return None
+
+    return df.copy(deep=True)
+
+
+def _store_cached_kline_df(key, df):
+    with _kline_cache_lock:
+        _kline_cache[key] = (time.time(), df.copy(deep=True))
+
+
+def get_klines(symbol, interval, limit=200):
+    try:
+        cache_key = _kline_cache_key(symbol, interval, limit)
+        cached = _get_cached_kline_df(cache_key)
+
+        if cached is not None:
+            return cached
+
+        _raise_if_public_rest_backoff("klines")
+        _rate_limit_public_request(config.KLINE_REQUEST_WEIGHT)
+
+        klines = client.futures_klines(
+            symbol=symbol,
+            interval=interval,
+            limit=limit,
+        )
+
+        df = pd.DataFrame(klines, columns=[
+            'time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'qav', 'trades', 'tbbav', 'tbqav', 'ignore'
+        ])
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+
+        _store_cached_kline_df(cache_key, df)
+        return df.copy(deep=True)
+
+    except Exception as exc:
+        if _is_public_rest_backoff_error(exc):
+            return None
+
+        _set_public_rest_backoff(exc, f"futures_klines:{symbol}:{interval}")
+        log_error(f"{symbol} klines error: {exc}")
+        return None
+
+
+def get_symbol_price_rules(symbol):
+    try:
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+
+            filters = {
+                entry.get("filterType"): entry
+                for entry in item.get("filters", [])
+            }
+            price_filter = filters.get("PRICE_FILTER") or {}
+            return {
+                "available": True,
+                "tick_size": price_filter.get("tickSize", "0"),
+                "min_price": price_filter.get("minPrice", "0"),
+                "max_price": price_filter.get("maxPrice", "0"),
+                "precision": int(item.get("pricePrecision", 4)),
+            }
+
+    except Exception as exc:
+        log_warning(f"{symbol} price rule lookup warning: {exc}")
+
+    return {
+        "available": False,
+        "tick_size": "0",
+        "min_price": "0",
+        "max_price": "0",
+        "precision": 8,
+    }
+
+
+def normalize_order_price(symbol, price, rounding="nearest"):
+    try:
+        rules = get_symbol_price_rules(symbol)
+
+        if not rules.get("available", True):
+            return 0.0
+
+        value = Decimal(str(float(price)))
+        tick = Decimal(str(rules.get("tick_size") or "0"))
+        minimum = Decimal(str(rules.get("min_price") or "0"))
+        maximum = Decimal(str(rules.get("max_price") or "0"))
+
+        if value <= 0:
+            return 0.0
+
+        if tick <= 0:
+            precision = max(int(rules.get("precision", 4)), 0)
+            return round(float(value), precision)
+
+        rounding_mode = {
+            "down": ROUND_DOWN,
+            "up": ROUND_UP,
+            "nearest": ROUND_HALF_UP,
+        }.get(str(rounding or "nearest").lower(), ROUND_HALF_UP)
+        steps = (value / tick).to_integral_value(rounding=rounding_mode)
+        normalized = steps * tick
+
+        if minimum > 0:
+            normalized = max(normalized, minimum)
+
+        if maximum > 0:
+            normalized = min(normalized, maximum)
+
+        return float(normalized)
+
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        log_warning(f"{symbol} price normalization warning: {exc}")
+        return 0.0
+
+
+def normalize_trigger_price(symbol, side, order_type, price):
+    """Round a stop/TP trigger away from the market on the side that
+    would otherwise make it trigger immediately - SL rounds against the
+    position, TP rounds against the position too but in the opposite
+    direction, matching Binance's own trigger-validation direction."""
+    side = str(side or "").upper()
+    order_type = str(order_type or "").upper()
+    take_profit = "TAKE_PROFIT" in order_type
+
+    if side == SIDE_BUY:
+        rounding = "down" if take_profit else "up"
+    else:
+        rounding = "up" if take_profit else "down"
+
+    return normalize_order_price(symbol, price, rounding=rounding)
+
+
+def get_symbol_quantity_rules(symbol, order_type="MARKET"):
+    try:
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+
+            filters = {
+                entry.get("filterType"): entry
+                for entry in item.get("filters", [])
+            }
+            order_type = str(order_type or "MARKET").upper()
+
+            if order_type == "MARKET":
+                lot_size = (
+                    filters.get("MARKET_LOT_SIZE")
+                    or filters.get("LOT_SIZE")
+                    or {}
+                )
+            else:
+                lot_size = filters.get("LOT_SIZE") or {}
+
+            return {
+                "available": True,
+                "step_size": lot_size.get("stepSize", "1"),
+                "min_qty": lot_size.get("minQty", "0"),
+                "max_qty": lot_size.get("maxQty", "0"),
+                "precision": int(item.get("quantityPrecision", 3)),
+            }
+    except Exception as exc:
+        log_warning(f"{symbol} quantity rule lookup warning: {exc}")
+
+    return {
+        "available": False,
+        "step_size": "0",
+        "min_qty": "0",
+        "max_qty": "0",
+        "precision": 8,
+    }
+
+
+def normalize_order_quantity(symbol, quantity, order_type="MARKET"):
+    try:
+        rules = get_symbol_quantity_rules(symbol, order_type=order_type)
+
+        if not rules.get("available", True):
+            return 0.0
+
+        value = Decimal(str(abs(float(quantity))))
+        step = Decimal(str(rules.get("step_size") or "1"))
+        min_qty = Decimal(str(rules.get("min_qty") or "0"))
+        max_qty = Decimal(str(rules.get("max_qty") or "0"))
+
+        if step > 0:
+            value = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+        if value < min_qty or value <= 0:
+            return 0.0
+
+        if max_qty > 0:
+            value = min(value, max_qty)
+
+        precision = max(int(rules.get("precision", 3)), 0)
+        quantum = Decimal("1").scaleb(-precision)
+        value = value.quantize(quantum, rounding=ROUND_DOWN)
+        return float(value)
+
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        log_warning(f"{symbol} quantity normalization warning: {exc}")
+        return 0.0
+
+
+def get_mark_price(symbol):
+    try:
+        mark = _public_rest_call(
+            f"futures_mark_price:{symbol}",
+            client.futures_mark_price,
+            symbol=symbol,
+            weight=1,
+        )
+        return float(mark["markPrice"])
+
+    except Exception as exc:
+        if _is_public_rest_backoff_error(exc):
+            return None
+
+        _set_public_rest_backoff(exc, f"futures_mark_price:{symbol}")
+        log_error(f"{symbol} mark price error: {exc}")
+        return None
+
+
+# =========================
+# PRIVATE REST (account/orders) - same weight-budget + backoff convention
+# as the public layer above, applied to authenticated endpoints.
+# =========================
+_private_rest_backoff_until = 0.0
+_private_rest_lock = threading.Lock()
+_private_rest_log_times = {}
+
+
+def _private_rest_log_allowed(key, cooldown=30):
+    now = time.time()
+
+    with _private_rest_lock:
+        last_logged_at = _private_rest_log_times.get(key, 0.0)
+
+        if now - last_logged_at < cooldown:
+            return False
+
+        _private_rest_log_times[key] = now
+        return True
+
+
+def _extract_private_rest_backoff_seconds(error):
+    message = str(error)
+    buffer_seconds = 60.0
+    match = _BAN_UNTIL_RE.search(message)
+
+    if match:
+        try:
+            banned_until_ms = int(match.group(1))
+            banned_until_seconds = banned_until_ms / 1000
+            return max(
+                banned_until_seconds - time.time() + buffer_seconds,
+                buffer_seconds,
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if _RATE_LIMIT_RE.search(message):
+        return 300.0
+
+    return 0.0
+
+
+def _set_private_rest_backoff(error, context):
+    global _private_rest_backoff_until
+
+    pause_seconds = _extract_private_rest_backoff_seconds(error)
+
+    if pause_seconds <= 0:
+        return
+
+    until = time.time() + pause_seconds
+
+    with _private_rest_lock:
+        _private_rest_backoff_until = max(_private_rest_backoff_until, until)
+
+    if _private_rest_log_allowed("private_rest_backoff_set"):
+        log_warning(
+            "Binance private REST backoff active | "
+            f"CALL={context} | PAUSE_SECONDS={round(pause_seconds, 1)} | "
+            f"ERROR={error}"
+        )
+
+
+def get_private_rest_backoff_remaining():
+    with _private_rest_lock:
+        return max(_private_rest_backoff_until - time.time(), 0.0)
+
+
+def is_private_rest_backoff_active():
+    return get_private_rest_backoff_remaining() > 0
+
+
+def _raise_if_private_rest_backoff(context):
+    remaining = get_private_rest_backoff_remaining()
+
+    if remaining <= 0:
+        return
+
+    raise RuntimeError(
+        "Binance private REST backoff active | "
+        f"CALL={context} | WAIT_SECONDS={round(remaining, 1)}"
+    )
+
+
+def _private_rest_call(context, func, *args, weight=0, **kwargs):
+    _raise_if_private_rest_backoff(context)
+
+    if weight > 0:
+        _rate_limit_public_request(weight)
+
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        _set_private_rest_backoff(exc, context)
+        raise
+
+
+# =========================
+# ACCOUNT / POSITIONS
+# =========================
+_balance_cache = {"time": 0.0, "value": None}
+_balance_cache_lock = threading.Lock()
+_balance_cache_ttl_seconds = 5
+
+
+def get_balance(force=False):
+    """USDT futures wallet balance, short-TTL cached so risk sizing and a
+    position-manager poll loop don't each trigger their own REST call."""
+    now = time.time()
+
+    with _balance_cache_lock:
+        cached_at, cached_value = _balance_cache["time"], _balance_cache["value"]
+
+    if not force and cached_value is not None and now - cached_at < _balance_cache_ttl_seconds:
+        return cached_value
+
+    try:
+        balances = _private_rest_call(
+            "futures_account_balance",
+            client.futures_account_balance,
+        )
+
+        for item in balances:
+            if item.get("asset") == "USDT":
+                value = float(item["balance"])
+
+                with _balance_cache_lock:
+                    _balance_cache["time"] = now
+                    _balance_cache["value"] = value
+
+                return value
+
+        return 0.0
+
+    except Exception as exc:
+        log_error(f"balance fetch error: {exc}")
+        return cached_value if cached_value is not None else 0.0
+
+
+def get_open_position_detail(symbol, force=False):
+    """Single-symbol position snapshot, one-way (non-hedge) mode only."""
+    try:
+        positions = _private_rest_call(
+            f"futures_position_information:{symbol}",
+            client.futures_position_information,
+            symbol=symbol,
+        )
+
+        for position in positions or []:
+            amount = float(position.get("positionAmt", 0) or 0)
+
+            if amount == 0:
+                continue
+
+            return {
+                "symbol": symbol,
+                "amount": amount,
+                "side": "BUY" if amount > 0 else "SELL",
+                "quantity": abs(amount),
+                "entry_price": float(position.get("entryPrice", 0) or 0),
+                "mark_price": float(position.get("markPrice", 0) or 0),
+                "unrealized_pnl": float(position.get("unRealizedProfit", 0) or 0),
+            }
+
+        return None
+
+    except Exception as exc:
+        log_error(f"{symbol} position fetch error: {exc}")
+        return None
+
+
+def has_open_position(symbol, force=True):
+    return get_open_position_detail(symbol, force=force) is not None
+
+
+def setup_leverage(symbol):
+    try:
+        response = _private_rest_call(
+            f"futures_change_leverage:{symbol}",
+            client.futures_change_leverage,
+            symbol=symbol,
+            leverage=config.LEVERAGE,
+        )
+        actual = int(response["leverage"])
+
+        if actual != config.LEVERAGE:
+            log_warning(f"{symbol} leverage mismatch | REQUESTED={config.LEVERAGE} | ACTUAL={actual}")
+            return False
+
+        log_info(f"{symbol} leverage set: {actual}x")
+        return True
+
+    except Exception as exc:
+        log_error(f"{symbol} leverage error: {exc}")
+        return False
+
+
+# =========================
+# ORDERS - entry, and TP/SL via the algo-order (conditional) endpoint,
+# same convention v7/v8 use: STOP_MARKET/TAKE_PROFIT_MARKET, MARK_PRICE
+# working type, priceProtect on, one-way mode (reduceOnly instead of a
+# positionSide close).
+# =========================
+def place_market_order(symbol, side, quantity):
+    quantity = normalize_order_quantity(symbol, quantity, order_type="MARKET")
+
+    if quantity <= 0:
+        raise ValueError(f"{symbol} entry quantity normalized to zero")
+
+    return _private_rest_call(
+        f"futures_create_order:{symbol}",
+        client.futures_create_order,
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        quantity=quantity,
+    )
+
+
+def place_algo_order(**params):
+    """SL/TP conditional orders go through Binance's algo-order namespace
+    (same as v7/v8), not the plain order endpoint - `algoStatus="FINISHED"`
+    on this namespace is the only reliable signal that a stop/TP actually
+    triggered, vs. `CANCELED`/`EXPIRED` because something else closed the
+    position first."""
+    method = getattr(client, "futures_create_algo_order", None)
+
+    if method:
+        return _private_rest_call(
+            f"futures_create_algo_order:{params.get('symbol', 'unknown')}",
+            method,
+            **params,
+        )
+
+    return _private_rest_call(
+        f"futures_create_algo_order:{params.get('symbol', 'unknown')}",
+        client._request_futures_api,
+        "post",
+        "algoOrder",
+        True,
+        data=params,
+    )
+
+
+def _accepted_order_id(order):
+    order = order or {}
+    status = str(order.get("status") or order.get("algoStatus") or "").upper()
+
+    if status in {"REJECTED", "EXPIRED", "CANCELED", "CANCELLED", "FAILED"}:
+        return ""
+
+    return order.get("orderId") or order.get("algoId") or ""
+
+
+def place_stop_loss(symbol, side, trigger_price):
+    """Full-position STOP_MARKET, closePosition=true - always closes
+    everything still open on that symbol, so it stays valid through a TP1
+    partial fill without needing to be resized."""
+    close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    trigger_price = normalize_trigger_price(symbol, side, "STOP_MARKET", trigger_price)
+
+    if trigger_price <= 0:
+        raise ValueError(f"{symbol} SL trigger price is invalid")
+
+    return place_algo_order(
+        symbol=symbol,
+        side=close_side,
+        type="STOP_MARKET",
+        stopPrice=trigger_price,
+        closePosition="true",
+        workingType="MARK_PRICE",
+        priceProtect="TRUE",
+        timeInForce="GTC",
+    )
+
+
+def place_take_profit_partial(symbol, side, quantity, trigger_price):
+    """Reduce-only TAKE_PROFIT_MARKET for an exact quantity - this is TP1,
+    closing part of the position and leaving the rest open."""
+    close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    quantity = normalize_order_quantity(symbol, quantity, order_type="CONDITIONAL")
+    trigger_price = normalize_trigger_price(symbol, side, "TAKE_PROFIT_MARKET", trigger_price)
+
+    if quantity <= 0:
+        raise ValueError(f"{symbol} TP1 quantity normalized to zero")
+
+    if trigger_price <= 0:
+        raise ValueError(f"{symbol} TP1 trigger price is invalid")
+
+    return place_algo_order(
+        symbol=symbol,
+        side=close_side,
+        type="TAKE_PROFIT_MARKET",
+        stopPrice=trigger_price,
+        quantity=quantity,
+        reduceOnly="true",
+        workingType="MARK_PRICE",
+        priceProtect="TRUE",
+        timeInForce="GTC",
+    )
+
+
+def place_take_profit_full(symbol, side, trigger_price):
+    """Full-position TAKE_PROFIT_MARKET, closePosition=true - this is TP2,
+    closing whatever remains after TP1."""
+    close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    trigger_price = normalize_trigger_price(symbol, side, "TAKE_PROFIT_MARKET", trigger_price)
+
+    if trigger_price <= 0:
+        raise ValueError(f"{symbol} TP2 trigger price is invalid")
+
+    return place_algo_order(
+        symbol=symbol,
+        side=close_side,
+        type="TAKE_PROFIT_MARKET",
+        stopPrice=trigger_price,
+        closePosition="true",
+        workingType="MARK_PRICE",
+        priceProtect="TRUE",
+        timeInForce="GTC",
+    )
+
+
+def cancel_algo_order(symbol, algo_id):
+    method = getattr(client, "futures_cancel_algo_order", None)
+
+    try:
+        if method:
+            return _private_rest_call(
+                f"futures_cancel_algo_order:{symbol}",
+                method,
+                symbol=symbol,
+                algoId=algo_id,
+            )
+
+        return _private_rest_call(
+            f"futures_cancel_algo_order:{symbol}",
+            client._request_futures_api,
+            "delete",
+            "algoOrder",
+            True,
+            data={"symbol": symbol, "algoId": algo_id},
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} algo order {algo_id} cancel warning: {exc}")
+        return None
+
+
+def get_algo_order_status(symbol, algo_id):
+    """`FINISHED` = genuinely triggered. `CANCELED`/`EXPIRED` = removed
+    without triggering (e.g. the other leg of the OCO pair filled first).
+    `NOT_FOUND` after a cancel call is the expected/successful outcome."""
+    method = getattr(client, "futures_get_algo_order", None)
+
+    try:
+        if method:
+            order = _private_rest_call(
+                f"futures_get_algo_order:{symbol}",
+                method,
+                symbol=symbol,
+                algoId=algo_id,
+            )
+        else:
+            order = _private_rest_call(
+                f"futures_get_algo_order:{symbol}",
+                client._request_futures_api,
+                "get",
+                "algoOrder",
+                True,
+                data={"symbol": symbol, "algoId": algo_id},
+            )
+
+        data = order.get("data") if isinstance(order, dict) and isinstance(order.get("data"), dict) else order
+        return str((data or {}).get("algoStatus") or (data or {}).get("status") or "").upper()
+
+    except Exception as exc:
+        message = str(exc).lower()
+
+        if "unknown order" in message or "order does not exist" in message or "not found" in message:
+            return "NOT_FOUND"
+
+        log_warning(f"{symbol} algo order {algo_id} status lookup warning: {exc}")
+        return "UNKNOWN"
+
+
+def get_24h_quote_volumes():
+    """One cheap REST call for 24h quote volume across every symbol -
+    used to rank the universe for the watchlist instead of guessing."""
+    try:
+        tickers = _public_rest_call(
+            "futures_ticker",
+            client.futures_ticker,
+            weight=40,
+        )
+        return {
+            item["symbol"]: _safe_float_local(item.get("quoteVolume"))
+            for item in tickers
+            if item.get("symbol")
+        }
+    except Exception as exc:
+        log_error(f"24h quote volume fetch error: {exc}")
+        return {}
+
+
+def _safe_float_local(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
