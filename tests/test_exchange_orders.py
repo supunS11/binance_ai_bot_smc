@@ -45,5 +45,31 @@ class OrderParameterTests(unittest.TestCase):
         self.assertEqual(kwargs["closePosition"], "true")
 
 
+class ClosePositionMarketTests(unittest.TestCase):
+    def test_closing_a_buy_position_sends_a_sell_reduce_only_order(self):
+        with patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
+             patch.object(exchange.client, "futures_create_order") as mock_order:
+            exchange.close_position_market("BTCUSDT", "BUY", 0.5)
+
+        _, kwargs = mock_order.call_args
+        self.assertEqual(kwargs["side"], "SELL")
+        self.assertEqual(kwargs["type"], "MARKET")
+        self.assertEqual(kwargs["quantity"], 0.5)
+        self.assertEqual(kwargs["reduceOnly"], "true")
+
+    def test_closing_a_sell_position_sends_a_buy_reduce_only_order(self):
+        with patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
+             patch.object(exchange.client, "futures_create_order") as mock_order:
+            exchange.close_position_market("BTCUSDT", "SELL", 0.5)
+
+        _, kwargs = mock_order.call_args
+        self.assertEqual(kwargs["side"], "BUY")
+
+    def test_zero_normalized_quantity_raises(self):
+        with patch.object(exchange, "normalize_order_quantity", return_value=0.0):
+            with self.assertRaises(ValueError):
+                exchange.close_position_market("BTCUSDT", "BUY", 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

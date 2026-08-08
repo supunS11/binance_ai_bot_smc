@@ -61,6 +61,69 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("boom", result["error"])
 
+    def test_sl_placement_failure_closes_the_just_opened_position(self):
+        # A real position now exists on the exchange (entry filled) - if
+        # SL can't be attached, it must be closed immediately rather than
+        # left both naked and untracked (main.py only registers on ok=True).
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("SL rejected")), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "place_take_profit_partial") as tp1, \
+             patch.object(exchange, "place_take_profit_full") as tp2:
+            result = execution.enter_trade(_plan())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("SL placement failed", result["error"])
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        tp1.assert_not_called()
+        tp2.assert_not_called()
+
+    def test_sl_placement_failure_survives_a_failed_close_attempt_too(self):
+        # Even the worst case (can't attach SL AND can't close the
+        # position) must not raise out of enter_trade - it has to return
+        # a normal not-ok result so the caller doesn't crash.
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("SL rejected")), \
+             patch.object(exchange, "close_position_market", side_effect=RuntimeError("close also failed")):
+            result = execution.enter_trade(_plan())
+
+        self.assertFalse(result["ok"])
+
+    def test_tp1_failure_does_not_abort_the_trade(self):
+        # SL is already attached at this point - the position is safe.
+        # A TP1 failure is degraded, not dangerous, so the trade must
+        # still be reported ok=True and get tracked.
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
+             patch.object(exchange, "place_take_profit_partial", side_effect=RuntimeError("TP1 rejected")), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
+            result = execution.enter_trade(_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(result["sl_order"])
+        self.assertIsNone(result["tp1_order"])
+        self.assertIsNotNone(result["tp2_order"])
+
+    def test_tp2_failure_does_not_abort_the_trade(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", side_effect=RuntimeError("TP2 rejected")):
+            result = execution.enter_trade(_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(result["sl_order"])
+        self.assertIsNotNone(result["tp1_order"])
+        self.assertIsNone(result["tp2_order"])
+
 
 if __name__ == "__main__":
     unittest.main()

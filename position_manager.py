@@ -14,7 +14,7 @@ import time
 
 import config
 import exchange
-from logger import log_error, log_info
+from logger import log_error, log_info, log_warning
 
 
 TP1_PENDING = "TP1_PENDING"
@@ -74,11 +74,36 @@ class PositionManager:
         return outcome
 
     def _promote_to_breakeven(self, position):
+        """Runs once TP1 is detected as filled. This is where a position
+        can legitimately have already closed entirely (the original SL
+        firing in the same window as TP1, or manual intervention) - so the
+        ground truth is checked on the exchange first rather than assuming
+        the remainder is still there. Returns an outcome string if the
+        position closed as part of this call, otherwise None - the retry
+        must never be silently repeated forever with no state change and
+        no escape hatch, since that can leave a position genuinely
+        unprotected between a failed cancel and a failed replace."""
         symbol = position["symbol"]
 
         if not config.MOVE_SL_TO_BREAKEVEN_AFTER_TP1:
             position["stage"] = BREAKEVEN_ACTIVE
-            return
+            return None
+
+        try:
+            live_position = exchange._fetch_open_position_detail(symbol)
+        except Exception as exc:
+            # Couldn't confirm ground truth this cycle (network/backoff) -
+            # do nothing rather than guess; the next poll tries again.
+            log_warning(f"{symbol} position-state check failed, retrying next poll: {exc}")
+            return None
+
+        if live_position is None:
+            # TP1 filling coincided with the position closing entirely
+            # (e.g. the original SL also triggered) - nothing left to
+            # promote. Stop retrying a doomed replacement.
+            if position["tp2_order_id"]:
+                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+            return self._close(symbol, "TP1_THEN_POSITION_ALREADY_CLOSED")
 
         try:
             if position["sl_order_id"]:
@@ -93,8 +118,51 @@ class PositionManager:
                 f"{symbol} TP1 filled | SL moved to breakeven="
                 f"{position['breakeven_price']}"
             )
+            return None
+
         except Exception as exc:
+            if "-2021" in str(exc):
+                # The breakeven trigger price is already behind current
+                # price - Binance refuses to place a stop that would fire
+                # instantly. The remainder is effectively unprotected
+                # right now, so close it at market immediately instead of
+                # leaving it exposed and retrying the same failing order.
+                log_warning(
+                    f"{symbol} breakeven level already reached by price - "
+                    "closing remainder at market"
+                )
+                return self._close_remainder_at_market(position)
+
             log_error(f"{symbol} breakeven SL replacement error: {exc}")
+            return None
+
+    def _close_remainder_at_market(self, position):
+        symbol = position["symbol"]
+
+        try:
+            live_position = exchange._fetch_open_position_detail(symbol)
+        except Exception as exc:
+            log_error(f"{symbol} market-close position check error: {exc}")
+            return None
+
+        if live_position is None:
+            if position["tp2_order_id"]:
+                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+            return self._close(symbol, "TP1_THEN_POSITION_ALREADY_CLOSED")
+
+        try:
+            exchange.close_position_market(
+                symbol, position["side"], live_position["quantity"]
+            )
+
+            if position["tp2_order_id"]:
+                exchange.cancel_algo_order(symbol, position["tp2_order_id"])
+
+            return self._close(symbol, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
+
+        except Exception as exc:
+            log_error(f"{symbol} market-close-remainder error: {exc}")
+            return None
 
     def poll_live(self, symbol):
         """Returns an outcome string if the position closed this call,
@@ -108,8 +176,7 @@ class PositionManager:
             tp1_status = exchange.get_algo_order_status(symbol, position["tp1_order_id"])
 
             if tp1_status == "FINISHED":
-                self._promote_to_breakeven(position)
-                return None
+                return self._promote_to_breakeven(position)
 
             sl_status = exchange.get_algo_order_status(symbol, position["sl_order_id"])
 

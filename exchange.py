@@ -678,33 +678,41 @@ def get_balance(force=False):
         return cached_value if cached_value is not None else 0.0
 
 
+def _fetch_open_position_detail(symbol):
+    """Raises on a REST failure instead of swallowing it - callers that
+    need to tell "confirmed flat" apart from "couldn't check right now"
+    (e.g. deciding whether to give up on a stop replacement) should call
+    this directly rather than get_open_position_detail, which collapses
+    both cases to None."""
+    positions = _private_rest_call(
+        f"futures_position_information:{symbol}",
+        client.futures_position_information,
+        symbol=symbol,
+    )
+
+    for position in positions or []:
+        amount = float(position.get("positionAmt", 0) or 0)
+
+        if amount == 0:
+            continue
+
+        return {
+            "symbol": symbol,
+            "amount": amount,
+            "side": "BUY" if amount > 0 else "SELL",
+            "quantity": abs(amount),
+            "entry_price": float(position.get("entryPrice", 0) or 0),
+            "mark_price": float(position.get("markPrice", 0) or 0),
+            "unrealized_pnl": float(position.get("unRealizedProfit", 0) or 0),
+        }
+
+    return None
+
+
 def get_open_position_detail(symbol, force=False):
     """Single-symbol position snapshot, one-way (non-hedge) mode only."""
     try:
-        positions = _private_rest_call(
-            f"futures_position_information:{symbol}",
-            client.futures_position_information,
-            symbol=symbol,
-        )
-
-        for position in positions or []:
-            amount = float(position.get("positionAmt", 0) or 0)
-
-            if amount == 0:
-                continue
-
-            return {
-                "symbol": symbol,
-                "amount": amount,
-                "side": "BUY" if amount > 0 else "SELL",
-                "quantity": abs(amount),
-                "entry_price": float(position.get("entryPrice", 0) or 0),
-                "mark_price": float(position.get("markPrice", 0) or 0),
-                "unrealized_pnl": float(position.get("unRealizedProfit", 0) or 0),
-            }
-
-        return None
-
+        return _fetch_open_position_detail(symbol)
     except Exception as exc:
         log_error(f"{symbol} position fetch error: {exc}")
         return None
@@ -755,6 +763,29 @@ def place_market_order(symbol, side, quantity):
         side=side,
         type="MARKET",
         quantity=quantity,
+    )
+
+
+def close_position_market(symbol, position_side, quantity):
+    """Immediately market-close `quantity` of an open position.
+    `position_side` is the position's own side (BUY/SELL, not the closing
+    order's side) - the closing order is placed on the opposite side with
+    reduceOnly, so it can never accidentally open a new position in the
+    other direction."""
+    close_side = SIDE_SELL if position_side == SIDE_BUY else SIDE_BUY
+    quantity = normalize_order_quantity(symbol, quantity, order_type="MARKET")
+
+    if quantity <= 0:
+        raise ValueError(f"{symbol} close quantity normalized to zero")
+
+    return _private_rest_call(
+        f"futures_create_order:{symbol}:close",
+        client.futures_create_order,
+        symbol=symbol,
+        side=close_side,
+        type="MARKET",
+        quantity=quantity,
+        reduceOnly="true",
     )
 
 

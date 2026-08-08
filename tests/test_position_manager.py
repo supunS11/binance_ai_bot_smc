@@ -150,6 +150,7 @@ class PollLiveTests(unittest.TestCase):
             return "FINISHED" if order_id == "tp1_1" else "NEW"
 
         with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}) as new_sl:
             outcome = manager.poll_live("BTCUSDT")
@@ -160,6 +161,79 @@ class PollLiveTests(unittest.TestCase):
         self.assertEqual(position["sl_order_id"], "sl2")
         cancel.assert_called_once_with("BTCUSDT", "sl1")
         new_sl.assert_called_once_with("BTCUSDT", "BUY", position["breakeven_price"])
+
+    def test_tp1_finished_but_position_already_closed_gives_up_cleanly(self):
+        # TP1 filling can coincide with the original SL also having fired
+        # (or manual intervention) - the position is genuinely gone, so
+        # this must close out tracking instead of retrying forever.
+        manager = self._manager_with_position()
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value=None), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss") as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "TP1_THEN_POSITION_ALREADY_CLOSED")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        new_sl.assert_not_called()
+        cancel.assert_called_once_with("BTCUSDT", "tp2_1")
+
+    def test_tp1_finished_but_position_check_fails_retries_next_poll(self):
+        # A transient network/backoff error while checking ground truth
+        # must NOT be treated as "position closed" - that would abandon a
+        # still-open, still-unprotected position.
+        manager = self._manager_with_position()
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", side_effect=RuntimeError("timeout")), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss") as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], TP1_PENDING)
+        cancel.assert_not_called()
+        new_sl.assert_not_called()
+
+    def test_breakeven_placement_immediately_triggers_closes_at_market(self):
+        # Binance rejects a stop that would fire the instant it's placed -
+        # that means price already passed the breakeven level, so the
+        # remainder must be closed at market instead of left unprotected.
+        manager = self._manager_with_position()
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(
+                 exchange,
+                 "_fetch_open_position_detail",
+                 return_value={"quantity": 0.5},
+             ), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(
+                 exchange,
+                 "place_stop_loss",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        market_close.assert_called_once_with("BTCUSDT", "BUY", 0.5)
+        # Both the original SL and TP2 must be cleaned up.
+        cancelled_ids = {call.args[1] for call in cancel.call_args_list}
+        self.assertIn("sl1", cancelled_ids)
+        self.assertIn("tp2_1", cancelled_ids)
 
     def test_sl_finished_closes_and_cancels_targets(self):
         manager = self._manager_with_position()
