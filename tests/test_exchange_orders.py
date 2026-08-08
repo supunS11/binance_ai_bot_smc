@@ -1,6 +1,8 @@
+import time
 import unittest
 from unittest.mock import patch
 
+import config
 import exchange
 
 
@@ -119,6 +121,12 @@ class GetSymbolMaxOrderQuantityTests(unittest.TestCase):
 
 
 class OpenInterestTests(unittest.TestCase):
+    def setUp(self):
+        exchange._oi_unavailable_symbols.clear()
+
+    def tearDown(self):
+        exchange._oi_unavailable_symbols.clear()
+
     def test_returns_open_interest_as_float(self):
         with patch.object(exchange.client, "futures_open_interest", return_value={"symbol": "BTCUSDT", "openInterest": "12345.67"}):
             result = exchange.get_open_interest("BTCUSDT")
@@ -130,6 +138,73 @@ class OpenInterestTests(unittest.TestCase):
             result = exchange.get_open_interest("BTCUSDT")
 
         self.assertIsNone(result)
+
+
+class OpenInterestUnavailableSymbolTests(unittest.TestCase):
+    """Real bug found live (2026-08-08, WATCHING=519): a large watchlist
+    includes symbols the OI endpoint permanently rejects (delisted/
+    settling/pre-trading, or simply invalid) - unhandled, these got
+    retried and logged on every single poll cycle forever."""
+
+    def setUp(self):
+        exchange._oi_unavailable_symbols.clear()
+
+    def tearDown(self):
+        exchange._oi_unavailable_symbols.clear()
+
+    def test_delisted_symbol_error_marks_it_unavailable_and_skips_future_calls(self):
+        error = Exception("APIError(code=-4108): Symbol is on delivering or delivered or settling or closed or pre-trading.")
+
+        with patch.object(exchange.client, "futures_open_interest", side_effect=error) as mock_call:
+            first = exchange.get_open_interest("ALLOUSDT")
+            second = exchange.get_open_interest("ALLOUSDT")
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        # Second call never hit the network - short-circuited by the cooldown.
+        self.assertEqual(mock_call.call_count, 1)
+
+    def test_invalid_symbol_error_also_triggers_the_cooldown(self):
+        error = Exception("APIError(code=-1121): Invalid symbol.")
+
+        with patch.object(exchange.client, "futures_open_interest", side_effect=error) as mock_call:
+            exchange.get_open_interest("IRYSUSDT")
+            exchange.get_open_interest("IRYSUSDT")
+
+        self.assertEqual(mock_call.call_count, 1)
+
+    def test_unavailable_symbol_is_retried_again_after_the_cooldown_expires(self):
+        error = Exception("APIError(code=-4108): Symbol is on delivering or delivered or settling or closed or pre-trading.")
+
+        with patch.object(config, "OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 60), \
+             patch.object(exchange.client, "futures_open_interest", side_effect=error) as mock_call:
+            exchange.get_open_interest("ALLOUSDT")
+
+            with patch.object(exchange.time, "time", return_value=time.time() + 61):
+                exchange.get_open_interest("ALLOUSDT")
+
+        self.assertEqual(mock_call.call_count, 2)
+
+    def test_unrelated_error_does_not_trigger_the_cooldown(self):
+        with patch.object(exchange.client, "futures_open_interest", side_effect=RuntimeError("boom")) as mock_call:
+            exchange.get_open_interest("BTCUSDT")
+            exchange.get_open_interest("BTCUSDT")
+
+        self.assertEqual(mock_call.call_count, 2)
+
+    def test_a_symbol_that_recovers_clears_its_unavailable_marker(self):
+        error = Exception("APIError(code=-4108): Symbol is on delivering or delivered or settling or closed or pre-trading.")
+
+        with patch.object(config, "OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 60), \
+             patch.object(exchange.client, "futures_open_interest", side_effect=error):
+            exchange.get_open_interest("ALLOUSDT")
+
+        with patch.object(exchange.time, "time", return_value=time.time() + 61), \
+             patch.object(exchange.client, "futures_open_interest", return_value={"symbol": "ALLOUSDT", "openInterest": "500"}):
+            result = exchange.get_open_interest("ALLOUSDT")
+
+        self.assertEqual(result, 500.0)
+        self.assertNotIn("ALLOUSDT", exchange._oi_unavailable_symbols)
 
 
 class CancelAllOpenOrdersTests(unittest.TestCase):

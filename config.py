@@ -136,6 +136,15 @@ OI_CONFIRMATION_ENABLED = env_bool("OI_CONFIRMATION_ENABLED", "True")
 OI_POLL_INTERVAL_SECONDS = env_int("OI_POLL_INTERVAL_SECONDS", 60)
 OI_LOOKBACK_SECONDS = env_int("OI_LOOKBACK_SECONDS", 900)
 OI_HISTORY_MAX_SAMPLES = env_int("OI_HISTORY_MAX_SAMPLES", 60)
+# Evidence (2026-08-08, live, WATCHING=519): a large watchlist includes
+# symbols the OI endpoint will never answer for - delisted/settling/
+# pre-trading (-4108) or simply no longer valid (-1121, e.g. stale
+# entries surviving in the hourly exchange-info cache). Left unhandled,
+# these get retried and logged on every single poll cycle forever. Skip a
+# symbol that just failed with one of these permanent-style errors for
+# this long before trying it again, instead of hammering it every
+# OI_POLL_INTERVAL_SECONDS indefinitely.
+OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS = env_int("OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 3600)
 # Liquidation clustering - informational only, NOT a gate. Real forced
 # liquidations at/around a detected sweep are the closest confirmation
 # ICT's "stop hunt" concept has to actual ground truth: a BULLISH break

@@ -782,10 +782,29 @@ def get_all_open_positions():
         return []
 
 
+_OI_UNAVAILABLE_SYMBOL_RE = re.compile(r"code=-4108|code=-1121")
+_oi_unavailable_symbols = {}
+_oi_unavailable_lock = threading.Lock()
+
+
 def get_open_interest(symbol):
     """Current total open interest (in contracts) for a symbol. Binance
     has no public OI websocket stream, so this is REST-polled - see
-    open_interest.py, which turns a series of these into a % change."""
+    open_interest.py, which turns a series of these into a % change.
+
+    A symbol that's delisted/settling/pre-trading (-4108) or simply no
+    longer a valid symbol (-1121 - can outlive the hourly exchange-info
+    cache) will never answer here - skip it for
+    OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS after the first such failure
+    instead of hitting the same permanent error on every single poll."""
+    now = time.time()
+
+    with _oi_unavailable_lock:
+        unavailable_until = _oi_unavailable_symbols.get(symbol, 0.0)
+
+    if now < unavailable_until:
+        return None
+
     try:
         data = _public_rest_call(
             f"futures_open_interest:{symbol}",
@@ -793,10 +812,28 @@ def get_open_interest(symbol):
             symbol=symbol,
             weight=1,
         )
+
+        with _oi_unavailable_lock:
+            _oi_unavailable_symbols.pop(symbol, None)
+
         return float(data["openInterest"])
 
     except Exception as exc:
         if _is_public_rest_backoff_error(exc):
+            return None
+
+        if _OI_UNAVAILABLE_SYMBOL_RE.search(str(exc)):
+            cooldown = max(float(config.OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS), 0)
+
+            with _oi_unavailable_lock:
+                _oi_unavailable_symbols[symbol] = now + cooldown
+
+            if _public_rest_log_allowed(f"oi_unavailable:{symbol}", cooldown=cooldown):
+                log_warning(
+                    f"{symbol} open interest unavailable (delisted/settling/invalid) - "
+                    f"skipping for {int(cooldown / 60)}m | ERROR={exc}"
+                )
+
             return None
 
         _set_public_rest_backoff(exc, f"futures_open_interest:{symbol}")
