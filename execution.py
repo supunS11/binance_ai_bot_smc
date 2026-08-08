@@ -71,6 +71,21 @@ def enter_trade(plan):
                 f"after SL placement failure - manual intervention needed: "
                 f"{close_exc}"
             )
+
+        if "-4130" in str(exc):
+            # -4130 means a conflicting closePosition stop/TP was already
+            # sitting on this symbol before this entry even started - real
+            # bug found live (STGUSDT/DEXEUSDT, 2026-08-08): that order
+            # survives the market-close above untouched (closePosition
+            # orders aren't cancelled just because the position went flat),
+            # so leaving it in place made every future entry attempt on
+            # this symbol hit the identical -4130 forever, every eval
+            # cycle, each one opening and immediately flattening a real
+            # position for no reason. Clear it so the next attempt has a
+            # clean slate. cancel_all_open_orders never raises (each of
+            # its two endpoint calls is independently try/excepted).
+            exchange.cancel_all_open_orders(symbol)
+
         return {"ok": False, "shadow": False, "error": f"SL placement failed: {exc}"}
 
     # TP1/TP2 are best-effort from here: the position already has real

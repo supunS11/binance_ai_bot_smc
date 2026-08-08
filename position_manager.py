@@ -61,6 +61,17 @@ class PositionManager:
         cooldown = max(int(config.SYMBOL_REENTRY_COOLDOWN_SECONDS), 0)
         return (time.time() - closed_at) < cooldown
 
+    def mark_entry_failure(self, symbol):
+        """A failed entry (leverage rejected, SL placement failed, etc.)
+        never reaches register(), so is_in_cooldown()'s normal trigger
+        (_close()) never fires for it either - real bug found live
+        (STGUSDT/DEXEUSDT, 2026-08-08): a symbol that fails entry for a
+        persistent reason got retried on every single eval cycle with no
+        backoff at all, each attempt opening and market-closing a real
+        position. Route a failed attempt through the same cooldown a
+        normal close gets, so a broken symbol backs off instead."""
+        self._closed_at[symbol] = time.time()
+
     def open_count(self):
         return len(self.positions)
 

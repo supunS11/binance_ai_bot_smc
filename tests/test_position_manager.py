@@ -246,6 +246,19 @@ class ReentryCooldownTests(unittest.TestCase):
         with patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 0):
             self.assertFalse(manager.is_in_cooldown("BTCUSDT"))
 
+    def test_mark_entry_failure_starts_the_cooldown_too(self):
+        # Real bug found live (STGUSDT/DEXEUSDT, 2026-08-08): a failed
+        # entry never reaches register()/_close(), so is_in_cooldown()'s
+        # only trigger never fired for it - a symbol that keeps failing
+        # entry for a persistent reason got retried on every single eval
+        # cycle with no backoff at all.
+        manager = PositionManager()
+
+        with patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 900):
+            self.assertFalse(manager.is_in_cooldown("STGUSDT"))
+            manager.mark_entry_failure("STGUSDT")
+            self.assertTrue(manager.is_in_cooldown("STGUSDT"))
+
 
 class RegisterTests(unittest.TestCase):
     def test_shadow_registration_has_no_order_ids(self):

@@ -97,6 +97,7 @@ def _evaluate_symbol(feed, symbol, positions, balance):
 
     if not execution_result.get("ok"):
         log_warning(f"{symbol} entry failed | {execution_result.get('error')}")
+        positions.mark_entry_failure(symbol)
         return
 
     trade_id = signal_journal.append_signal(result, plan)

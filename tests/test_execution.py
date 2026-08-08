@@ -94,6 +94,42 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         tp1.assert_not_called()
         tp2.assert_not_called()
 
+    def test_sl_failure_with_4130_cancels_the_stray_conflicting_order(self):
+        # Real bug found live (STGUSDT/DEXEUSDT, 2026-08-08): -4130 means a
+        # conflicting closePosition stop/TP was already sitting on this
+        # symbol before this entry started. Left in place, that same stray
+        # order survives the market-close untouched (closePosition orders
+        # aren't cancelled just because the position went flat) and blocks
+        # every future entry on this symbol with the identical error,
+        # forever. Must be cleared as part of this same recovery.
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("APIError(code=-4130): An open stop or take profit order with GTE and closePosition in the direction is existing.")), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            result = execution.enter_trade(_plan())
+
+        self.assertFalse(result["ok"])
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        cancel_all.assert_called_once_with("BTCUSDT")
+
+    def test_sl_failure_without_4130_does_not_touch_other_orders(self):
+        # A plain SL rejection unrelated to a conflicting order has nothing
+        # to clean up - calling cancel_all_open_orders here would be a
+        # no-op at best and a surprising side effect at worst.
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("SL rejected")), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            result = execution.enter_trade(_plan())
+
+        self.assertFalse(result["ok"])
+        close_market.assert_called_once()
+        cancel_all.assert_not_called()
+
     def test_sl_placement_failure_survives_a_failed_close_attempt_too(self):
         # Even the worst case (can't attach SL AND can't close the
         # position) must not raise out of enter_trade - it has to return
