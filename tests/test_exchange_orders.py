@@ -45,6 +45,79 @@ class OrderParameterTests(unittest.TestCase):
         self.assertEqual(kwargs["closePosition"], "true")
 
 
+def _exchange_info(symbol, lot_size_max, market_lot_size_max):
+    return {
+        "symbols": [{
+            "symbol": symbol,
+            "quantityPrecision": 3,
+            "filters": [
+                {
+                    "filterType": "LOT_SIZE",
+                    "stepSize": "1",
+                    "minQty": "1",
+                    "maxQty": str(lot_size_max),
+                },
+                {
+                    "filterType": "MARKET_LOT_SIZE",
+                    "stepSize": "1",
+                    "minQty": "1",
+                    "maxQty": str(market_lot_size_max),
+                },
+            ],
+        }]
+    }
+
+
+class QuantityRuleMaxFilterTests(unittest.TestCase):
+    """Real bug found live (XAIUSDT, 2026-08-08): a TAKE_PROFIT_MARKET
+    TP1 quantity that passed LOT_SIZE's max alone still got rejected by
+    Binance with -4005 "Quantity greater than max quantity" - conditional
+    orders that execute as MARKET once triggered are apparently validated
+    against the tighter of the two filters, not LOT_SIZE alone."""
+
+    def test_conditional_order_type_uses_the_tighter_of_both_filters(self):
+        with patch.object(exchange, "get_exchange_info", return_value=_exchange_info("XAIUSDT", 900000, 300000)):
+            rules = exchange.get_symbol_quantity_rules("XAIUSDT", order_type="CONDITIONAL")
+
+        self.assertEqual(rules["max_qty"], "300000.0")
+
+    def test_market_order_type_still_uses_market_lot_size(self):
+        with patch.object(exchange, "get_exchange_info", return_value=_exchange_info("XAIUSDT", 900000, 300000)):
+            rules = exchange.get_symbol_quantity_rules("XAIUSDT", order_type="MARKET")
+
+        self.assertEqual(rules["max_qty"], "300000")
+
+    def test_conditional_falls_back_to_lot_size_when_market_lot_size_missing(self):
+        info = {
+            "symbols": [{
+                "symbol": "XAIUSDT",
+                "quantityPrecision": 3,
+                "filters": [
+                    {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1", "maxQty": "900000"},
+                ],
+            }]
+        }
+
+        with patch.object(exchange, "get_exchange_info", return_value=info):
+            rules = exchange.get_symbol_quantity_rules("XAIUSDT", order_type="CONDITIONAL")
+
+        self.assertEqual(rules["max_qty"], "900000.0")
+
+
+class GetSymbolMaxOrderQuantityTests(unittest.TestCase):
+    def test_returns_the_tighter_max_across_market_and_conditional(self):
+        with patch.object(exchange, "get_exchange_info", return_value=_exchange_info("XAIUSDT", 900000, 300000)):
+            result = exchange.get_symbol_max_order_quantity("XAIUSDT")
+
+        self.assertEqual(result, 300000.0)
+
+    def test_returns_zero_when_symbol_unknown(self):
+        with patch.object(exchange, "get_exchange_info", return_value={"symbols": []}):
+            result = exchange.get_symbol_max_order_quantity("DOESNOTEXIST")
+
+        self.assertEqual(result, 0.0)
+
+
 class OpenInterestTests(unittest.TestCase):
     def test_returns_open_interest_as_float(self):
         with patch.object(exchange.client, "futures_open_interest", return_value={"symbol": "BTCUSDT", "openInterest": "12345.67"}):

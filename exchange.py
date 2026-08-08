@@ -458,21 +458,35 @@ def get_symbol_quantity_rules(symbol, order_type="MARKET"):
                 for entry in item.get("filters", [])
             }
             order_type = str(order_type or "MARKET").upper()
+            lot_size = filters.get("LOT_SIZE") or {}
 
             if order_type == "MARKET":
-                lot_size = (
-                    filters.get("MARKET_LOT_SIZE")
-                    or filters.get("LOT_SIZE")
-                    or {}
-                )
+                lot_size = filters.get("MARKET_LOT_SIZE") or lot_size or {}
+                max_qty = lot_size.get("maxQty", "0")
             else:
-                lot_size = filters.get("LOT_SIZE") or {}
+                # Algo/conditional orders that carry an explicit quantity
+                # (TAKE_PROFIT_MARKET's partial TP1 leg) execute as a
+                # MARKET order once triggered - confirmed live (XAIUSDT,
+                # 2026-08-08): a TP1 quantity that passed LOT_SIZE's max
+                # alone still got rejected server-side with -4005 "Quantity
+                # greater than max quantity". Clamp to whichever of
+                # LOT_SIZE/MARKET_LOT_SIZE is tighter instead of assuming
+                # which one Binance enforces for this undocumented case.
+                market_lot_size = filters.get("MARKET_LOT_SIZE") or {}
+                candidates = [
+                    value for value in (
+                        _safe_float_local(lot_size.get("maxQty")),
+                        _safe_float_local(market_lot_size.get("maxQty")),
+                    )
+                    if value > 0
+                ]
+                max_qty = str(min(candidates)) if candidates else lot_size.get("maxQty", "0")
 
             return {
                 "available": True,
                 "step_size": lot_size.get("stepSize", "1"),
                 "min_qty": lot_size.get("minQty", "0"),
-                "max_qty": lot_size.get("maxQty", "0"),
+                "max_qty": max_qty,
                 "precision": int(item.get("quantityPrecision", 3)),
             }
     except Exception as exc:
@@ -485,6 +499,20 @@ def get_symbol_quantity_rules(symbol, order_type="MARKET"):
         "max_qty": "0",
         "precision": 8,
     }
+
+
+def get_symbol_max_order_quantity(symbol):
+    """The most restrictive max order quantity across every order type
+    this bot actually places for a symbol over a trade's lifecycle
+    (MARKET for entry, TAKE_PROFIT_MARKET for the TP1 partial). Sizing a
+    position against only one of these lets the other get rejected later
+    with -4005 once TP1 is a fraction of an entry quantity that was only
+    ever checked against its own filter - size against the tightest limit
+    up front instead."""
+    market_max = _safe_float_local(get_symbol_quantity_rules(symbol, order_type="MARKET").get("max_qty"))
+    algo_max = _safe_float_local(get_symbol_quantity_rules(symbol, order_type="CONDITIONAL").get("max_qty"))
+    candidates = [value for value in (market_max, algo_max) if value > 0]
+    return min(candidates) if candidates else 0.0
 
 
 def normalize_order_quantity(symbol, quantity, order_type="MARKET"):

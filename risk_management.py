@@ -1,7 +1,7 @@
 import math
 
 import config
-from exchange import get_symbol_precision
+from exchange import get_symbol_max_order_quantity, get_symbol_precision
 
 
 MIN_NOTIONAL = 5.0
@@ -68,6 +68,21 @@ def calculate_position_size(
         max_notional = base_notional * 1.5
         max_qty = max_notional / entry_price
         quantity = min(quantity, max_qty)
+
+        # Real exchange ceiling, independent of the margin-based sanity
+        # cap above - a low-priced/volatile symbol (e.g. risk-based sizing
+        # on XAIUSDT) can need a contract count that clears max_notional
+        # comfortably but still exceeds Binance's own max order quantity.
+        # Left unclamped here, the entry order silently gets cut down to
+        # this same limit anyway at placement time (normalize_order_quantity)
+        # while tp1_quantity/tp2_quantity (exact fractions of the
+        # uncapped `quantity` returned from here) stay oversized and get
+        # rejected later with -4005 - size against it up front so every
+        # leg of the trade agrees on the same real position size.
+        exchange_max_qty = get_symbol_max_order_quantity(symbol)
+
+        if exchange_max_qty > 0:
+            quantity = min(quantity, exchange_max_qty)
 
         precision = get_symbol_precision(symbol)
         quantity = _round_quantity_down(quantity, precision)
