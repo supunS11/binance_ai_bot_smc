@@ -722,6 +722,70 @@ def has_open_position(symbol, force=True):
     return get_open_position_detail(symbol, force=force) is not None
 
 
+def get_all_open_positions():
+    """Every non-zero position on the account, account-wide, in one call
+    - used for startup reconciliation instead of checking symbol by
+    symbol (and catches a position outside the current watchlist too, if
+    SCAN_SYMBOLS changed since it was opened)."""
+    try:
+        positions = _private_rest_call(
+            "futures_position_information:all",
+            client.futures_position_information,
+        )
+        result = []
+
+        for position in positions or []:
+            amount = float(position.get("positionAmt", 0) or 0)
+
+            if amount == 0:
+                continue
+
+            result.append({
+                "symbol": position["symbol"],
+                "side": "BUY" if amount > 0 else "SELL",
+                "quantity": abs(amount),
+                "entry_price": float(position.get("entryPrice", 0) or 0),
+            })
+
+        return result
+
+    except Exception as exc:
+        log_error(f"account-wide open positions fetch error: {exc}")
+        return []
+
+
+def get_open_algo_orders(symbol):
+    """Every open algo/conditional order (our SL/TP1/TP2) for a symbol -
+    used to rebuild position tracking on startup reconciliation."""
+    method = getattr(client, "futures_get_open_algo_orders", None)
+
+    try:
+        if method:
+            response = _private_rest_call(
+                f"futures_get_open_algo_orders:{symbol}",
+                method,
+                symbol=symbol,
+            )
+        else:
+            response = _private_rest_call(
+                f"futures_get_open_algo_orders:{symbol}",
+                client._request_futures_api,
+                "get",
+                "openAlgoOrders",
+                True,
+                data={"symbol": symbol},
+            )
+
+        if isinstance(response, dict) and isinstance(response.get("data"), list):
+            return response["data"]
+
+        return response if isinstance(response, list) else []
+
+    except Exception as exc:
+        log_error(f"{symbol} open algo orders fetch error: {exc}")
+        return []
+
+
 def setup_leverage(symbol):
     try:
         response = _private_rest_call(

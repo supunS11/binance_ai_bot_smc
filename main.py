@@ -142,6 +142,10 @@ def main():
     feed.start()
 
     positions = PositionManager()
+
+    if config.EXECUTION_MODE == "LIVE":
+        positions.reconcile_on_startup()
+
     eval_interval = max(config.SIGNAL_EVAL_INTERVAL_SECONDS, 1)
     heartbeat_every = max(int(30 / eval_interval), 1)
     tick = 0

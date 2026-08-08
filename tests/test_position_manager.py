@@ -56,6 +56,107 @@ def _candle(high, low):
     return {"open_time": 0, "open": high, "high": high, "low": low, "close": high, "volume": 1, "closed": False}
 
 
+class ReconcileOnStartupTests(unittest.TestCase):
+    def _live_position(self, symbol="BTCUSDT", side="BUY", entry=100.0, qty=1.0):
+        return {"symbol": symbol, "side": side, "entry_price": entry, "quantity": qty}
+
+    def test_no_open_positions_does_nothing(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[]):
+            manager.reconcile_on_startup()
+
+        self.assertEqual(manager.open_count(), 0)
+
+    def test_already_tracked_symbol_is_not_re_adopted(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True})
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders") as get_orders:
+            manager.reconcile_on_startup()
+
+        get_orders.assert_not_called()
+
+    def test_full_order_set_found_adopts_with_real_prices_and_ids(self):
+        manager = PositionManager()
+        open_orders = [
+            {"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "false", "triggerPrice": "102", "origQty": "0.8", "algoId": "tp1_1"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["sl_price"], 98.0)
+        self.assertEqual(position["tp1_price"], 102.0)
+        self.assertEqual(position["tp2_price"], 104.0)
+        self.assertEqual(position["sl_order_id"], "sl1")
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+        self.assertEqual(position["tp2_order_id"], "tp2_1")
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertTrue(position["trade_id"].startswith("BTCUSDT_RECOVERED_"))
+
+    def test_only_sl_and_tp2_found_means_tp1_already_resolved(self):
+        manager = PositionManager()
+        open_orders = [
+            {"type": "STOP_MARKET", "triggerPrice": "100.02", "algoId": "sl2"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertEqual(position["tp1_order_id"], "")
+
+    def test_no_stop_loss_found_places_an_emergency_stop(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}) as place_sl, \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.3):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        place_sl.assert_called_once()
+        self.assertEqual(position["sl_order_id"], "emergency_sl")
+        # Emergency stop is at least the configured minimum distance away.
+        self.assertLessEqual(position["sl_price"], 100.0 * (1 - 0.003))
+
+    def test_no_orders_at_all_still_produces_a_trackable_position(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["tp1_order_id"], "")
+        self.assertEqual(position["tp2_order_id"], "")
+        self.assertIsNotNone(position["tp1_price"])
+        self.assertIsNotNone(position["tp2_price"])
+
+    def test_emergency_stop_placement_failure_does_not_raise(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")):
+            manager.reconcile_on_startup()  # must not raise
+
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_order_id"], "")
+
+
 class RegisterTests(unittest.TestCase):
     def test_shadow_registration_has_no_order_ids(self):
         manager = PositionManager()
@@ -330,6 +431,72 @@ class PollLiveTests(unittest.TestCase):
     def test_unknown_symbol_returns_none(self):
         manager = PositionManager()
         self.assertIsNone(manager.poll_live("NOPE"))
+
+    def test_missing_order_id_is_never_sent_to_the_status_lookup(self):
+        # A blank algoId is a guaranteed -1102 from Binance on every call -
+        # this must short-circuit locally instead of hitting the exchange.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp1_order_id"] = ""
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW") as status, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": ""}):
+            manager.poll_live("BTCUSDT")
+
+        called_ids = {call.args[1] for call in status.call_args_list}
+        self.assertNotIn("", called_ids)
+
+    def test_missing_tp1_order_is_recovered(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp1_order_id"] = ""
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(
+                 exchange, "place_take_profit_partial", return_value={"algoId": "tp1_new"}
+             ) as recover:
+            manager.poll_live("BTCUSDT")
+
+        recover.assert_called_once()
+        self.assertEqual(manager.positions["BTCUSDT"]["tp1_order_id"], "tp1_new")
+
+    def test_missing_tp2_order_is_recovered_in_either_stage(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp2_order_id"] = ""
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(
+                 exchange, "place_take_profit_full", return_value={"algoId": "tp2_new"}
+             ) as recover:
+            manager.poll_live("BTCUSDT")
+
+        recover.assert_called_once()
+        self.assertEqual(manager.positions["BTCUSDT"]["tp2_order_id"], "tp2_new")
+
+    def test_tp1_recovery_is_not_attempted_once_in_breakeven_stage(self):
+        # TP1 is already resolved by the time BREAKEVEN_ACTIVE is reached -
+        # a blank tp1_order_id there is expected (it filled), not missing.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp1_order_id"] = ""
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "place_take_profit_partial") as recover:
+            manager.poll_live("BTCUSDT")
+
+        recover.assert_not_called()
+
+    def test_recovery_failure_is_handled_gracefully(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["tp1_order_id"] = ""
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(
+                 exchange, "place_take_profit_partial", side_effect=RuntimeError("rejected")
+             ):
+            outcome = manager.poll_live("BTCUSDT")  # must not raise
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["tp1_order_id"], "")
 
 
 if __name__ == "__main__":
