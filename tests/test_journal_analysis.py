@@ -7,10 +7,12 @@ import signal_journal
 import journal_analysis as ja
 
 
-def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_r_multiple=None, **signal_fields):
+def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_r_multiple=None, closed_at=None, **signal_fields):
     """Writes a signal row (and optionally its outcome row) directly via
     the real signal_journal writer, so these tests exercise the exact
-    on-disk format the analysis code has to parse."""
+    on-disk format the analysis code has to parse. `closed_at` (unix
+    seconds) controls the outcome row's timestamp, for testing the
+    since_timestamp filter."""
     fields = {
         "symbol": symbol,
         "signal": "BUY",
@@ -35,10 +37,17 @@ def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_
         signal_journal.append_signal(fields, plan)
 
         if outcome:
-            signal_journal.append_outcome(
-                symbol, outcome, trade_id,
-                mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
-            )
+            if closed_at is not None:
+                with patch.object(signal_journal.time, "time", return_value=closed_at):
+                    signal_journal.append_outcome(
+                        symbol, outcome, trade_id,
+                        mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
+                    )
+            else:
+                signal_journal.append_outcome(
+                    symbol, outcome, trade_id,
+                    mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
+                )
 
 
 def _write_outcome_only(path, trade_id, symbol, outcome, mae_r_multiple=None, mfe_r_multiple=None):
@@ -175,6 +184,36 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         report = ja.summarize(self.journal_path)
 
         self.assertNotIn("excluded", report)
+
+    def test_since_timestamp_excludes_trades_that_closed_before_it(self):
+        # Real need found live (2026-08-09): a fixed-size batch of stale
+        # pre-fix rows doesn't get diluted out just because more trades
+        # pile up in a different outcome bucket - most need to be
+        # excluded outright by close time, not averaged against forever.
+        _write_trade(self.journal_path, "OLD", "BTCUSDT", outcome="TP2_HIT", closed_at=1000.0)
+        _write_trade(self.journal_path, "NEW", "ETHUSDT", outcome="SL_HIT", closed_at=2000.0)
+
+        report = ja.summarize(self.journal_path, since_timestamp=1500.0)
+
+        self.assertIn("Resolved trades: 1", report)
+        self.assertIn("LOSS=1", report)
+        self.assertIn("WIN=0", report)
+
+    def test_since_timestamp_none_includes_everything(self):
+        _write_trade(self.journal_path, "OLD", "BTCUSDT", outcome="TP2_HIT", closed_at=1000.0)
+        _write_trade(self.journal_path, "NEW", "ETHUSDT", outcome="SL_HIT", closed_at=2000.0)
+
+        report = ja.summarize(self.journal_path, since_timestamp=None)
+
+        self.assertIn("Resolved trades: 2", report)
+
+    def test_no_trades_in_window_gives_a_clear_message(self):
+        _write_trade(self.journal_path, "OLD", "BTCUSDT", outcome="TP2_HIT", closed_at=1000.0)
+
+        report = ja.summarize(self.journal_path, since_timestamp=5000.0)
+
+        self.assertIn("No resolved", report)
+        self.assertIn("in this window", report)
 
 
 if __name__ == "__main__":

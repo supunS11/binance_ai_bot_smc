@@ -4,7 +4,12 @@ fields captured at signal time - the actual mechanism for answering "why
 did these SL hit" with evidence instead of a guess.
 
 Run directly on the machine with the real journal:
-    python journal_analysis.py
+    python journal_analysis.py [hours_back]
+
+`hours_back` restricts this to trades that CLOSED within that window -
+use it to look only at trades resolved after a deploy/fix, since a fixed
+number of stale pre-fix rows doesn't get diluted out just because more
+trades pile up elsewhere. Omit it to include the whole journal.
 
 Only trades logged after the trade_id correlation fix (this file's
 counterpart change in signal_journal.py/position_manager.py) can be
@@ -12,6 +17,7 @@ joined - older rows without a trade_id are silently skipped, not guessed
 at via symbol/time proximity.
 """
 import csv
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -156,15 +162,37 @@ def _breakdown_lines(resolved, label, key_fn):
     return lines
 
 
-def summarize(journal_path=None):
+def _closed_at(trade):
+    """The outcome row's timestamp (the trade's actual close time) - since
+    load_trades() merges non-blank fields from both rows and the outcome
+    row is always written later, "timestamp" in the merged record ends up
+    being the close time, not the original signal time."""
+    try:
+        return float(trade.get("timestamp", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def summarize(journal_path=None, since_timestamp=None):
+    """`since_timestamp` (unix seconds) restricts this to trades that
+    CLOSED after that point - the way to look only at trades resolved
+    after a fix/deploy, instead of a fixed-size batch of stale pre-fix
+    rows quietly dragging down an average forever (real case found live,
+    2026-08-09: a since-fixed MAE/MFE bug's corrupted rows don't get
+    diluted out just because more trades pile up in a different outcome
+    bucket - most of them need to be excluded outright)."""
     trades = load_trades(journal_path)
-    resolved = {tid: t for tid, t in trades.items() if t.get("outcome")}
+    resolved = {
+        tid: t for tid, t in trades.items()
+        if t.get("outcome") and (since_timestamp is None or _closed_at(t) >= since_timestamp)
+    }
 
     if not resolved:
         return (
-            "No resolved (closed) trades with a matching signal row yet. "
-            "This needs trades opened after the trade_id correlation fix - "
-            "let more run, then check again."
+            "No resolved (closed) trades with a matching signal row yet"
+            + (" in this window" if since_timestamp else "")
+            + ". This needs trades opened after the trade_id correlation "
+            "fix - let more run, then check again."
         )
 
     lines = [f"Resolved trades: {len(resolved)}"]
@@ -197,4 +225,8 @@ def summarize(journal_path=None):
 
 
 if __name__ == "__main__":
-    print(summarize())
+    import sys
+
+    hours_back = float(sys.argv[1]) if len(sys.argv) > 1 else None
+    since = (time.time() - hours_back * 3600) if hours_back else None
+    print(summarize(since_timestamp=since))
