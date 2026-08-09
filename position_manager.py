@@ -110,6 +110,11 @@ class PositionManager:
             "early_breakeven_applied": False,
             "mae_price": plan["entry_price"],
             "mfe_price": plan["entry_price"],
+            # Fixed at entry, never touched again - see
+            # _mae_mfe_r_multiples for why this must never be re-derived
+            # from position["sl_price"] later (that field legitimately
+            # moves to the breakeven price once a trade is promoted).
+            "risk_distance": plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"]),
         }
         self.positions[symbol] = position
         return position
@@ -223,6 +228,18 @@ class PositionManager:
             # way to recover the price path from before this restart.
             "mae_price": entry_price,
             "mfe_price": entry_price,
+            # Real bug found live (2026-08-09): a position adopted while
+            # already BREAKEVEN_ACTIVE has `sl_price` sitting at the
+            # breakeven price, not the original stop - the true original
+            # risk distance was lost the moment the exchange's SL order
+            # got replaced, before this restart, and there is no way to
+            # recover it now. Using abs(entry-sl_price) here for that case
+            # would divide MAE/MFE by a near-zero breakeven-buffer
+            # distance instead of the real risk, producing R-multiples in
+            # the billions. None (unknown) is honest; a fabricated number
+            # isn't. Only a TP1_PENDING adoption still has its real,
+            # untouched original stop to compute this from.
+            "risk_distance": abs(entry_price - sl_price) if stage == TP1_PENDING else None,
         }
 
         if not sl_order:
@@ -287,18 +304,30 @@ class PositionManager:
 
     @staticmethod
     def _mae_mfe_r_multiples(position):
-        """Both expressed as an R-multiple of the position's original
-        risk distance (entry to SL) - comparable across symbols and
-        volatility regimes, unlike a raw price distance. A LOSS with
-        mfe_r_multiple near zero never moved favorably at all (wrong from
-        the first tick); a LOSS with a large mfe_r_multiple was solidly
-        in profit at some point before fully reversing - two very
-        different problems that look identical as a plain outcome."""
-        entry_price = position["entry_price"]
-        sl_price = position["sl_price"]
-        risk_distance = abs(entry_price - sl_price)
+        """Both expressed as an R-multiple of the position's ORIGINAL risk
+        distance (entry to its stop at the moment the trade opened) -
+        comparable across symbols and volatility regimes, unlike a raw
+        price distance. A LOSS with mfe_r_multiple near zero never moved
+        favorably at all (wrong from the first tick); a LOSS with a large
+        mfe_r_multiple was solidly in profit at some point before fully
+        reversing - two very different problems that look identical as a
+        plain outcome.
 
-        if risk_distance <= 0:
+        Real bug found live (2026-08-09): this used to recompute
+        abs(entry_price - position["sl_price"]) here directly - but
+        sl_price is legitimately mutated over a trade's life (moved to
+        the breakeven price on promotion, in both shadow mode's direct
+        mutation and a startup-reconciliation adoption that picks up an
+        already-breakeven real order). Once sl_price sits a few cents
+        from entry instead of the original stop's real distance, dividing
+        by it inflates the R-multiple into the billions. Must always use
+        the fixed `risk_distance` captured once at position start
+        (register()/_adopt_position()), never re-derive it from the
+        current (possibly-moved) sl_price."""
+        entry_price = position["entry_price"]
+        risk_distance = position.get("risk_distance")
+
+        if risk_distance is None or risk_distance <= 0:
             return None, None
 
         mae_price = position.get("mae_price", entry_price)

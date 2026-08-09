@@ -156,6 +156,26 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("Average MFE (favorable excursion) by outcome:", report)
         self.assertIn("WIN: avg=4.000R n=1", report)
 
+    def test_implausible_outliers_are_excluded_not_silently_included(self):
+        # Real bug found live: a since-fixed position_manager.py bug
+        # could produce R-multiples in the billions, permanently sitting
+        # in the journal - a plain average has no defense against that.
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SL_HIT", mae_r_multiple=1.5, mfe_r_multiple=0.5)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="BREAKEVEN_STOP_HIT", mae_r_multiple=577181328244.11, mfe_r_multiple=6319090709162.06)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("LOSS: avg=1.500R n=1", report)
+        self.assertNotIn("BREAKEVEN: avg=577181328244", report)
+        self.assertIn("1 value(s) excluded as implausible outliers", report)
+
+    def test_outlier_exclusion_is_silent_when_nothing_is_excluded(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SL_HIT", mae_r_multiple=1.5, mfe_r_multiple=0.5)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertNotIn("excluded", report)
+
 
 if __name__ == "__main__":
     unittest.main()

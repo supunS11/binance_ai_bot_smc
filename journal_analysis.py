@@ -82,20 +82,37 @@ def _bucket_cvd(value):
     return "strong (>=0.6)"
 
 
-def _average_by_outcome(resolved, label, key):
+_MAE_MFE_SANITY_BOUND = 1000  # R-multiples - see the outlier guard below
+
+
+def _average_by_outcome(resolved, label, key, sanity_bound=_MAE_MFE_SANITY_BOUND):
     """Average of a numeric field (mae_r_multiple/mfe_r_multiple),
     grouped by WIN/BREAKEVEN/LOSS - the diagnostic that tells apart a
     LOSS that went wrong from the first tick (near-zero average MFE) from
     one that was solidly in profit before fully reversing (a large
-    average MFE) - both look identical as a plain loss count."""
+    average MFE) - both look identical as a plain loss count.
+
+    Real bug found live (2026-08-09): a since-fixed position_manager.py
+    bug could re-derive the R-multiple's denominator from a moved
+    sl_price instead of the original risk distance, producing values in
+    the billions. Those rows are already permanently in the journal (this
+    file's own schema didn't change, so no fresh-file migration clears
+    them) - a plain average has no defense against an outlier that size,
+    so anything beyond sanity_bound is excluded and reported, rather than
+    silently included or silently dropped."""
     lines = [f"\nAverage {label} by outcome:"]
     sums = defaultdict(float)
     counts = defaultdict(int)
+    excluded = 0
 
     for trade in resolved.values():
         try:
             value = float(trade.get(key))
         except (TypeError, ValueError):
+            continue
+
+        if abs(value) > sanity_bound:
+            excluded += 1
             continue
 
         classification = classify(trade.get("outcome", ""))
@@ -108,6 +125,12 @@ def _average_by_outcome(resolved, label, key):
                 f"  {classification}: avg={sums[classification] / counts[classification]:.3f}R "
                 f"n={counts[classification]}"
             )
+
+    if excluded:
+        lines.append(
+            f"  ({excluded} value(s) excluded as implausible outliers - "
+            f"beyond {sanity_bound}R, almost certainly corrupted data)"
+        )
 
     if len(lines) == 1:
         lines.append("  (no trades with this field recorded yet)")

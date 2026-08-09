@@ -171,6 +171,44 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertEqual(position["tp1_order_id"], "")
 
+    def test_tp1_pending_adoption_stores_a_real_risk_distance(self):
+        # SL is still the genuine original here (TP1 hasn't resolved yet),
+        # so entry-to-sl is a trustworthy original risk distance.
+        manager = PositionManager()
+        open_orders = [
+            {"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["risk_distance"], 2.0)
+
+    def test_breakeven_active_adoption_has_no_recoverable_risk_distance(self):
+        # Real bug found live (2026-08-09): sl here is the REAL exchange
+        # order's price, which by BREAKEVEN_ACTIVE time is the breakeven
+        # price (~entry), not the true original stop - that original
+        # distance was lost before this restart. Storing
+        # abs(entry-sl)=0.02 here instead of None would silently
+        # reintroduce the billions-R bug the next time this position's
+        # MAE/MFE gets computed at close.
+        manager = PositionManager()
+        open_orders = [
+            {"type": "STOP_MARKET", "triggerPrice": "100.02", "algoId": "sl2"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertIsNone(position["risk_distance"])
+
     def test_no_stop_loss_found_places_an_emergency_stop(self):
         manager = PositionManager()
 
@@ -309,6 +347,19 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(position["confluence_ratio"], 0.25)
         self.assertFalse(position["early_breakeven_applied"])
 
+    def test_risk_distance_is_read_from_the_plan_when_present(self):
+        manager = PositionManager()
+        position = manager.register(dict(_plan(), risk_distance=1.75), {"shadow": True})
+
+        self.assertEqual(position["risk_distance"], 1.75)
+
+    def test_risk_distance_falls_back_to_entry_minus_sl_when_missing_from_plan(self):
+        # _plan() fixture: entry=100, sl=98
+        manager = PositionManager()
+        position = manager.register(_plan(), {"shadow": True})
+
+        self.assertEqual(position["risk_distance"], 2)
+
 
 class EarlyBreakevenEligibilityTests(unittest.TestCase):
     """config.EARLY_BREAKEVEN_ENABLED - low-confluence trades get pulled
@@ -429,6 +480,7 @@ class MaeMfeTrackingTests(unittest.TestCase):
         position = {
             "side": side, "entry_price": entry_price, "sl_price": sl_price,
             "mae_price": entry_price, "mfe_price": entry_price,
+            "risk_distance": abs(entry_price - sl_price),
         }
         position.update(overrides)
         return position
@@ -498,6 +550,40 @@ class MaeMfeTrackingTests(unittest.TestCase):
 
         self.assertAlmostEqual(mae_r, 1.5)  # (100-97)/2
         self.assertAlmostEqual(mfe_r, 1.5)  # (103-100)/2
+
+    def test_r_multiples_use_the_stored_risk_distance_not_the_live_sl_price(self):
+        # Real bug found live (2026-08-09): once a trade is promoted to
+        # breakeven, sl_price legitimately moves to ~entry_price (shadow
+        # mode mutates it directly; a reconciled-while-already-breakeven
+        # position picks it up from the real exchange order). Recomputing
+        # risk_distance from that moved sl_price at close time divided
+        # real MAE/MFE price distances by a near-zero breakeven-buffer
+        # distance instead of the original ~2.0, producing R-multiples in
+        # the billions. The fixed risk_distance field must be used
+        # instead, completely ignoring wherever sl_price ended up.
+        position = self._position(
+            sl_price=98, mae_price=97, mfe_price=104,
+            risk_distance=2.0,  # captured once at entry, before promotion
+        )
+        position["sl_price"] = 100.02  # moved to breakeven, as it really would be
+
+        mae_r, mfe_r = PositionManager._mae_mfe_r_multiples(position)
+
+        self.assertAlmostEqual(mae_r, 1.5)  # (100-97)/2, NOT /0.02
+        self.assertAlmostEqual(mfe_r, 2.0)  # (104-100)/2, NOT /0.02
+
+    def test_r_multiples_are_none_when_risk_distance_is_unknown(self):
+        # The stored risk_distance can itself be None (a position adopted
+        # via startup reconciliation while already BREAKEVEN_ACTIVE has no
+        # recoverable original risk distance) - must stay honestly
+        # unknown rather than falling back to a live sl_price-derived
+        # value that would reintroduce the same bug.
+        position = self._position(risk_distance=None)
+
+        mae_r, mfe_r = PositionManager._mae_mfe_r_multiples(position)
+
+        self.assertIsNone(mae_r)
+        self.assertIsNone(mfe_r)
 
     def test_r_multiples_are_none_when_risk_distance_is_zero(self):
         position = self._position(entry_price=100, sl_price=100)
