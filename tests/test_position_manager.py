@@ -283,7 +283,10 @@ class RegisterTests(unittest.TestCase):
             outcome = manager._close("BTCUSDT", "SHADOW_SL_HIT")
 
         self.assertEqual(outcome, "SHADOW_SL_HIT")
-        append_outcome.assert_called_once_with("BTCUSDT", "SHADOW_SL_HIT", "BTCUSDT_123456")
+        args, kwargs = append_outcome.call_args
+        self.assertEqual(args, ("BTCUSDT", "SHADOW_SL_HIT", "BTCUSDT_123456"))
+        self.assertIn("mae_r_multiple", kwargs)
+        self.assertIn("mfe_r_multiple", kwargs)
 
     def test_live_registration_extracts_order_ids(self):
         manager = PositionManager()
@@ -416,6 +419,95 @@ class EarlyBreakevenPriceReachedTests(unittest.TestCase):
             )
 
 
+class MaeMfeTrackingTests(unittest.TestCase):
+    """config.MAE_TRACKING_ENABLED - the diagnostic that tells apart a
+    trade that went wrong from the first tick (near-zero MFE) from one
+    that was solidly in profit before fully reversing (large MFE), which
+    look identical as a plain WIN/LOSS outcome."""
+
+    def _position(self, side="BUY", entry_price=100, sl_price=98, **overrides):
+        position = {
+            "side": side, "entry_price": entry_price, "sl_price": sl_price,
+            "mae_price": entry_price, "mfe_price": entry_price,
+        }
+        position.update(overrides)
+        return position
+
+    def test_disabled_config_leaves_mae_mfe_untouched(self):
+        position = self._position()
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", False):
+            PositionManager._update_mae_mfe(position, 90, 110)
+
+        self.assertEqual(position["mae_price"], 100)
+        self.assertEqual(position["mfe_price"], 100)
+
+    def test_buy_tracks_low_as_adverse_and_high_as_favorable(self):
+        position = self._position(side="BUY")
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe(position, 97, 103)
+
+        self.assertEqual(position["mae_price"], 97)
+        self.assertEqual(position["mfe_price"], 103)
+
+    def test_sell_tracks_high_as_adverse_and_low_as_favorable(self):
+        position = self._position(side="SELL", entry_price=100, sl_price=102)
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe(position, 97, 103)
+
+        self.assertEqual(position["mae_price"], 103)
+        self.assertEqual(position["mfe_price"], 97)
+
+    def test_single_price_variant_updates_both_extremes_from_one_sample(self):
+        position = self._position(side="BUY")
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe(position, 105)  # no high_or_price given
+
+        self.assertEqual(position["mae_price"], 100)  # unchanged, 105 isn't adverse
+        self.assertEqual(position["mfe_price"], 105)
+
+    def test_extremes_only_ever_move_in_the_worse_or_better_direction(self):
+        # A later, less-extreme sample must not undo an already-recorded
+        # worst/best price.
+        position = self._position(side="BUY")
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe(position, 95, 105)
+            PositionManager._update_mae_mfe(position, 98, 101)
+
+        self.assertEqual(position["mae_price"], 95)
+        self.assertEqual(position["mfe_price"], 105)
+
+    def test_none_price_is_ignored(self):
+        position = self._position()
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe(position, None)
+
+        self.assertEqual(position["mae_price"], 100)
+        self.assertEqual(position["mfe_price"], 100)
+
+    def test_r_multiples_are_normalized_to_risk_distance(self):
+        # entry=100, sl=98 -> risk_distance=2
+        position = self._position(mae_price=97, mfe_price=103)
+
+        mae_r, mfe_r = PositionManager._mae_mfe_r_multiples(position)
+
+        self.assertAlmostEqual(mae_r, 1.5)  # (100-97)/2
+        self.assertAlmostEqual(mfe_r, 1.5)  # (103-100)/2
+
+    def test_r_multiples_are_none_when_risk_distance_is_zero(self):
+        position = self._position(entry_price=100, sl_price=100)
+
+        mae_r, mfe_r = PositionManager._mae_mfe_r_multiples(position)
+
+        self.assertIsNone(mae_r)
+        self.assertIsNone(mfe_r)
+
+
 class PollShadowTests(unittest.TestCase):
     def _manager_with_position(self, side="BUY", confluence_ratio=None):
         manager = PositionManager()
@@ -522,6 +614,43 @@ class PollShadowTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], TP1_PENDING)
         self.assertFalse(position["early_breakeven_applied"])
+
+    def test_mae_mfe_track_the_full_candle_range_not_just_the_close(self):
+        # BUY, entry=100, sl=98, tp1=102 - low stays above sl and high
+        # stays below tp1, so the position survives this poll untouched
+        # and both extremes are purely from the range tracking.
+        manager = self._manager_with_position()
+        manager.poll_shadow("BTCUSDT", _candle(high=101, low=98.5, close=99.5))
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["mae_price"], 98.5)
+        self.assertEqual(position["mfe_price"], 101)
+
+    def test_mae_mfe_disabled_leaves_tracking_at_entry(self):
+        with patch.object(config, "MAE_TRACKING_ENABLED", False):
+            manager = self._manager_with_position()
+            manager.poll_shadow("BTCUSDT", _candle(high=101, low=98.5, close=99.5))
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["mae_price"], 100)
+        self.assertEqual(position["mfe_price"], 100)
+
+    def test_journal_receives_mae_mfe_r_multiples_on_close(self):
+        manager = self._manager_with_position()  # BUY, entry=100, sl=98, risk=2
+
+        with patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            # Moved favorably to 101 within the same candle before also
+            # touching down to 97 (low(97) <= sl(98)) -> closes as
+            # SHADOW_SL_HIT, but with real favorable excursion recorded
+            # along the way - exactly the case MFE exists to distinguish
+            # from a trade that went straight down.
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=101, low=97))
+
+        self.assertEqual(outcome, "SHADOW_SL_HIT")
+        append_outcome.assert_called_once()
+        _, kwargs = append_outcome.call_args
+        self.assertAlmostEqual(kwargs["mae_r_multiple"], 1.5)  # (100-97)/2
+        self.assertAlmostEqual(kwargs["mfe_r_multiple"], 0.5)  # (101-100)/2
 
 
 class PollLiveTests(unittest.TestCase):
@@ -852,30 +981,45 @@ class PollLiveTests(unittest.TestCase):
         # Never reached the normal TP1/SL/TP2 status checks this cycle.
         status_mock.assert_not_called()
 
-    def test_high_confluence_never_fetches_mark_price_or_triggers_early(self):
+    def test_high_confluence_never_triggers_early_breakeven(self):
+        # MAE tracking still fetches mark price for every position
+        # regardless of confluence - only the early-breakeven trigger
+        # itself is confluence-gated.
         manager = self._manager_with_position(confluence_ratio=0.75)
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
-             patch.object(exchange, "get_mark_price") as mark_price_mock, \
+             patch.object(exchange, "get_mark_price", return_value=102.0), \
              patch.object(exchange, "get_algo_order_status", return_value="NEW"):
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertIsNone(outcome)
-        mark_price_mock.assert_not_called()
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], TP1_PENDING)
         self.assertFalse(position["early_breakeven_applied"])
 
-    def test_early_breakeven_disabled_never_fetches_mark_price(self):
+    def test_mark_price_never_fetched_when_both_mae_tracking_and_early_breakeven_are_off(self):
         manager = self._manager_with_position(confluence_ratio=0.25)
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", False), \
+             patch.object(config, "MAE_TRACKING_ENABLED", False), \
              patch.object(exchange, "get_mark_price") as mark_price_mock, \
              patch.object(exchange, "get_algo_order_status", return_value="NEW"):
             manager.poll_live("BTCUSDT")
 
         mark_price_mock.assert_not_called()
+
+    def test_mae_tracking_still_fetches_mark_price_when_early_breakeven_is_off(self):
+        manager = self._manager_with_position(confluence_ratio=0.25)
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", False), \
+             patch.object(config, "MAE_TRACKING_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=101.0) as mark_price_mock, \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            manager.poll_live("BTCUSDT")
+
+        mark_price_mock.assert_called_once_with("BTCUSDT")
+        self.assertEqual(manager.positions["BTCUSDT"]["mfe_price"], 101.0)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ FIELDNAMES = [
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
     "liquidation_cluster", "liquidation_aligned", "confluence_score", "confluence_total",
     "confluence_ratio", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
-    "execution_mode", "outcome",
+    "execution_mode", "mae_r_multiple", "mfe_r_multiple", "outcome",
 ]
 
 
@@ -137,10 +137,17 @@ def append_signal(signal, plan):
     return trade_id
 
 
-def append_outcome(symbol, outcome, trade_id=None):
+def append_outcome(symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None):
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
     row["trade_id"] = trade_id or ""
     row["symbol"] = symbol
     row["outcome"] = outcome
+
+    if mae_r_multiple is not None:
+        row["mae_r_multiple"] = mae_r_multiple
+
+    if mfe_r_multiple is not None:
+        row["mfe_r_multiple"] = mfe_r_multiple
+
     _append_row(row)

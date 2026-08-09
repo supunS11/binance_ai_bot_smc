@@ -108,6 +108,8 @@ class PositionManager:
             "opened_at": time.time(),
             "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
+            "mae_price": plan["entry_price"],
+            "mfe_price": plan["entry_price"],
         }
         self.positions[symbol] = position
         return position
@@ -217,6 +219,10 @@ class PositionManager:
             # for early breakeven (see _is_early_breakeven_candidate).
             "confluence_ratio": None,
             "early_breakeven_applied": False,
+            # MAE/MFE tracking effectively restarts here too - there's no
+            # way to recover the price path from before this restart.
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
         }
 
         if not sl_order:
@@ -243,9 +249,63 @@ class PositionManager:
         if position:
             self._closed_at[symbol] = time.time()
             log_info(f"{symbol} position closed | OUTCOME={outcome}")
-            signal_journal.append_outcome(symbol, outcome, position.get("trade_id"))
+            mae_r, mfe_r = self._mae_mfe_r_multiples(position)
+            signal_journal.append_outcome(
+                symbol, outcome, position.get("trade_id"),
+                mae_r_multiple=mae_r, mfe_r_multiple=mfe_r,
+            )
 
         return outcome
+
+    @staticmethod
+    def _update_mae_mfe(position, low_or_price, high_or_price=None):
+        """Tracks the worst (MAE) and best (MFE) price seen over the life
+        of a trade so far. Live mode passes a single mark-price sample
+        (high_or_price defaults to the same value); shadow mode passes
+        the current candle's actual low/high so a single candle's full
+        range is captured, not just its close. See
+        config.MAE_TRACKING_ENABLED for why this exists."""
+        if not config.MAE_TRACKING_ENABLED:
+            return
+
+        if high_or_price is None:
+            high_or_price = low_or_price
+
+        if low_or_price is None or high_or_price is None:
+            return
+
+        side = position["side"]
+        mae_price = position.get("mae_price", position["entry_price"])
+        mfe_price = position.get("mfe_price", position["entry_price"])
+
+        if side == "BUY":
+            position["mae_price"] = min(mae_price, low_or_price)
+            position["mfe_price"] = max(mfe_price, high_or_price)
+        else:
+            position["mae_price"] = max(mae_price, high_or_price)
+            position["mfe_price"] = min(mfe_price, low_or_price)
+
+    @staticmethod
+    def _mae_mfe_r_multiples(position):
+        """Both expressed as an R-multiple of the position's original
+        risk distance (entry to SL) - comparable across symbols and
+        volatility regimes, unlike a raw price distance. A LOSS with
+        mfe_r_multiple near zero never moved favorably at all (wrong from
+        the first tick); a LOSS with a large mfe_r_multiple was solidly
+        in profit at some point before fully reversing - two very
+        different problems that look identical as a plain outcome."""
+        entry_price = position["entry_price"]
+        sl_price = position["sl_price"]
+        risk_distance = abs(entry_price - sl_price)
+
+        if risk_distance <= 0:
+            return None, None
+
+        mae_price = position.get("mae_price", entry_price)
+        mfe_price = position.get("mfe_price", entry_price)
+        mae_r = round(abs(entry_price - mae_price) / risk_distance, 4)
+        mfe_r = round(abs(entry_price - mfe_price) / risk_distance, 4)
+        return mae_r, mfe_r
 
     def _promote_to_breakeven(self, position, reason="TP1 filled"):
         """Runs once TP1 is detected as filled (or, via `reason`, when a
@@ -395,16 +455,28 @@ class PositionManager:
 
         self._ensure_protection_orders(position)
 
-        if position["stage"] == TP1_PENDING:
-            if self._is_early_breakeven_candidate(position):
-                current_price = exchange.get_mark_price(symbol)
+        # One shared mark-price fetch, reused for both MAE/MFE tracking
+        # and the early-breakeven check below - no reason to pay for two
+        # REST calls when either (or both) need the same current price.
+        early_breakeven_candidate = (
+            position["stage"] == TP1_PENDING and self._is_early_breakeven_candidate(position)
+        )
+        current_price = None
 
-                if self._early_breakeven_price_reached(position, current_price):
-                    position["early_breakeven_applied"] = True
-                    self._promote_to_breakeven(
-                        position, reason="Confluence-weighted early breakeven"
-                    )
-                    return None
+        if config.MAE_TRACKING_ENABLED or early_breakeven_candidate:
+            current_price = exchange.get_mark_price(symbol)
+            self._update_mae_mfe(position, current_price)
+
+        if position["stage"] == TP1_PENDING:
+            if (
+                early_breakeven_candidate
+                and self._early_breakeven_price_reached(position, current_price)
+            ):
+                position["early_breakeven_applied"] = True
+                self._promote_to_breakeven(
+                    position, reason="Confluence-weighted early breakeven"
+                )
+                return None
 
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
 
@@ -564,6 +636,8 @@ class PositionManager:
         high = latest_candle["high"]
         low = latest_candle["low"]
         side = position["side"]
+
+        self._update_mae_mfe(position, low, high)
 
         if position["stage"] == TP1_PENDING:
             hit_sl = (

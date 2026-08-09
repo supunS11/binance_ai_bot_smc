@@ -195,7 +195,14 @@ MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.6)
 # uncorrelated with outcome, and can extract information from these
 # fields collectively even before any one of them individually clears a
 # significance bar on its own.
-CONFLUENCE_SIZING_ENABLED = env_bool("CONFLUENCE_SIZING_ENABLED", "True")
+# DISABLED 2026-08-09 on real evidence: a 54-trade journal_analysis.py
+# pull showed confluence_score trending flat-to-inverse against outcome
+# (score=1 80% loss, score=2 96% loss, score=3 89% loss) - the opposite
+# of what this multiplier assumes. Exercising the "reversible at zero
+# cost" design above. confluence_score/ratio is still computed and
+# journaled either way - re-enable only if a larger, cleaner sample
+# (see MAE_TRACKING_ENABLED below) actually shows separation.
+CONFLUENCE_SIZING_ENABLED = env_bool("CONFLUENCE_SIZING_ENABLED", "False")
 CONFLUENCE_SIZING_MIN_MULTIPLIER = env_float("CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5)
 CONFLUENCE_SIZING_MAX_MULTIPLIER = env_float("CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25)
 MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
@@ -239,9 +246,23 @@ BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.02)
 # full room to run. Does not change entry/trade count - same principle as
 # the sizing feature: adapt what happens to a trade that's already
 # happening, not whether it happens.
-EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "True")
+# DISABLED 2026-08-09 alongside CONFLUENCE_SIZING_ENABLED above, same
+# reason - it's driven by the same confluence_ratio that real data
+# doesn't currently support gating anything on.
+EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "False")
 EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD = env_float("EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5)
 EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 1.0)
+# MAE/MFE (max adverse/favorable excursion) tracking - the diagnostic
+# that's actually missing right now. A plain WIN/LOSS outcome can't tell
+# apart a trade that was wrong from the first tick (near-zero MFE, went
+# straight to the stop) from one that moved solidly in its favor and
+# still reversed all the way back to a loss (large MFE) - those need
+# completely different fixes (rework entry timing vs. tighten profit-
+# taking/trailing). Tracks the worst/best price seen over a trade's life
+# and journals both as an R-multiple of the original risk distance, so
+# they're comparable across symbols/volatility regimes. Purely
+# observational - never gates or sizes anything.
+MAE_TRACKING_ENABLED = env_bool("MAE_TRACKING_ENABLED", "True")
 
 # =========================
 # EXECUTION

@@ -37,9 +37,18 @@ def classify(outcome):
 
 
 def load_trades(journal_path=None):
-    """Returns {trade_id: merged_row}. A signal row supplies every field
-    except outcome; its later outcome row (same trade_id, everything else
-    blank) fills in `outcome` on the same record."""
+    """Returns {trade_id: merged_row}. A signal row supplies every
+    signal-time field; its later outcome row (same trade_id) fills in
+    `outcome` plus whatever outcome-time-only fields it carries (symbol,
+    mae_r_multiple, mfe_r_multiple). Real bug found live (2026-08-09):
+    an earlier version of this only ever merged `outcome` from that row,
+    so a trade with no matching signal row at all (e.g. one adopted via
+    startup reconciliation after a restart) showed "unknown" for every
+    single field - including symbol - even though the outcome row had it
+    the whole time. Blank fields never overwrite an already-populated one
+    on either side, since both rows only ever carry their own half of the
+    data (signal-time fields are always blank on the outcome row, and
+    vice versa)."""
     path = Path(journal_path) if journal_path else JOURNAL_PATH
 
     if not path.exists():
@@ -55,11 +64,7 @@ def load_trades(journal_path=None):
                 continue
 
             existing = trades.setdefault(trade_id, {})
-
-            if row.get("outcome"):
-                existing["outcome"] = row["outcome"]
-            else:
-                existing.update({k: v for k, v in row.items() if v != ""})
+            existing.update({k: v for k, v in row.items() if v != ""})
 
     return trades
 
@@ -75,6 +80,39 @@ def _bucket_cvd(value):
     if value < 0.6:
         return "moderate (0.3-0.6)"
     return "strong (>=0.6)"
+
+
+def _average_by_outcome(resolved, label, key):
+    """Average of a numeric field (mae_r_multiple/mfe_r_multiple),
+    grouped by WIN/BREAKEVEN/LOSS - the diagnostic that tells apart a
+    LOSS that went wrong from the first tick (near-zero average MFE) from
+    one that was solidly in profit before fully reversing (a large
+    average MFE) - both look identical as a plain loss count."""
+    lines = [f"\nAverage {label} by outcome:"]
+    sums = defaultdict(float)
+    counts = defaultdict(int)
+
+    for trade in resolved.values():
+        try:
+            value = float(trade.get(key))
+        except (TypeError, ValueError):
+            continue
+
+        classification = classify(trade.get("outcome", ""))
+        sums[classification] += value
+        counts[classification] += 1
+
+    for classification in ("WIN", "BREAKEVEN", "LOSS"):
+        if counts[classification]:
+            lines.append(
+                f"  {classification}: avg={sums[classification] / counts[classification]:.3f}R "
+                f"n={counts[classification]}"
+            )
+
+    if len(lines) == 1:
+        lines.append("  (no trades with this field recorded yet)")
+
+    return lines
 
 
 def _breakdown_lines(resolved, label, key_fn):
@@ -128,6 +166,9 @@ def summarize(journal_path=None):
     lines += _breakdown_lines(resolved, "order block present", lambda t: t.get("order_block_present", "unknown") or "False")
     lines += _breakdown_lines(resolved, "FVG present", lambda t: t.get("fvg_present", "unknown") or "False")
     lines += _breakdown_lines(resolved, "symbol", lambda t: t.get("symbol", "unknown"))
+
+    lines += _average_by_outcome(resolved, "MAE (adverse excursion)", "mae_r_multiple")
+    lines += _average_by_outcome(resolved, "MFE (favorable excursion)", "mfe_r_multiple")
 
     return "\n".join(lines)
 
