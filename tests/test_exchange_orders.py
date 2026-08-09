@@ -106,6 +106,45 @@ class QuantityRuleMaxFilterTests(unittest.TestCase):
         self.assertEqual(rules["max_qty"], "900000.0")
 
 
+class GetIncomeHistoryTests(unittest.TestCase):
+    def test_returns_the_records_list(self):
+        records = [{"symbol": "BTCUSDT", "incomeType": "REALIZED_PNL", "income": "1.5", "time": 1000}]
+
+        with patch.object(exchange.client, "futures_income_history", return_value=records) as mock_call:
+            result = exchange.get_income_history(start_time=500)
+
+        self.assertEqual(result, records)
+        _, kwargs = mock_call.call_args
+        self.assertEqual(kwargs["startTime"], 500)
+        self.assertNotIn("symbol", kwargs)
+        self.assertNotIn("incomeType", kwargs)
+
+    def test_passes_through_optional_filters(self):
+        with patch.object(exchange.client, "futures_income_history", return_value=[]) as mock_call:
+            exchange.get_income_history(
+                symbol="BTCUSDT", income_type="REALIZED_PNL", start_time=1, end_time=2, limit=50
+            )
+
+        _, kwargs = mock_call.call_args
+        self.assertEqual(kwargs["symbol"], "BTCUSDT")
+        self.assertEqual(kwargs["incomeType"], "REALIZED_PNL")
+        self.assertEqual(kwargs["startTime"], 1)
+        self.assertEqual(kwargs["endTime"], 2)
+        self.assertEqual(kwargs["limit"], 50)
+
+    def test_non_list_response_returns_empty_list(self):
+        with patch.object(exchange.client, "futures_income_history", return_value={"unexpected": "shape"}):
+            result = exchange.get_income_history()
+
+        self.assertEqual(result, [])
+
+    def test_error_returns_empty_list_instead_of_raising(self):
+        with patch.object(exchange.client, "futures_income_history", side_effect=RuntimeError("boom")):
+            result = exchange.get_income_history()
+
+        self.assertEqual(result, [])
+
+
 class GetSymbolMaxOrderQuantityTests(unittest.TestCase):
     def test_returns_the_tighter_max_across_market_and_conditional(self):
         with patch.object(exchange, "get_exchange_info", return_value=_exchange_info("XAIUSDT", 900000, 300000)):

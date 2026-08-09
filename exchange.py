@@ -1137,6 +1137,37 @@ def get_algo_order_status(symbol, algo_id):
         return "UNKNOWN"
 
 
+def get_income_history(symbol=None, income_type=None, start_time=None, end_time=None, limit=1000):
+    """Ground-truth realized PNL/commission/funding from Binance's own
+    account income ledger (/fapi/v1/income) - unlike the journal's
+    planned entry/SL/TP prices, this reflects what actually happened
+    (real fills, slippage, fees), so it's the right source for "what did
+    this actually make or lose", not an estimate derived from our own
+    signal records."""
+    params = {"limit": min(max(int(limit), 1), 1000)}
+
+    if symbol:
+        params["symbol"] = symbol
+    if income_type:
+        params["incomeType"] = income_type
+    if start_time is not None:
+        params["startTime"] = int(start_time)
+    if end_time is not None:
+        params["endTime"] = int(end_time)
+
+    try:
+        records = _private_rest_call(
+            "futures_income_history",
+            client.futures_income_history,
+            **params,
+        )
+        return records if isinstance(records, list) else []
+
+    except Exception as exc:
+        log_error(f"income history fetch error: {exc}")
+        return []
+
+
 def get_24h_quote_volumes():
     """One cheap REST call for 24h quote volume across every symbol -
     used to rank the universe for the watchlist instead of guessing."""
