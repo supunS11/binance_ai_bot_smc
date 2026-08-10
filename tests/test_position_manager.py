@@ -187,6 +187,21 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["stage"], TP1_PENDING)
         self.assertEqual(position["risk_distance"], 2.0)
 
+    def test_adopted_position_has_no_break_confirmation_data(self):
+        # No original signal/candle to check this against - stays
+        # unresolved forever, same honesty policy as confluence_ratio.
+        manager = PositionManager()
+        open_orders = [{"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"}]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertIsNone(position["structure_level"])
+        self.assertIsNone(position["trigger_candle_open_time"])
+        self.assertIsNone(position["break_confirmed_by_close"])
+
     def test_breakeven_active_adoption_has_no_recoverable_risk_distance(self):
         # Real bug found live (2026-08-09): sl here is the REAL exchange
         # order's price, which by BREAKEVEN_ACTIVE time is the breakeven
@@ -420,6 +435,17 @@ class RegisterTests(unittest.TestCase):
 
         self.assertEqual(position["risk_distance"], 2)
 
+    def test_break_confirmation_fields_are_carried_from_the_plan(self):
+        manager = PositionManager()
+        position = manager.register(
+            dict(_plan(), structure_level=98.5, trigger_candle_open_time=12345),
+            {"shadow": True},
+        )
+
+        self.assertEqual(position["structure_level"], 98.5)
+        self.assertEqual(position["trigger_candle_open_time"], 12345)
+        self.assertIsNone(position["break_confirmed_by_close"])
+
 
 class EarlyBreakevenEligibilityTests(unittest.TestCase):
     """config.EARLY_BREAKEVEN_ENABLED - every trade still waiting on TP1
@@ -650,6 +676,126 @@ class MaeMfeTrackingTests(unittest.TestCase):
 
         self.assertIsNone(mae_r)
         self.assertIsNone(mfe_r)
+
+
+class _FakeCandleStore:
+    """Minimal stand-in for ws_client.CandleStore - resolve_break_confirmations
+    only ever calls .get(symbol)."""
+
+    def __init__(self, candles_by_symbol):
+        self.candles_by_symbol = candles_by_symbol
+
+    def get(self, symbol):
+        return self.candles_by_symbol.get(symbol, [])
+
+
+class ResolveBreakConfirmationsTests(unittest.TestCase):
+    """The entry fires the instant a live/forming candle breaks structure
+    - this is the look-back, a candle later, checking whether price
+    actually held beyond the level once that candle finished, or snapped
+    back inside first (just a wick, not a real break)."""
+
+    def _manager_with_position(self, side="BUY", structure_level=98.0, trigger_candle_open_time=1000):
+        manager = PositionManager()
+        manager.register(
+            dict(_plan(side), structure_level=structure_level, trigger_candle_open_time=trigger_candle_open_time),
+            {"shadow": True},
+        )
+        return manager
+
+    def test_stays_unresolved_while_the_trigger_candle_is_still_forming(self):
+        manager = self._manager_with_position()
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 99.0, "closed": False}],
+        })
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertIsNone(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_stays_unresolved_when_the_trigger_candle_is_not_in_the_buffer_yet(self):
+        manager = self._manager_with_position()
+        candles = _FakeCandleStore({"BTCUSDT": []})
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertIsNone(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_buy_break_confirmed_when_close_holds_above_the_level(self):
+        # side=BUY, structure_level=98.0 - a bullish break of 98 that's
+        # still closing above 98 once the candle finishes is a real break.
+        manager = self._manager_with_position(side="BUY", structure_level=98.0)
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 99.5, "closed": True}],
+        })
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertTrue(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_buy_break_rejected_when_close_snaps_back_below_the_level(self):
+        manager = self._manager_with_position(side="BUY", structure_level=98.0)
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 97.5, "closed": True}],
+        })
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertFalse(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_sell_break_confirmed_when_close_holds_below_the_level(self):
+        manager = self._manager_with_position(side="SELL", structure_level=102.0)
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 101.0, "closed": True}],
+        })
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertTrue(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_sell_break_rejected_when_close_snaps_back_above_the_level(self):
+        manager = self._manager_with_position(side="SELL", structure_level=102.0)
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 102.5, "closed": True}],
+        })
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertFalse(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_already_resolved_positions_are_not_recomputed(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["break_confirmed_by_close"] = True
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 50.0, "closed": True}],  # would flip to False
+        })
+
+        manager.resolve_break_confirmations(candles)
+
+        self.assertTrue(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_missing_structure_level_or_trigger_time_is_skipped_without_crashing(self):
+        # e.g. a startup-reconciliation-adopted position, which has no
+        # original signal/candle data at all.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["structure_level"] = None
+        candles = _FakeCandleStore({
+            "BTCUSDT": [{"open_time": 1000, "close": 99.5, "closed": True}],
+        })
+
+        manager.resolve_break_confirmations(candles)  # must not raise
+
+        self.assertIsNone(manager.positions["BTCUSDT"]["break_confirmed_by_close"])
+
+    def test_close_journals_break_confirmed_by_close(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["break_confirmed_by_close"] = False
+
+        with patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            manager._close("BTCUSDT", "SHADOW_SL_HIT")
+
+        _, kwargs = append_outcome.call_args
+        self.assertEqual(kwargs["break_confirmed_by_close"], False)
 
 
 class PollShadowTests(unittest.TestCase):

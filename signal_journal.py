@@ -32,7 +32,7 @@ FIELDNAMES = [
     "liquidation_cluster", "liquidation_aligned", "confluence_score", "confluence_total",
     "confluence_ratio", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
-    "outcome",
+    "break_confirmed_by_close", "outcome",
 ]
 
 
@@ -140,7 +140,7 @@ def append_signal(signal, plan):
 
 def append_outcome(
     symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None,
-    early_breakeven_applied=None,
+    early_breakeven_applied=None, break_confirmed_by_close=None,
 ):
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
@@ -156,5 +156,8 @@ def append_outcome(
 
     if early_breakeven_applied is not None:
         row["early_breakeven_applied"] = early_breakeven_applied
+
+    if break_confirmed_by_close is not None:
+        row["break_confirmed_by_close"] = break_confirmed_by_close
 
     _append_row(row)

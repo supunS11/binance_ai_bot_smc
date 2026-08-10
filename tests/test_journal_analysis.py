@@ -7,7 +7,7 @@ import signal_journal
 import journal_analysis as ja
 
 
-def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_r_multiple=None, early_breakeven_applied=None, closed_at=None, **signal_fields):
+def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_r_multiple=None, early_breakeven_applied=None, break_confirmed_by_close=None, closed_at=None, **signal_fields):
     """Writes a signal row (and optionally its outcome row) directly via
     the real signal_journal writer, so these tests exercise the exact
     on-disk format the analysis code has to parse. `closed_at` (unix
@@ -43,12 +43,14 @@ def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_
                         symbol, outcome, trade_id,
                         mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
                         early_breakeven_applied=early_breakeven_applied,
+                        break_confirmed_by_close=break_confirmed_by_close,
                     )
             else:
                 signal_journal.append_outcome(
                     symbol, outcome, trade_id,
                     mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
                     early_breakeven_applied=early_breakeven_applied,
+                    break_confirmed_by_close=break_confirmed_by_close,
                 )
 
 
@@ -137,6 +139,17 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("True: n=2 WIN=1 BREAKEVEN=1 LOSS=0 loss_rate=0%", report)
         self.assertIn("False: n=1 WIN=0 BREAKEVEN=0 LOSS=1 loss_rate=100%", report)
         self.assertIn("loss_rate=100%", report)
+
+    def test_summarize_breaks_down_by_break_confirmed_by_close(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", break_confirmed_by_close=True)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", break_confirmed_by_close=False)
+        _write_trade(self.journal_path, "C", "SOLUSDT", outcome="SL_HIT", break_confirmed_by_close=False)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By break confirmed by candle close (wick vs real break):", report)
+        self.assertIn("False: n=2 WIN=0 BREAKEVEN=0 LOSS=2 loss_rate=100%", report)
+        self.assertIn("True: n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
 
     def test_outcome_only_trade_still_gets_its_symbol_from_the_outcome_row(self):
         # Real bug found live: a startup-reconciliation-adopted position

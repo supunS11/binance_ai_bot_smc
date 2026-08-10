@@ -268,6 +268,7 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "liquidation aligned (informational)", lambda t: t.get("liquidation_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "confluence score (drives position sizing)", lambda t: t.get("confluence_score", "unknown") or "0")
     lines += _breakdown_lines(resolved, "early breakeven applied (new 1R profit-lock trigger)", lambda t: t.get("early_breakeven_applied", "unknown") or "False")
+    lines += _breakdown_lines(resolved, "break confirmed by candle close (wick vs real break)", lambda t: t.get("break_confirmed_by_close", "unknown") or "False")
     lines += _breakdown_lines(resolved, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "order block present", lambda t: t.get("order_block_present", "unknown") or "False")
     lines += _breakdown_lines(resolved, "FVG present", lambda t: t.get("fvg_present", "unknown") or "False")

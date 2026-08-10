@@ -101,6 +101,13 @@ class SignalJournalTests(unittest.TestCase):
         rows = self._read_rows()
         self.assertEqual(rows[1]["early_breakeven_applied"], "")
 
+    def test_append_outcome_writes_break_confirmed_by_close(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome("BTCUSDT", "SL_HIT", trade_id, break_confirmed_by_close=False)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["break_confirmed_by_close"], "False")
+
 
 class HeaderMigrationTests(unittest.TestCase):
     """Real bug found live: a schema change (new diagnostic fields) while

@@ -86,6 +86,13 @@ def _evaluate_symbol(feed, symbol, positions, balance):
         log_info(f"{symbol} signal found but plan rejected | REASON={status}")
         return
 
+    # Carried through to the position so resolve_break_confirmations() can
+    # later check, once this exact candle actually finishes, whether price
+    # held beyond the level it broke or snapped back inside first (just a
+    # wick, not a real break) - see PositionManager.resolve_break_confirmations.
+    plan["structure_level"] = result.get("structure_level")
+    plan["trigger_candle_open_time"] = ltf_candles[-1]["open_time"]
+
     log_info(
         f"{symbol} SIGNAL {result['signal']} | entry~={plan['entry_price']} "
         f"SL={plan['sl_price']} TP1={plan['tp1_price']} TP2={plan['tp2_price']} | "
@@ -119,6 +126,10 @@ def _poll_positions(feed, positions):
             positions.poll_shadow(symbol, latest_candle)
         else:
             positions.poll_live(symbol)
+
+
+def _resolve_break_confirmations(feed, positions):
+    positions.resolve_break_confirmations(feed.candles)
 
 
 def _log_heartbeat(feed, symbols, positions):
@@ -166,6 +177,7 @@ def main():
 
             balance = _current_balance()
             _poll_positions(feed, positions)
+            _resolve_break_confirmations(feed, positions)
 
             for symbol in symbols:
                 _evaluate_symbol(feed, symbol, positions, balance)

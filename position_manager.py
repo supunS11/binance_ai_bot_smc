@@ -115,6 +115,13 @@ class PositionManager:
             # from position["sl_price"] later (that field legitimately
             # moves to the breakeven price once a trade is promoted).
             "risk_distance": plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"]),
+            # For resolve_break_confirmations() - was the structure break
+            # that triggered this entry still holding once its candle
+            # actually finished, or was it just a wick that snapped back
+            # before the candle closed? None until that candle closes.
+            "structure_level": plan.get("structure_level"),
+            "trigger_candle_open_time": plan.get("trigger_candle_open_time"),
+            "break_confirmed_by_close": None,
         }
         self.positions[symbol] = position
         return position
@@ -259,6 +266,12 @@ class PositionManager:
             # isn't. Only a TP1_PENDING adoption still has its real,
             # untouched original stop to compute this from.
             "risk_distance": abs(entry_price - sl_price) if stage == TP1_PENDING else None,
+            # No original signal/candle to check this against - stays
+            # unresolved forever for a reconciled position, same honesty
+            # policy as confluence_ratio/risk_distance above.
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "break_confirmed_by_close": None,
         }
 
         if not sl_order:
@@ -290,9 +303,45 @@ class PositionManager:
                 symbol, outcome, position.get("trade_id"),
                 mae_r_multiple=mae_r, mfe_r_multiple=mfe_r,
                 early_breakeven_applied=position.get("early_breakeven_applied", False),
+                break_confirmed_by_close=position.get("break_confirmed_by_close"),
             )
 
         return outcome
+
+    def resolve_break_confirmations(self, candle_store):
+        """For every open position whose triggering LTF candle has since
+        actually closed, records whether price held beyond the structure
+        level it broke, or snapped back inside before that candle
+        finished - i.e. was just a wick, not a real break. The entry
+        itself fires the instant the live/forming candle breaks the level
+        (that's the whole point of reacting in real time), so this is
+        necessarily a look-back done a candle later, not a gate on entry.
+        `candle_store` only needs a `.get(symbol)` returning the same
+        candle-dict shape ws_client.CandleStore does."""
+        for symbol, position in list(self.positions.items()):
+            if position.get("break_confirmed_by_close") is not None:
+                continue
+
+            trigger_open_time = position.get("trigger_candle_open_time")
+            structure_level = position.get("structure_level")
+
+            if trigger_open_time is None or structure_level is None:
+                continue
+
+            trigger_candle = next(
+                (c for c in candle_store.get(symbol) if c["open_time"] == trigger_open_time),
+                None,
+            )
+
+            if not trigger_candle or not trigger_candle.get("closed"):
+                continue
+
+            side = position["side"]
+            held = (
+                trigger_candle["close"] > structure_level if side == "BUY"
+                else trigger_candle["close"] < structure_level
+            )
+            position["break_confirmed_by_close"] = held
 
     @staticmethod
     def _update_mae_mfe(position, low_or_price, high_or_price=None):
