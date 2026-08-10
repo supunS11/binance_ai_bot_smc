@@ -87,6 +87,20 @@ class SignalJournalTests(unittest.TestCase):
         rows = self._read_rows()
         self.assertEqual(rows[0]["risk_distance_pct"], "")
 
+    def test_append_outcome_writes_early_breakeven_applied(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome("BTCUSDT", "BREAKEVEN_STOP_HIT", trade_id, early_breakeven_applied=True)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["early_breakeven_applied"], "True")
+
+    def test_append_outcome_leaves_early_breakeven_applied_blank_when_not_given(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome("BTCUSDT", "SL_HIT", trade_id)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["early_breakeven_applied"], "")
+
 
 class HeaderMigrationTests(unittest.TestCase):
     """Real bug found live: a schema change (new diagnostic fields) while

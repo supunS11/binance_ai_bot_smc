@@ -325,6 +325,18 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(args, ("BTCUSDT", "SHADOW_SL_HIT", "BTCUSDT_123456"))
         self.assertIn("mae_r_multiple", kwargs)
         self.assertIn("mfe_r_multiple", kwargs)
+        self.assertEqual(kwargs["early_breakeven_applied"], False)
+
+    def test_close_reports_early_breakeven_applied_when_it_fired(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True}, trade_id="BTCUSDT_123456")
+        manager.positions["BTCUSDT"]["early_breakeven_applied"] = True
+
+        with patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            manager._close("BTCUSDT", "SHADOW_BREAKEVEN_STOP_HIT")
+
+        _, kwargs = append_outcome.call_args
+        self.assertEqual(kwargs["early_breakeven_applied"], True)
 
     def test_live_registration_extracts_order_ids(self):
         manager = PositionManager()

@@ -7,7 +7,7 @@ import signal_journal
 import journal_analysis as ja
 
 
-def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_r_multiple=None, closed_at=None, **signal_fields):
+def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_r_multiple=None, early_breakeven_applied=None, closed_at=None, **signal_fields):
     """Writes a signal row (and optionally its outcome row) directly via
     the real signal_journal writer, so these tests exercise the exact
     on-disk format the analysis code has to parse. `closed_at` (unix
@@ -42,11 +42,13 @@ def _write_trade(path, trade_id, symbol, outcome=None, mae_r_multiple=None, mfe_
                     signal_journal.append_outcome(
                         symbol, outcome, trade_id,
                         mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
+                        early_breakeven_applied=early_breakeven_applied,
                     )
             else:
                 signal_journal.append_outcome(
                     symbol, outcome, trade_id,
                     mae_r_multiple=mae_r_multiple, mfe_r_multiple=mfe_r_multiple,
+                    early_breakeven_applied=early_breakeven_applied,
                 )
 
 
@@ -123,6 +125,17 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("LOSS=2", report)
         # The weak-CVD bucket should show the 2/2 loss rate concentration.
         self.assertIn("weak (<0.3): n=2", report)
+
+    def test_summarize_breaks_down_by_early_breakeven_applied(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SHADOW_BREAKEVEN_STOP_HIT", early_breakeven_applied=True)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SHADOW_TP2_HIT", early_breakeven_applied=True)
+        _write_trade(self.journal_path, "C", "SOLUSDT", outcome="SHADOW_SL_HIT", early_breakeven_applied=False)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By early breakeven applied (new 1R profit-lock trigger):", report)
+        self.assertIn("True: n=2 WIN=1 BREAKEVEN=1 LOSS=0 loss_rate=0%", report)
+        self.assertIn("False: n=1 WIN=0 BREAKEVEN=0 LOSS=1 loss_rate=100%", report)
         self.assertIn("loss_rate=100%", report)
 
     def test_outcome_only_trade_still_gets_its_symbol_from_the_outcome_row(self):

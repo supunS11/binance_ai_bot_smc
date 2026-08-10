@@ -271,6 +271,7 @@ class PositionManager:
             signal_journal.append_outcome(
                 symbol, outcome, position.get("trade_id"),
                 mae_r_multiple=mae_r, mfe_r_multiple=mfe_r,
+                early_breakeven_applied=position.get("early_breakeven_applied", False),
             )
 
         return outcome
