@@ -197,10 +197,28 @@ class PositionManager:
             tp1_quantity = round(quantity * min(max(float(config.TP1_CLOSE_PCT), 0), 100) / 100, 8)
         tp2_quantity = max(round(quantity - tp1_quantity, 8), 0)
 
-        # Only TP2 existing (no TP1) means TP1 already resolved before
-        # restart; anything else defaults to TP1_PENDING so a genuinely
-        # missing TP1 gets self-healed rather than silently skipped.
-        stage = BREAKEVEN_ACTIVE if (tp2_order and not tp1_order) else TP1_PENDING
+        # Real bug found live (2026-08-10): "TP1 order absent" alone used
+        # to be a reliable "already promoted" signal, but the early-1R
+        # breakeven trigger moves the stop WITHOUT touching TP1 (it's
+        # still a live, resting order - the trade just hasn't reached it
+        # yet). A position early-promoted before a restart was getting
+        # misclassified as still TP1_PENDING, which then computed
+        # risk_distance from the already-moved (tiny) stop distance
+        # instead of correctly marking it unrecoverable - and, worse, an
+        # eventual stop-out on that misclassified position would log as a
+        # full SL_HIT instead of the breakeven it actually was. Detect
+        # "already protected" directly instead: a stop sitting on the
+        # profit side of entry can only be a promoted stop (breakeven or
+        # later) - an original risk-bearing stop is never there.
+        sl_already_protects_profit = (
+            (side == "BUY" and sl_price >= entry_price)
+            or (side == "SELL" and sl_price <= entry_price)
+        )
+        stage = (
+            BREAKEVEN_ACTIVE
+            if (sl_already_protects_profit or (tp2_order and not tp1_order))
+            else TP1_PENDING
+        )
 
         position = {
             "symbol": symbol,

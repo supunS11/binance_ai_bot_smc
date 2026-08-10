@@ -209,6 +209,54 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertIsNone(position["risk_distance"])
 
+    def test_early_breakeven_promoted_position_is_recognized_even_with_tp1_still_open(self):
+        # Real bug found live (2026-08-10): the early-1R trigger moves the
+        # stop WITHOUT touching TP1 (still a live, resting order) - so
+        # "TP1 order absent" alone can no longer tell "already promoted"
+        # apart from "still TP1_PENDING". A stop already sitting on the
+        # profit side of entry is unambiguous either way. Getting this
+        # wrong doesn't just corrupt risk_distance (same billions-R class
+        # of bug via a smaller, filter-evading magnitude) - it also means
+        # an eventual stop-out on this position would log as a full
+        # SL_HIT instead of the breakeven it actually is.
+        manager = PositionManager()
+        open_orders = [
+            # BUY, entry=100 - a stop at 100.02 is above entry, only
+            # possible if this SL was already moved to breakeven.
+            {"type": "STOP_MARKET", "triggerPrice": "100.02", "algoId": "sl2"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "false", "triggerPrice": "102", "quantity": "0.5", "algoId": "tp1_1"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertIsNone(position["risk_distance"])
+        # TP1 tracking is still correctly wired up too - it's a real,
+        # still-open order, not something to self-heal/recover.
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+
+    def test_sell_side_stop_on_profit_side_is_also_recognized(self):
+        # SELL, entry=100 - a stop at or below entry is on the profit
+        # side (mirrors the BUY case, where profit-side is above entry).
+        manager = PositionManager()
+        open_orders = [
+            {"type": "STOP_MARKET", "triggerPrice": "99.98", "algoId": "sl2"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "false", "triggerPrice": "98", "quantity": "0.5", "algoId": "tp1_1"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "96", "algoId": "tp2_1"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(side="SELL", entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertIsNone(position["risk_distance"])
+
     def test_no_stop_loss_found_places_an_emergency_stop(self):
         manager = PositionManager()
 
