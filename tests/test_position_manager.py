@@ -362,10 +362,14 @@ class RegisterTests(unittest.TestCase):
 
 
 class EarlyBreakevenEligibilityTests(unittest.TestCase):
-    """config.EARLY_BREAKEVEN_ENABLED - low-confluence trades get pulled
-    to breakeven before TP1, instead of gating entry on confluence at
-    all. These test the eligibility check in isolation from any exchange
-    or shadow-candle mechanics."""
+    """config.EARLY_BREAKEVEN_ENABLED - every trade still waiting on TP1
+    gets pulled to breakeven once it's moved EARLY_BREAKEVEN_R_MULTIPLE R
+    in profit (evidence: 2026-08-10, 28% of LOSS trades ran 1.0R+ before
+    fully reversing, completely unprotected). No longer gated on
+    confluence_ratio - that was the original design (2026-08-09) but real
+    data showed confluence didn't correlate with outcome at all. These
+    test the eligibility check in isolation from any exchange or shadow-
+    candle mechanics."""
 
     def _position(self, **overrides):
         position = {
@@ -402,33 +406,27 @@ class EarlyBreakevenEligibilityTests(unittest.TestCase):
                 self._position(stage=BREAKEVEN_ACTIVE)
             ))
 
-    def test_missing_confluence_ratio_is_not_a_candidate(self):
-        # No original signal to read confluence from (e.g. a position
-        # adopted via startup reconciliation) - no evidence, no early
-        # promotion.
+    def test_zero_risk_distance_is_not_a_candidate(self):
         manager = PositionManager()
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
             self.assertFalse(manager._is_early_breakeven_candidate(
+                self._position(entry_price=100, sl_price=100)
+            ))
+
+    def test_any_confluence_ratio_is_a_candidate_including_none(self):
+        # Real bug this replaces: gating on confluence_ratio meant a
+        # position with no original signal (e.g. startup-reconciliation-
+        # adopted) or a high-confluence trade never got this protection
+        # at all - neither restriction is evidence-backed anymore.
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
+            self.assertTrue(manager._is_early_breakeven_candidate(
                 self._position(confluence_ratio=None)
             ))
-
-    def test_confluence_above_threshold_is_not_a_candidate(self):
-        manager = PositionManager()
-
-        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5):
-            self.assertFalse(manager._is_early_breakeven_candidate(
-                self._position(confluence_ratio=0.75)
-            ))
-
-    def test_confluence_at_or_below_threshold_is_a_candidate(self):
-        manager = PositionManager()
-
-        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5):
             self.assertTrue(manager._is_early_breakeven_candidate(
-                self._position(confluence_ratio=0.5)
+                self._position(confluence_ratio=0.75)
             ))
             self.assertTrue(manager._is_early_breakeven_candidate(
                 self._position(confluence_ratio=0.25)
@@ -595,6 +593,21 @@ class MaeMfeTrackingTests(unittest.TestCase):
 
 
 class PollShadowTests(unittest.TestCase):
+    def setUp(self):
+        # EARLY_BREAKEVEN_ENABLED now defaults True and is no longer
+        # confluence-gated - without this, a candle favorable enough to
+        # hit TP1 is *also* favorable enough to satisfy the 1R early-
+        # breakeven trigger, and since that check now runs first, tests
+        # meant to exercise a genuine TP1 hit would silently pass through
+        # the early-breakeven path instead (same end state, wrong code
+        # path actually verified). Off by default here; the tests that
+        # actually exercise early breakeven turn it back on locally.
+        self.early_breakeven_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
+        self.early_breakeven_patcher.start()
+
+    def tearDown(self):
+        self.early_breakeven_patcher.stop()
+
     def _manager_with_position(self, side="BUY", confluence_ratio=None):
         manager = PositionManager()
         manager.register(dict(_plan(side), confluence_ratio=confluence_ratio), {"shadow": True})
@@ -659,14 +672,13 @@ class PollShadowTests(unittest.TestCase):
         outcome = manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))
         self.assertEqual(outcome, "SHADOW_SL_HIT")
 
-    def test_low_confluence_early_breakeven_triggers_before_tp1_reached(self):
+    def test_early_breakeven_triggers_before_tp1_reached(self):
         # entry=100, sl=98 (risk=2), R multiple 0.5 -> trigger at close=101,
         # well below tp1(102) - isolates the early trigger from a genuine
         # TP1 hit.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
-            manager = self._manager_with_position(confluence_ratio=0.25)
+            manager = self._manager_with_position()
             outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
 
         self.assertIsNone(outcome)
@@ -675,11 +687,10 @@ class PollShadowTests(unittest.TestCase):
         self.assertTrue(position["early_breakeven_applied"])
         self.assertEqual(position["sl_price"], position["breakeven_price"])
 
-    def test_low_confluence_but_price_not_moved_enough_stays_pending(self):
+    def test_price_not_moved_enough_stays_pending(self):
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
-            manager = self._manager_with_position(confluence_ratio=0.25)
+            manager = self._manager_with_position()
             outcome = manager.poll_shadow("BTCUSDT", _candle(high=100.8, low=99, close=100.5))
 
         self.assertIsNone(outcome)
@@ -687,19 +698,20 @@ class PollShadowTests(unittest.TestCase):
         self.assertEqual(position["stage"], TP1_PENDING)
         self.assertFalse(position["early_breakeven_applied"])
 
-    def test_high_confluence_never_triggers_early_breakeven(self):
+    def test_triggers_regardless_of_confluence_ratio(self):
+        # No longer gated on confluence - real evidence (2026-08-10)
+        # showed confluence didn't predict outcome, while MFE distribution
+        # did: 28% of losses ran 1.0R+ before fully reversing, completely
+        # unprotected. A high-confluence trade gets the same protection.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
             manager = self._manager_with_position(confluence_ratio=0.75)
-            # Same favorable close as the triggering test above, but this
-            # trade has enough confluence to not qualify.
             outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
 
         self.assertIsNone(outcome)
         position = manager.positions["BTCUSDT"]
-        self.assertEqual(position["stage"], TP1_PENDING)
-        self.assertFalse(position["early_breakeven_applied"])
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["early_breakeven_applied"])
 
     def test_mae_mfe_track_the_full_candle_range_not_just_the_close(self):
         # BUY, entry=100, sl=98, tp1=102 - low stays above sl and high
@@ -740,6 +752,25 @@ class PollShadowTests(unittest.TestCase):
 
 
 class PollLiveTests(unittest.TestCase):
+    def setUp(self):
+        # EARLY_BREAKEVEN_ENABLED/MAE_TRACKING_ENABLED now default True -
+        # without this, a test that doesn't mock exchange.get_mark_price
+        # makes a real, unmocked network call every poll_live(), which is
+        # slow, non-deterministic, and (since this fixture's entry/sl sit
+        # around 100) a real BTCUSDT mark price would trivially clear the
+        # early-breakeven trigger and hijack tests meant to exercise a
+        # completely different code path (SL_HIT, TP2_HIT_DIRECT, etc.).
+        # Off by default here; tests that actually exercise either
+        # feature turn the relevant one back on locally.
+        self.early_breakeven_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
+        self.mae_tracking_patcher = patch.object(config, "MAE_TRACKING_ENABLED", False)
+        self.early_breakeven_patcher.start()
+        self.mae_tracking_patcher.start()
+
+    def tearDown(self):
+        self.early_breakeven_patcher.stop()
+        self.mae_tracking_patcher.stop()
+
     def _manager_with_position(self, confluence_ratio=None):
         manager = PositionManager()
         execution_result = {
@@ -1043,11 +1074,10 @@ class PollLiveTests(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["tp1_order_id"], "")
 
-    def test_low_confluence_triggers_early_breakeven_before_the_normal_tp1_check(self):
-        manager = self._manager_with_position(confluence_ratio=0.25)
+    def test_early_breakeven_triggers_before_the_normal_tp1_check(self):
+        manager = self._manager_with_position()
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
              patch.object(exchange, "get_mark_price", return_value=102.0), \
              patch.object(exchange, "get_algo_order_status") as status_mock, \
@@ -1067,22 +1097,26 @@ class PollLiveTests(unittest.TestCase):
         # Never reached the normal TP1/SL/TP2 status checks this cycle.
         status_mock.assert_not_called()
 
-    def test_high_confluence_never_triggers_early_breakeven(self):
-        # MAE tracking still fetches mark price for every position
-        # regardless of confluence - only the early-breakeven trigger
-        # itself is confluence-gated.
+    def test_triggers_regardless_of_confluence_ratio(self):
+        # No longer gated on confluence - real evidence (2026-08-10)
+        # showed confluence didn't predict outcome, while MFE distribution
+        # did: 28% of losses ran 1.0R+ before fully reversing, completely
+        # unprotected. A high-confluence trade gets the same protection.
         manager = self._manager_with_position(confluence_ratio=0.75)
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
              patch.object(exchange, "get_mark_price", return_value=102.0), \
-             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}):
             outcome = manager.poll_live("BTCUSDT")
 
         self.assertIsNone(outcome)
         position = manager.positions["BTCUSDT"]
-        self.assertEqual(position["stage"], TP1_PENDING)
-        self.assertFalse(position["early_breakeven_applied"])
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["early_breakeven_applied"])
 
     def test_mark_price_never_fetched_when_both_mae_tracking_and_early_breakeven_are_off(self):
         manager = self._manager_with_position(confluence_ratio=0.25)

@@ -235,22 +235,26 @@ MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )
 BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.02)
-# Early breakeven for low-confluence trades - the "optional follow-up" to
-# confluence-weighted sizing above. Instead of waiting for the full TP1
-# target before protecting capital, a trade whose confluence_ratio (at
-# signal time) is at or below EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD gets
-# its SL pulled to breakeven as soon as price has moved
-# EARLY_BREAKEVEN_R_MULTIPLE R in its favor - protects capital faster on
-# the setups with the least evidence behind them, while a high-confluence
-# trade is untouched and keeps the normal TP1-triggered promotion with
-# full room to run. Does not change entry/trade count - same principle as
-# the sizing feature: adapt what happens to a trade that's already
-# happening, not whether it happens.
-# DISABLED 2026-08-09 alongside CONFLUENCE_SIZING_ENABLED above, same
-# reason - it's driven by the same confluence_ratio that real data
-# doesn't currently support gating anything on.
-EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "False")
-EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD = env_float("EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD", 0.5)
+# Early breakeven - protects profit on a trade before it reaches TP1,
+# instead of leaving the original (wider) stop in place the whole way
+# there. Originally gated on confluence_ratio (protect low-confidence
+# trades faster) and disabled 2026-08-09 when real data showed confluence
+# didn't correlate with outcome at all. Re-enabled 2026-08-10 with a
+# different, evidence-backed trigger: a journal_analysis.py MAE/MFE
+# distribution pull (61 resolved LOSS trades) showed a clear bimodal
+# split - 38% of losses were near-zero MFE (wrong from the first tick,
+# nothing here helps them), but 28% ran 1.0R+ in profit before fully
+# reversing to a full loss, completely unprotected the whole way down
+# since nothing moves the stop until TP1 formally triggers at 2R. This
+# now applies to every trade still waiting on TP1 (not just low-
+# confluence ones): once price has moved EARLY_BREAKEVEN_R_MULTIPLE R in
+# its favor, the SL moves to breakeven. Known tradeoff: a genuine winner
+# that dips back through breakeven on its way to a real TP1/TP2 would
+# close early instead of running - real cost, not yet measured, weighed
+# against the 28% of losses this targets. Does not change entry/trade
+# count - same principle as the sizing feature: adapt what happens to a
+# trade that's already happening, not whether it happens.
+EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "True")
 EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 1.0)
 # MAE/MFE (max adverse/favorable excursion) tracking - the diagnostic
 # that's actually missing right now. A plain WIN/LOSS outcome can't tell

@@ -220,8 +220,9 @@ class PositionManager:
             "stage": stage,
             "shadow": False,
             "opened_at": time.time(),
-            # No original signal to read confluence from - never eligible
-            # for early breakeven (see _is_early_breakeven_candidate).
+            # No original signal to read confluence from - kept for
+            # journaling only; early breakeven no longer depends on it
+            # (see _is_early_breakeven_candidate).
             "confluence_ratio": None,
             "early_breakeven_applied": False,
             # MAE/MFE tracking effectively restarts here too - there's no
@@ -338,7 +339,8 @@ class PositionManager:
 
     def _promote_to_breakeven(self, position, reason="TP1 filled"):
         """Runs once TP1 is detected as filled (or, via `reason`, when a
-        low-confluence trade earns an early promotion before TP1 - see
+        trade earns an early promotion before TP1 by reaching
+        EARLY_BREAKEVEN_R_MULTIPLE in profit - see
         _is_early_breakeven_candidate). This is where a position can
         legitimately have already closed entirely (the original SL
         firing in the same window as TP1, or manual intervention) - so the
@@ -435,24 +437,26 @@ class PositionManager:
             return None
 
     def _is_early_breakeven_candidate(self, position):
-        """Cheap, no-network pre-check for confluence-weighted early
-        breakeven (config.EARLY_BREAKEVEN_ENABLED) - only fetch a current
-        price at all (an extra REST call in poll_live) for a position that
-        could actually qualify: TP1 still pending, not already promoted,
-        and its signal-time confluence_ratio at or below the configured
-        threshold. A position with no confluence_ratio at all (e.g. one
-        adopted via startup reconciliation, which has no original signal
-        to read it from) is never a candidate - no evidence, no early
-        promotion."""
+        """Cheap, no-network pre-check for early breakeven
+        (config.EARLY_BREAKEVEN_ENABLED) - only fetch a current price at
+        all (an extra REST call in poll_live) for a position that could
+        actually qualify: TP1 still pending, not already promoted.
+
+        Originally gated on confluence_ratio (protect low-confidence
+        trades faster) - real evidence (2026-08-10, 61 resolved LOSS
+        trades) didn't support that: confluence showed no correlation
+        with outcome. What the same data DID show clearly: MFE for LOSS
+        trades is bimodal, not a smooth spread - 38% near zero (wrong
+        from the first tick, no fix here helps them) but 28% ran 1.0R+ in
+        profit before fully reversing to a full loss, completely
+        unprotected the whole way down since nothing moves the stop until
+        TP1 formally triggers at 2R. This now targets that second,
+        evidence-backed population directly - every trade still waiting
+        on TP1, not just ones with low confluence."""
         if not config.EARLY_BREAKEVEN_ENABLED or position.get("early_breakeven_applied"):
             return False
 
         if position["stage"] != TP1_PENDING:
-            return False
-
-        confluence_ratio = position.get("confluence_ratio")
-
-        if confluence_ratio is None or confluence_ratio > config.EARLY_BREAKEVEN_CONFLUENCE_THRESHOLD:
             return False
 
         return abs(position["entry_price"] - position["sl_price"]) > 0
@@ -503,7 +507,7 @@ class PositionManager:
             ):
                 position["early_breakeven_applied"] = True
                 self._promote_to_breakeven(
-                    position, reason="Confluence-weighted early breakeven"
+                    position, reason="Early breakeven (1R profit-lock)"
                 )
                 return None
 
@@ -684,7 +688,7 @@ class PositionManager:
                 position["early_breakeven_applied"] = True
                 position["stage"] = BREAKEVEN_ACTIVE
                 position["sl_price"] = position["breakeven_price"]
-                log_info(f"{symbol} [SHADOW] confluence-weighted early breakeven | SL -> breakeven")
+                log_info(f"{symbol} [SHADOW] early breakeven (1R profit-lock) | SL -> breakeven")
                 return None
 
             hit_tp1 = (
