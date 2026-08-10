@@ -144,6 +144,60 @@ def _average_by_outcome(resolved, label, key, sanity_bound=_MAE_MFE_SANITY_BOUND
     return lines
 
 
+_LOSS_MFE_BUCKETS = [
+    (0.0, 0.2, "0.0-0.2R (near-zero - wrong from the first tick)"),
+    (0.2, 0.4, "0.2-0.4R"),
+    (0.4, 0.6, "0.4-0.6R"),
+    (0.6, 0.8, "0.6-0.8R"),
+    (0.8, 1.0, "0.8-1.0R"),
+    (1.0, float("inf"), "1.0R+ (ran deep in profit before fully reversing)"),
+]
+
+
+def _loss_mfe_distribution(resolved, sanity_bound=_MAE_MFE_SANITY_BOUND):
+    """Bucketed distribution of MFE specifically for LOSS trades - an
+    average alone can't tell apart "most losses went wrong immediately"
+    from "a few trades ran deep in profit and reversed hard, skewing the
+    mean" - literally the same lesson the corrupted-MAE/MFE bug taught:
+    never trust a single aggregate without checking what's actually
+    behind it. A consistent mid-range distribution argues for a trade-
+    management fix (tighter partial/trail); a cluster near zero argues
+    entries are still the real problem regardless of what the average
+    said."""
+    lines = ["\nLOSS trades - MFE distribution (near-zero = wrong from the "
+              "first tick; large = was right, then fully reversed):"]
+    counts = [0] * len(_LOSS_MFE_BUCKETS)
+    total = 0
+
+    for trade in resolved.values():
+        if classify(trade.get("outcome", "")) != "LOSS":
+            continue
+
+        try:
+            value = float(trade.get("mfe_r_multiple"))
+        except (TypeError, ValueError):
+            continue
+
+        if value < 0 or value > sanity_bound:
+            continue
+
+        for index, (low, high, _label) in enumerate(_LOSS_MFE_BUCKETS):
+            if low <= value < high:
+                counts[index] += 1
+                total += 1
+                break
+
+    if total == 0:
+        lines.append("  (no LOSS trades with mfe_r_multiple recorded yet)")
+        return lines
+
+    for (low, high, label), count in zip(_LOSS_MFE_BUCKETS, counts):
+        if count:
+            lines.append(f"  {label}: n={count} ({count / total * 100:.0f}%)")
+
+    return lines
+
+
 def _breakdown_lines(resolved, label, key_fn):
     lines = [f"\nBy {label}:"]
     buckets = defaultdict(lambda: defaultdict(int))
@@ -220,6 +274,7 @@ def summarize(journal_path=None, since_timestamp=None):
 
     lines += _average_by_outcome(resolved, "MAE (adverse excursion)", "mae_r_multiple")
     lines += _average_by_outcome(resolved, "MFE (favorable excursion)", "mfe_r_multiple")
+    lines += _loss_mfe_distribution(resolved)
 
     return "\n".join(lines)
 

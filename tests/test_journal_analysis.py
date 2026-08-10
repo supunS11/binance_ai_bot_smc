@@ -216,5 +216,51 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("in this window", report)
 
 
+class LossMfeDistributionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.journal_path = Path(self.tmpdir.name) / "journal.csv"
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_buckets_loss_trades_by_mfe_range(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SL_HIT", mfe_r_multiple=0.1)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", mfe_r_multiple=0.15)
+        _write_trade(self.journal_path, "C", "SOLUSDT", outcome="SHADOW_SL_HIT", mfe_r_multiple=0.65)
+        _write_trade(self.journal_path, "D", "BNBUSDT", outcome="SL_HIT", mfe_r_multiple=1.4)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("0.0-0.2R (near-zero - wrong from the first tick): n=2 (50%)", report)
+        self.assertIn("0.6-0.8R: n=1 (25%)", report)
+        self.assertIn("1.0R+ (ran deep in profit before fully reversing): n=1 (25%)", report)
+
+    def test_win_and_breakeven_trades_are_excluded_from_the_loss_distribution(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", mfe_r_multiple=4.0)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="BREAKEVEN_STOP_HIT", mfe_r_multiple=2.0)
+        _write_trade(self.journal_path, "C", "SOLUSDT", outcome="SL_HIT", mfe_r_multiple=0.5)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("0.4-0.6R: n=1 (100%)", report)
+
+    def test_implausible_outlier_is_excluded_from_the_distribution_too(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SL_HIT", mfe_r_multiple=0.5)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", mfe_r_multiple=6319090709162.06)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("0.4-0.6R: n=1 (100%)", report)
+        self.assertNotIn("6319090709162", report)
+
+    def test_no_loss_trades_gives_a_clear_message(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", mfe_r_multiple=4.0)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("(no LOSS trades with mfe_r_multiple recorded yet)", report)
+
+
 if __name__ == "__main__":
     unittest.main()
