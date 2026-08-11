@@ -80,6 +80,13 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ja.classify("TP2_HIT"), "WIN")
         self.assertEqual(ja.classify("SHADOW_TP2_HIT"), "WIN")
 
+    def test_early_breakeven_profit_hit_is_win_not_breakeven(self):
+        # A real locked-profit stop hit (EARLY_BREAKEVEN_LOCK_R_MULTIPLE >
+        # 0) is a genuine small win, not a zero-sum scratch - distinct from
+        # BREAKEVEN_STOP_HIT above.
+        self.assertEqual(ja.classify("EARLY_BREAKEVEN_PROFIT_HIT"), "WIN")
+        self.assertEqual(ja.classify("SHADOW_EARLY_BREAKEVEN_PROFIT_HIT"), "WIN")
+
     def test_unknown_outcome_is_unknown(self):
         self.assertEqual(ja.classify("SOMETHING_ELSE"), "UNKNOWN")
 

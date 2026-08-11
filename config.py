@@ -273,6 +273,19 @@ BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.02)
 # trade that's already happening, not whether it happens.
 EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "True")
 EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 1.0)
+# How much profit (as an R-multiple) to lock in when early breakeven
+# promotes a trade, instead of moving the stop to flat entry (a scratch).
+# 0 preserves the original flat-breakeven behavior (see
+# risk_manager.compute_early_breakeven_price). Rationale (2026-08-11): the
+# early-breakeven population so far is roughly half WIN, half BREAKEVEN
+# with zero LOSS - a modest lock converts some of those scratches into
+# small realized wins instead of leaving them at exactly zero. Known
+# tradeoff, not yet measured: a genuine TP1/TP2 runner that dips slightly
+# on its way to target now gets stopped out at this smaller locked amount
+# instead of running further. Watch the WIN vs BREAKEVEN split among
+# early_breakeven_applied=True trades after this ships - see the
+# EARLY_BREAKEVEN_PROFIT_HIT outcome in journal_analysis.py.
+EARLY_BREAKEVEN_LOCK_R_MULTIPLE = env_float("EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3)
 # MAE/MFE (max adverse/favorable excursion) tracking - the diagnostic
 # that's actually missing right now. A plain WIN/LOSS outcome can't tell
 # apart a trade that was wrong from the first tick (near-zero MFE, went

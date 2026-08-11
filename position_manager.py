@@ -108,6 +108,13 @@ class PositionManager:
             "opened_at": time.time(),
             "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
+            # Set True only if EARLY_BREAKEVEN_LOCK_R_MULTIPLE was actually
+            # > 0 at the moment of promotion - distinguishes a genuine
+            # locked-profit stop hit (a real small win) from a flat
+            # breakeven scratch, both of which land in BREAKEVEN_ACTIVE.
+            # See _promote_to_breakeven and the EARLY_BREAKEVEN_PROFIT_HIT
+            # outcome.
+            "early_breakeven_profit_locked": False,
             "mae_price": plan["entry_price"],
             "mfe_price": plan["entry_price"],
             # Fixed at entry, never touched again - see
@@ -250,6 +257,7 @@ class PositionManager:
             # (see _is_early_breakeven_candidate).
             "confluence_ratio": None,
             "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
             # MAE/MFE tracking effectively restarts here too - there's no
             # way to recover the price path from before this restart.
             "mae_price": entry_price,
@@ -405,7 +413,7 @@ class PositionManager:
         mfe_r = round(abs(entry_price - mfe_price) / risk_distance, 4)
         return mae_r, mfe_r
 
-    def _promote_to_breakeven(self, position, reason="TP1 filled"):
+    def _promote_to_breakeven(self, position, reason="TP1 filled", target_price=None):
         """Runs once TP1 is detected as filled (or, via `reason`, when a
         trade earns an early promotion before TP1 by reaching
         EARLY_BREAKEVEN_R_MULTIPLE in profit - see
@@ -417,8 +425,14 @@ class PositionManager:
         position closed as part of this call, otherwise None - the retry
         must never be silently repeated forever with no state change and
         no escape hatch, since that can leave a position genuinely
-        unprotected between a failed cancel and a failed replace."""
+        unprotected between a failed cancel and a failed replace.
+
+        `target_price` defaults to the flat (fee-buffer-only) breakeven
+        price for a genuine TP1 fill; the early-breakeven caller passes a
+        real locked-profit price instead (see
+        risk_manager.compute_early_breakeven_price)."""
         symbol = position["symbol"]
+        target_price = position["breakeven_price"] if target_price is None else target_price
 
         if not config.MOVE_SL_TO_BREAKEVEN_AFTER_TP1:
             position["stage"] = BREAKEVEN_ACTIVE
@@ -453,14 +467,12 @@ class PositionManager:
                 exchange.cancel_algo_order(symbol, position["sl_order_id"])
 
             new_sl_order = exchange.place_stop_loss(
-                symbol, position["side"], position["breakeven_price"]
+                symbol, position["side"], target_price
             )
             position["sl_order_id"] = exchange._accepted_order_id(new_sl_order)
             position["stage"] = BREAKEVEN_ACTIVE
-            log_info(
-                f"{symbol} {reason} | SL moved to breakeven="
-                f"{position['breakeven_price']}"
-            )
+            position["sl_price"] = target_price
+            log_info(f"{symbol} {reason} | SL moved to {target_price}")
             return None
 
         except Exception as exc:
@@ -498,7 +510,11 @@ class PositionManager:
             )
             exchange.cancel_all_open_orders(symbol)
 
-            return self._close(symbol, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
+            outcome = (
+                "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
+                else "BREAKEVEN_TRIGGER_MARKET_CLOSE"
+            )
+            return self._close(symbol, outcome)
 
         except Exception as exc:
             log_error(f"{symbol} market-close-remainder error: {exc}")
@@ -546,6 +562,16 @@ class PositionManager:
         )
         return favorable_move >= trigger_distance
 
+    @staticmethod
+    def _early_breakeven_lock_price(position):
+        """Where the stop goes on THIS early promotion - uses the fixed
+        `risk_distance` captured once at position start (same discipline as
+        _mae_mfe_r_multiples), not a re-derived value, since sl_price is
+        still the original (unmoved) stop at this point anyway."""
+        return risk_manager.compute_early_breakeven_price(
+            position["entry_price"], position["side"], position["risk_distance"]
+        )
+
     def poll_live(self, symbol):
         """Returns an outcome string if the position closed this call,
         otherwise None."""
@@ -574,8 +600,13 @@ class PositionManager:
                 and self._early_breakeven_price_reached(position, current_price)
             ):
                 position["early_breakeven_applied"] = True
+                position["early_breakeven_profit_locked"] = (
+                    float(config.EARLY_BREAKEVEN_LOCK_R_MULTIPLE) > 0
+                )
                 self._promote_to_breakeven(
-                    position, reason="Early breakeven (1R profit-lock)"
+                    position,
+                    reason="Early breakeven (profit-lock)",
+                    target_price=self._early_breakeven_lock_price(position),
                 )
                 return None
 
@@ -603,7 +634,11 @@ class PositionManager:
 
             if sl_status == "FINISHED":
                 exchange.cancel_all_open_orders(symbol)
-                return self._close(symbol, "BREAKEVEN_STOP_HIT")
+                outcome = (
+                    "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
+                    else "BREAKEVEN_STOP_HIT"
+                )
+                return self._close(symbol, outcome)
 
             tp2_status = self._status_or_missing(symbol, position["tp2_order_id"])
 
@@ -754,9 +789,15 @@ class PositionManager:
                 position, latest_candle["close"]
             ):
                 position["early_breakeven_applied"] = True
+                position["early_breakeven_profit_locked"] = (
+                    float(config.EARLY_BREAKEVEN_LOCK_R_MULTIPLE) > 0
+                )
                 position["stage"] = BREAKEVEN_ACTIVE
-                position["sl_price"] = position["breakeven_price"]
-                log_info(f"{symbol} [SHADOW] early breakeven (1R profit-lock) | SL -> breakeven")
+                position["sl_price"] = self._early_breakeven_lock_price(position)
+                log_info(
+                    f"{symbol} [SHADOW] early breakeven (profit-lock) | "
+                    f"SL -> {position['sl_price']}"
+                )
                 return None
 
             hit_tp1 = (
@@ -780,7 +821,12 @@ class PositionManager:
             )
 
             if hit_sl:
-                return self._close(symbol, "SHADOW_BREAKEVEN_STOP_HIT")
+                outcome = (
+                    "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT"
+                    if position.get("early_breakeven_profit_locked")
+                    else "SHADOW_BREAKEVEN_STOP_HIT"
+                )
+                return self._close(symbol, outcome)
 
             hit_tp2 = (
                 high >= position["tp2_price"]

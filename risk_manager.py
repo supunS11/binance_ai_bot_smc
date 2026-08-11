@@ -146,6 +146,28 @@ def compute_breakeven_price(entry_price, side):
     return entry_price * (1 - buffer_pct)
 
 
+def compute_early_breakeven_price(entry_price, side, risk_distance):
+    """Where the stop goes on an EARLY breakeven promotion specifically
+    (see config.EARLY_BREAKEVEN_LOCK_R_MULTIPLE) - distinct from
+    compute_breakeven_price, which stays fee-buffer-only for the TP1-
+    triggered promotion path. A lock multiple of 0 preserves the original
+    flat-breakeven behavior exactly (falls through to
+    compute_breakeven_price); above 0, the stop moves into real locked
+    profit instead of a scratch, at the cost of a tighter stop that a
+    genuine TP1/TP2 runner could dip through on its way to target."""
+    lock_multiple = max(float(config.EARLY_BREAKEVEN_LOCK_R_MULTIPLE), 0)
+
+    if lock_multiple <= 0:
+        return compute_breakeven_price(entry_price, side)
+
+    lock_distance = risk_distance * lock_multiple
+
+    if side == "BUY":
+        return entry_price + lock_distance
+
+    return entry_price - lock_distance
+
+
 def _confluence_size_multiplier(signal):
     """Scales risk per trade by how much of sweep/EMA/OI/liquidation
     confluence agrees with this signal (signal_engine's confluence_ratio),

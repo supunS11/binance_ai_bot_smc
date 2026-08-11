@@ -881,9 +881,12 @@ class PollShadowTests(unittest.TestCase):
     def test_early_breakeven_triggers_before_tp1_reached(self):
         # entry=100, sl=98 (risk=2), R multiple 0.5 -> trigger at close=101,
         # well below tp1(102) - isolates the early trigger from a genuine
-        # TP1 hit.
+        # TP1 hit. Lock multiple forced to 0 here so this test stays
+        # decoupled from the profit-lock pricing - see
+        # EarlyBreakevenProfitLockTests for that.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
-             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0):
             manager = self._manager_with_position()
             outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
 
@@ -891,6 +894,7 @@ class PollShadowTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertTrue(position["early_breakeven_applied"])
+        self.assertFalse(position["early_breakeven_profit_locked"])
         self.assertEqual(position["sl_price"], position["breakeven_price"])
 
     def test_price_not_moved_enough_stays_pending(self):
@@ -918,6 +922,27 @@ class PollShadowTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertTrue(position["early_breakeven_applied"])
+
+    def test_early_breakeven_locks_real_profit_when_configured(self):
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3):
+            manager = self._manager_with_position()
+            manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
+
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["early_breakeven_profit_locked"])
+        self.assertAlmostEqual(position["sl_price"], 100.6)  # entry=100, risk=2, lock 0.3R
+
+    def test_stop_hit_after_a_locked_early_breakeven_is_a_real_win_not_a_scratch(self):
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3):
+            manager = self._manager_with_position()
+            manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))  # locks sl=100.6
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=100.7, low=100.5))  # low <= 100.6
+
+        self.assertEqual(outcome, "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT")
 
     def test_mae_mfe_track_the_full_candle_range_not_just_the_close(self):
         # BUY, entry=100, sl=98, tp1=102 - low stays above sl and high
@@ -1283,8 +1308,11 @@ class PollLiveTests(unittest.TestCase):
     def test_early_breakeven_triggers_before_the_normal_tp1_check(self):
         manager = self._manager_with_position()
 
+        # Lock multiple forced to 0 here so this test stays decoupled from
+        # the profit-lock pricing itself - see EarlyBreakevenProfitLockTests.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
              patch.object(exchange, "get_mark_price", return_value=102.0), \
              patch.object(exchange, "get_algo_order_status") as status_mock, \
              patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
@@ -1297,6 +1325,7 @@ class PollLiveTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertTrue(position["early_breakeven_applied"])
+        self.assertFalse(position["early_breakeven_profit_locked"])
         self.assertEqual(position["sl_order_id"], "sl2")
         new_sl.assert_called_once_with("BTCUSDT", "BUY", position["breakeven_price"])
         cancel.assert_called_once_with("BTCUSDT", "sl1")
@@ -1323,6 +1352,47 @@ class PollLiveTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertTrue(position["early_breakeven_applied"])
+
+    def test_early_breakeven_places_locked_profit_stop_when_configured(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3), \
+             patch.object(exchange, "get_mark_price", return_value=102.0), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}) as new_sl:
+            manager.poll_live("BTCUSDT")
+
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["early_breakeven_profit_locked"])
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 100.6)  # entry=100, risk=2, lock 0.3R
+        self.assertEqual(position["sl_price"], 100.6)
+
+    def test_sl_hit_after_a_locked_early_breakeven_reports_profit_hit_outcome(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3), \
+             patch.object(exchange, "get_mark_price", return_value=102.0), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}):
+            manager.poll_live("BTCUSDT")  # promotes to a locked-profit stop
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "sl2" else "NEW"
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "EARLY_BREAKEVEN_PROFIT_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_mark_price_never_fetched_when_both_mae_tracking_and_early_breakeven_are_off(self):
         manager = self._manager_with_position(confluence_ratio=0.25)

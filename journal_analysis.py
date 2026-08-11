@@ -29,7 +29,15 @@ BREAKEVEN_OUTCOMES = {
     "BREAKEVEN_STOP_HIT", "SHADOW_BREAKEVEN_STOP_HIT",
     "BREAKEVEN_TRIGGER_MARKET_CLOSE",
 }
-WIN_OUTCOMES = {"TP2_HIT", "TP2_HIT_DIRECT", "SHADOW_TP2_HIT"}
+WIN_OUTCOMES = {
+    "TP2_HIT", "TP2_HIT_DIRECT", "SHADOW_TP2_HIT",
+    # A genuine small realized win from EARLY_BREAKEVEN_LOCK_R_MULTIPLE > 0
+    # (position_manager only ever writes this outcome when a real profit
+    # was actually locked at promotion time - see
+    # position["early_breakeven_profit_locked"]) - distinct from
+    # BREAKEVEN_STOP_HIT, which is a true zero-sum scratch.
+    "EARLY_BREAKEVEN_PROFIT_HIT", "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT",
+}
 
 
 def classify(outcome):

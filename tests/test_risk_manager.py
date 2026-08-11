@@ -204,6 +204,34 @@ class ComputeBreakevenPriceTests(unittest.TestCase):
         self.assertAlmostEqual(price, 99.98)
 
 
+class ComputeEarlyBreakevenPriceTests(unittest.TestCase):
+    def test_zero_lock_multiple_falls_back_to_flat_breakeven(self):
+        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
+            price = risk_manager.compute_early_breakeven_price(100, "BUY", 2.0)
+
+        self.assertAlmostEqual(price, 100.02)
+
+    def test_buy_locks_profit_at_the_configured_r_multiple(self):
+        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3):
+            price = risk_manager.compute_early_breakeven_price(100, "BUY", 2.0)
+
+        self.assertAlmostEqual(price, 100.6)  # 100 + 2*0.3
+
+    def test_sell_locks_profit_at_the_configured_r_multiple(self):
+        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3):
+            price = risk_manager.compute_early_breakeven_price(100, "SELL", 2.0)
+
+        self.assertAlmostEqual(price, 99.4)  # 100 - 2*0.3
+
+    def test_negative_lock_multiple_is_clamped_to_zero(self):
+        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", -1), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
+            price = risk_manager.compute_early_breakeven_price(100, "BUY", 2.0)
+
+        self.assertAlmostEqual(price, 100.02)
+
+
 class BuildTradePlanTests(unittest.TestCase):
     def _signal(self, side="BUY", entry_price=100, structure_level=98, atr=1):
         return {
