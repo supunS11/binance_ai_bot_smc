@@ -7,6 +7,7 @@ and resolved against live price action, but no real order is placed until
 EXECUTION_MODE is explicitly switched to LIVE in .env. This is the
 evidence-gate from the original plan: review shadow signal quality first.
 """
+from collections import Counter
 import threading
 import time
 
@@ -51,7 +52,18 @@ def _current_balance():
     return config.SHADOW_ACCOUNT_BALANCE_USDT
 
 
-def _evaluate_symbol(feed, symbol, positions, balance):
+def _evaluate_symbol(feed, symbol, positions, balance, reject_counts=None):
+    """`reject_counts` (a Counter, optional) tallies why candidates don't
+    convert to a trade - signal_engine.evaluate()'s `reason`, plus a couple
+    of pre-signal/post-signal cases of our own. Real gap found live
+    (2026-08-11): with 0 open positions and a slow 1h/4h timeframe, "no
+    entries" was completely unexplainable from the logs - every rejection
+    reason was silently discarded, so there was no way to tell "working as
+    intended, genuinely no qualifying setups yet" apart from "something is
+    over-restrictive". This makes that visible via the heartbeat instead of
+    guessing. Deliberately excludes the has_open_position/cooldown/
+    max_positions early-exits above - those are routine operational skips,
+    not signal-quality rejections, and would just dilute the tally."""
     if positions.has_open_position(symbol):
         return
 
@@ -65,6 +77,8 @@ def _evaluate_symbol(feed, symbol, positions, balance):
     htf_candles = feed.htf_candles.get(symbol)
 
     if not ltf_candles or not htf_candles:
+        if reject_counts is not None:
+            reject_counts["NO_CANDLE_DATA"] += 1
         return
 
     cvd_snapshot = feed.cvd.snapshot(symbol)
@@ -78,11 +92,15 @@ def _evaluate_symbol(feed, symbol, positions, balance):
     )
 
     if not result.get("signal"):
+        if reject_counts is not None:
+            reject_counts[result.get("reason") or "UNKNOWN"] += 1
         return
 
     plan, status = risk_manager.build_trade_plan(result, balance)
 
     if status != "OK":
+        if reject_counts is not None:
+            reject_counts[f"PLAN_REJECTED:{status}"] += 1
         log_info(f"{symbol} signal found but plan rejected | REASON={status}")
         return
 
@@ -137,11 +155,16 @@ def _resolve_break_confirmations(feed, positions):
     positions.resolve_break_confirmations(feed.candles)
 
 
-def _log_heartbeat(feed, symbols, positions):
+def _log_heartbeat(feed, symbols, positions, reject_counts=None):
     log_info(
         f"Heartbeat | WATCHING={len(symbols)} | OPEN_POSITIONS={positions.open_count()} "
         f"| MODE={config.EXECUTION_MODE}"
     )
+
+    if reject_counts:
+        top = sorted(reject_counts.items(), key=lambda kv: -kv[1])[:8]
+        summary = " ".join(f"{reason}={count}" for reason, count in top)
+        log_info(f"  REJECTED since last heartbeat | {summary}")
 
     for symbol in list(positions.positions.keys()):
         position = positions.positions[symbol]
@@ -185,6 +208,7 @@ def main():
     # contributed to a real Binance IP ban (-1003 Way too many requests).
     poll_every_ticks = max(round(config.POSITION_POLL_INTERVAL_SECONDS / eval_interval), 1)
     tick = 0
+    reject_counts = Counter()
 
     try:
         while not shutdown_event.is_set():
@@ -198,10 +222,11 @@ def main():
                 _resolve_break_confirmations(feed, positions)
 
             for symbol in symbols:
-                _evaluate_symbol(feed, symbol, positions, balance)
+                _evaluate_symbol(feed, symbol, positions, balance, reject_counts)
 
             if tick % heartbeat_every == 0:
-                _log_heartbeat(feed, symbols, positions)
+                _log_heartbeat(feed, symbols, positions, reject_counts)
+                reject_counts.clear()
 
     except KeyboardInterrupt:
         log_warning("Shutdown requested (KeyboardInterrupt)")
