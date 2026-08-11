@@ -575,17 +575,35 @@ class RealtimeMarketData:
         self.oi_poll_thread = thread
 
     def _oi_poll_loop(self, generation):
+        """Spreads the per-symbol REST calls evenly across the poll window
+        instead of firing them all back-to-back and then sleeping the
+        remainder - a tight burst of N rapid-fire calls is exactly the
+        shape of traffic most likely to trip a raw-request-frequency
+        limit (distinct from the weight-budget one - see
+        exchange._rate_limit_public_request), even though the total
+        weight per sweep is unchanged either way. Real event (2026-08-11):
+        a -1003 citing "6000 requests per minute", not a weight-budget
+        ban, on a run with 0 open positions - this loop's un-paced 40-
+        symbol burst every OI_POLL_INTERVAL_SECONDS was the most likely
+        contributor found while investigating."""
         interval = max(float(config.OI_POLL_INTERVAL_SECONDS), 5)
 
         while self._worker_active(generation):
+            if not self.symbols:
+                if self.stop_event.wait(interval):
+                    return
+                continue
+
+            gap = interval / len(self.symbols)
+
             for symbol in self.symbols:
                 if not self._worker_active(generation):
                     return
 
                 self.open_interest.record(symbol, get_open_interest(symbol))
 
-            if self.stop_event.wait(interval):
-                return
+                if self.stop_event.wait(gap):
+                    return
 
     # =========================
     # LIQUIDATIONS (combined `!forceOrder@arr` stream - every symbol on

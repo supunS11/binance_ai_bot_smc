@@ -61,6 +61,57 @@ class CandleStoreTests(unittest.TestCase):
         self.assertIsNone(store.latest("NOPE"))
 
 
+class OiPollLoopTests(unittest.TestCase):
+    """Real event (2026-08-11): a -1003 citing "6000 requests per minute"
+    (not the weight-budget ban message) hit on a run with 0 open
+    positions, where this loop's un-paced full-watchlist burst every
+    OI_POLL_INTERVAL_SECONDS was the most likely contributor found while
+    investigating. These lock in that the sweep is now paced call-by-call
+    across the poll window instead of fired as one tight burst."""
+
+    def test_waits_between_each_symbol_not_after_the_whole_sweep(self):
+        feed = RealtimeMarketData(["BTCUSDT", "ETHUSDT", "BNBUSDT"])
+
+        with patch("ws_client.get_open_interest", return_value=100.0), \
+             patch.object(config, "OI_POLL_INTERVAL_SECONDS", 30), \
+             patch.object(feed.stop_event, "wait", side_effect=[False, False, True]) as wait_mock:
+            feed._oi_poll_loop(feed.generation)
+
+        # One wait() call per symbol (3), each for interval/len(symbols) -
+        # not a single wait(interval) after the whole sweep.
+        self.assertEqual(wait_mock.call_count, 3)
+        for call in wait_mock.call_args_list:
+            self.assertAlmostEqual(call.args[0], 10.0)  # 30 / 3 symbols
+
+    def test_records_open_interest_for_every_symbol_in_the_sweep(self):
+        feed = RealtimeMarketData(["BTCUSDT", "ETHUSDT"])
+
+        with patch("ws_client.get_open_interest", return_value=250.0), \
+             patch.object(feed.stop_event, "wait", side_effect=[False, True]):
+            feed._oi_poll_loop(feed.generation)
+
+        self.assertEqual(feed.open_interest.snapshot("BTCUSDT")["oi_value"], 250.0)
+        self.assertEqual(feed.open_interest.snapshot("ETHUSDT")["oi_value"], 250.0)
+
+    def test_empty_symbol_list_waits_the_full_interval_without_dividing_by_zero(self):
+        feed = RealtimeMarketData([])
+
+        with patch.object(config, "OI_POLL_INTERVAL_SECONDS", 20), \
+             patch.object(feed.stop_event, "wait", return_value=True) as wait_mock:
+            feed._oi_poll_loop(feed.generation)
+
+        wait_mock.assert_called_once_with(20.0)
+
+    def test_stop_mid_sweep_does_not_call_open_interest_for_remaining_symbols(self):
+        feed = RealtimeMarketData(["BTCUSDT", "ETHUSDT"])
+
+        with patch("ws_client.get_open_interest", return_value=1.0) as oi_mock, \
+             patch.object(feed.stop_event, "wait", side_effect=[True]):
+            feed._oi_poll_loop(feed.generation)
+
+        oi_mock.assert_called_once_with("BTCUSDT")
+
+
 class RealtimeMarketDataMessageHandlingTests(unittest.TestCase):
     """These exercise the pure message-parsing/routing logic without ever
     opening a real socket (start()/connect() are never called)."""
