@@ -347,6 +347,13 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertIsNone(result["depth_imbalance"])
 
+    def test_trigger_candle_open_time_comes_from_the_live_break(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = dict(LTF_BULLISH_BREAK["live_break"], open_time=456)
+        result = self._run(ltf_analysis=analysis)
+
+        self.assertEqual(result["trigger_candle_open_time"], 456)
+
     def test_no_signal_without_ltf_candles(self):
         result = signal_engine.evaluate("BTCUSDT", ["htf"], [], {}, {})
         self.assertEqual(result["reason"], "INSUFFICIENT_CANDLES")

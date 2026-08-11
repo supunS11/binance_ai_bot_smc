@@ -159,6 +159,23 @@ LIQUIDATION_CONFIRMATION_ENABLED = env_bool("LIQUIDATION_CONFIRMATION_ENABLED", 
 LIQUIDATION_WINDOW_SECONDS = env_int("LIQUIDATION_WINDOW_SECONDS", 120)
 LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT = env_float("LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000)
 LIQUIDATION_MAX_EVENTS_PER_SYMBOL = env_int("LIQUIDATION_MAX_EVENTS_PER_SYMBOL", 200)
+# Require the LTF candle that broke structure to have actually CLOSED
+# beyond the level before entering, instead of reacting to a still-forming
+# candle's wick - a real behavior change (this bot's original premise was
+# reacting before candle close), not just another journaled field.
+# Evidence (2026-08-11, 40 resolved trades post-early-breakeven): 60% of
+# remaining LOSS trades were near-zero MFE (wrong from the first tick) -
+# up from 38% before early breakeven started peeling off the other loss
+# population, meaning entry timing is now the dominant unsolved driver.
+# The break_confirmed_by_close journal field (observational only, added
+# 2026-08-10) showed the same direction on a thin sample: wick-only breaks
+# that didn't hold to their candle's close were 4/4 (100%) LOSS vs 53% for
+# closed-confirmed breaks. Combined with standard ICT/SMC doctrine (a BOS/
+# CHoCH is only real once confirmed by a closed candle), that's enough to
+# ship this gated, not just log it. Costs up to one candle of entry
+# latency. Reversible at zero cost if the next batch doesn't show
+# separation - see market_structure.live_break_check.
+REQUIRE_CLOSE_CONFIRMED_BREAK = env_bool("REQUIRE_CLOSE_CONFIRMED_BREAK", "True")
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

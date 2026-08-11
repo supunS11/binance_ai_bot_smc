@@ -141,14 +141,38 @@ def structure_state(candles, left=None, right=None):
     return _classify_swings(swings)
 
 
-def live_break_check(candles, structure):
-    """Has the *current, possibly still-forming* candle already broken the
-    last confirmed swing level? This is the real-time advantage over
-    waiting for the candle to close before reacting."""
+def live_break_check(candles, structure, require_closed_candle=None):
+    """Has a candle broken the last confirmed swing level?
+
+    By default (require_closed_candle=False) this checks the *current,
+    possibly still-forming* candle - the real-time advantage over waiting
+    for a candle to close before reacting.
+
+    When require_closed_candle is True (config.REQUIRE_CLOSE_CONFIRMED_BREAK),
+    it instead checks the most recently CLOSED candle. This deliberately
+    does NOT just test `candles[-1]["closed"]` - the live buffer typically
+    replaces a just-closed candle with a new forming one within moments (see
+    ws_client.CandleStore.update), so a naive "is the current last candle
+    closed" check would rarely be true at an arbitrary eval tick and would
+    almost never fire. Scanning back to the last candle with closed=True
+    instead gives a stable answer regardless of exactly when between
+    candles this function happens to be called."""
     if not structure.get("available") or not candles:
         return {"broken": False}
 
-    latest = candles[-1]
+    if require_closed_candle is None:
+        require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if require_closed_candle:
+        closed_candles = [c for c in candles if c.get("closed")]
+
+        if not closed_candles:
+            return {"broken": False}
+
+        latest = closed_candles[-1]
+    else:
+        latest = candles[-1]
+
     close = latest["close"]
     last_high = structure.get("last_swing_high")
     last_low = structure.get("last_swing_low")
@@ -161,6 +185,7 @@ def live_break_check(candles, structure):
         "direction": "BULLISH" if broke_up else "BEARISH" if broke_down else None,
         "level": last_high if broke_up else last_low if broke_down else None,
         "candle_closed": latest["closed"],
+        "open_time": latest["open_time"],
     }
 
 

@@ -195,6 +195,7 @@ def evaluate(
         "entry_price": latest_price,
         "htf_trend": htf_structure.get("trend"),
         "structure_level": live_break.get("level"),
+        "trigger_candle_open_time": live_break.get("open_time"),
         "order_block": order_block,
         "fvg": matching_fvg,
         "sweep_confluence": sweep_confluence,

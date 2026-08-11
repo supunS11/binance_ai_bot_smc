@@ -120,7 +120,7 @@ class LiveBreakCheckTests(unittest.TestCase):
         candles = [_candle(0, high=10, low=9, close=10.5, closed=False)]
         structure = {"available": True, "last_swing_high": 10, "last_swing_low": 5}
 
-        result = ms.live_break_check(candles, structure)
+        result = ms.live_break_check(candles, structure, require_closed_candle=False)
 
         self.assertTrue(result["broken"])
         self.assertEqual(result["direction"], "BULLISH")
@@ -145,6 +145,62 @@ class LiveBreakCheckTests(unittest.TestCase):
 
     def test_unavailable_structure_is_never_broken(self):
         result = ms.live_break_check([_candle(0, 10, 9)], {"available": False})
+        self.assertFalse(result["broken"])
+
+    def test_broken_result_includes_the_evaluated_candles_open_time(self):
+        candles = [_candle(123, high=10, low=9, close=10.5, closed=False)]
+        structure = {"available": True, "last_swing_high": 10, "last_swing_low": 5}
+
+        result = ms.live_break_check(candles, structure, require_closed_candle=False)
+
+        self.assertEqual(result["open_time"], 123)
+
+    def test_require_closed_candle_ignores_a_forming_candles_break(self):
+        # The forming candle (open_time=1) wicks above the swing high, but
+        # require_closed_candle=True must only look at the last CLOSED
+        # candle (open_time=0), which never broke it.
+        candles = [
+            _candle(0, high=9.5, low=8, close=9, closed=True),
+            _candle(1, high=11, low=9, close=10.5, closed=False),
+        ]
+        structure = {"available": True, "last_swing_high": 10, "last_swing_low": 5}
+
+        result = ms.live_break_check(candles, structure, require_closed_candle=True)
+
+        self.assertFalse(result["broken"])
+
+    def test_require_closed_candle_fires_once_the_breaking_candle_closes(self):
+        candles = [
+            _candle(0, high=9.5, low=8, close=9, closed=True),
+            _candle(1, high=11, low=9.5, close=10.5, closed=True),
+        ]
+        structure = {"available": True, "last_swing_high": 10, "last_swing_low": 5}
+
+        result = ms.live_break_check(candles, structure, require_closed_candle=True)
+
+        self.assertTrue(result["broken"])
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertTrue(result["candle_closed"])
+        self.assertEqual(result["open_time"], 1)
+
+    def test_require_closed_candle_with_no_closed_candle_yet_is_not_broken(self):
+        candles = [_candle(0, high=11, low=9, close=10.5, closed=False)]
+        structure = {"available": True, "last_swing_high": 10, "last_swing_low": 5}
+
+        result = ms.live_break_check(candles, structure, require_closed_candle=True)
+
+        self.assertFalse(result["broken"])
+
+    def test_require_closed_candle_defaults_from_config(self):
+        candles = [
+            _candle(0, high=9.5, low=8, close=9, closed=True),
+            _candle(1, high=11, low=9.5, close=10.5, closed=False),
+        ]
+        structure = {"available": True, "last_swing_high": 10, "last_swing_low": 5}
+
+        with patch.object(config, "REQUIRE_CLOSE_CONFIRMED_BREAK", True):
+            result = ms.live_break_check(candles, structure)
+
         self.assertFalse(result["broken"])
 
 

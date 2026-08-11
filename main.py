@@ -90,8 +90,13 @@ def _evaluate_symbol(feed, symbol, positions, balance):
     # later check, once this exact candle actually finishes, whether price
     # held beyond the level it broke or snapped back inside first (just a
     # wick, not a real break) - see PositionManager.resolve_break_confirmations.
+    # Sourced from the signal itself (the candle signal_engine actually
+    # evaluated the break against), NOT blindly ltf_candles[-1] - with
+    # REQUIRE_CLOSE_CONFIRMED_BREAK enabled that's the last CLOSED candle,
+    # which may already differ from whatever candle is forming by the time
+    # this line runs.
     plan["structure_level"] = result.get("structure_level")
-    plan["trigger_candle_open_time"] = ltf_candles[-1]["open_time"]
+    plan["trigger_candle_open_time"] = result.get("trigger_candle_open_time")
 
     log_info(
         f"{symbol} SIGNAL {result['signal']} | entry~={plan['entry_price']} "
