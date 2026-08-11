@@ -106,6 +106,95 @@ class QuantityRuleMaxFilterTests(unittest.TestCase):
         self.assertEqual(rules["max_qty"], "900000.0")
 
 
+class PrivateRestWeightTests(unittest.TestCase):
+    """Real bug found live (2026-08-11): every _private_rest_call site
+    used to omit `weight`, so the pre-emptive throttle
+    (_rate_limit_public_request) was never actually invoked for any
+    account/order REST call - only the reactive backoff-after-error half
+    worked, by which point Binance had already banned the IP (-1003 "Way
+    too many requests"). These lock in that every private GET/query call
+    site now passes a real, nonzero weight, and that order mutations
+    (which Binance doesn't charge IP weight for) stay untouched."""
+
+    def setUp(self):
+        self.rate_limit_patcher = patch.object(exchange, "_rate_limit_public_request")
+        self.rate_limit_mock = self.rate_limit_patcher.start()
+
+    def tearDown(self):
+        self.rate_limit_patcher.stop()
+
+    def test_get_balance_is_weighted(self):
+        with patch.object(
+            exchange.client, "futures_account_balance",
+            return_value=[{"asset": "USDT", "balance": "100"}],
+        ):
+            exchange.get_balance(force=True)
+
+        self.rate_limit_mock.assert_called_once_with(5)
+
+    def test_fetch_open_position_detail_is_weighted(self):
+        with patch.object(exchange.client, "futures_position_information", return_value=[]):
+            exchange._fetch_open_position_detail("BTCUSDT")
+
+        self.rate_limit_mock.assert_called_once_with(5)
+
+    def test_get_all_open_positions_is_weighted(self):
+        with patch.object(exchange.client, "futures_position_information", return_value=[]):
+            exchange.get_all_open_positions()
+
+        self.rate_limit_mock.assert_called_once_with(5)
+
+    def test_setup_leverage_is_weighted(self):
+        with patch.object(
+            exchange.client, "futures_change_leverage",
+            return_value={"leverage": config.LEVERAGE},
+        ):
+            exchange.setup_leverage("BTCUSDT")
+
+        self.rate_limit_mock.assert_called_once_with(1)
+
+    def test_get_algo_order_status_is_weighted(self):
+        with patch.object(
+            exchange.client, "futures_get_algo_order", return_value={"algoStatus": "NEW"}
+        ):
+            exchange.get_algo_order_status("BTCUSDT", "algo1")
+
+        self.rate_limit_mock.assert_called_once_with(1)
+
+    def test_get_open_algo_orders_is_weighted(self):
+        with patch.object(exchange.client, "futures_get_open_algo_orders", return_value=[]):
+            exchange.get_open_algo_orders("BTCUSDT")
+
+        self.rate_limit_mock.assert_called_once_with(1)
+
+    def test_cancel_algo_order_is_weighted(self):
+        with patch.object(exchange.client, "futures_cancel_algo_order", return_value={}):
+            exchange.cancel_algo_order("BTCUSDT", "algo1")
+
+        self.rate_limit_mock.assert_called_once_with(1)
+
+    def test_cancel_all_open_orders_is_weighted_for_both_calls(self):
+        with patch.object(exchange.client, "futures_cancel_all_open_orders", return_value={}):
+            exchange.cancel_all_open_orders("BTCUSDT")
+
+        calls = [call.args for call in self.rate_limit_mock.call_args_list]
+        self.assertEqual(calls, [(1,), (1,)])
+
+    def test_income_history_is_weighted(self):
+        with patch.object(exchange.client, "futures_income_history", return_value=[]):
+            exchange.get_income_history()
+
+        self.rate_limit_mock.assert_called_once_with(30)
+
+    def test_place_algo_order_is_not_weighted(self):
+        # Order mutations consume Binance's separate order-count limit,
+        # not IP REQUEST_WEIGHT - must stay untouched, not newly throttled.
+        with patch.object(exchange.client, "futures_create_algo_order", return_value={}):
+            exchange.place_algo_order(symbol="BTCUSDT", side="SELL", type="STOP_MARKET")
+
+        self.rate_limit_mock.assert_not_called()
+
+
 class GetIncomeHistoryTests(unittest.TestCase):
     def test_returns_the_records_list(self):
         records = [{"symbol": "BTCUSDT", "incomeType": "REALIZED_PNL", "income": "1.5", "time": 1000}]

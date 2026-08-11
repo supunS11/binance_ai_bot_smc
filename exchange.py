@@ -652,6 +652,20 @@ def _raise_if_private_rest_backoff(context):
 
 
 def _private_rest_call(context, func, *args, weight=0, **kwargs):
+    """weight=0 (the default) skips the pre-emptive weight-budget throttle
+    entirely - only the reactive backoff-after-error below still applies.
+    Real bug found live (2026-08-11): every call site in this module used
+    to omit `weight`, so despite this function's own claim to use "the
+    same weight-budget + backoff convention as the public layer", NONE of
+    the account/order REST traffic was ever actually throttled - only
+    caught after Binance had already banned the IP (-1003). Every call
+    site below now passes a real weight for GET/query endpoints (the ones
+    that actually cost IP REQUEST_WEIGHT); order mutations (place/cancel)
+    are left at the default since Binance doesn't charge IP weight for
+    those (verified: they consume the separate order-count limit
+    instead) - don't add a new private call site without setting `weight`
+    for anything that's a GET/query call, or this regresses silently
+    again."""
     _raise_if_private_rest_backoff(context)
 
     if weight > 0:
@@ -687,6 +701,7 @@ def get_balance(force=False):
         balances = _private_rest_call(
             "futures_account_balance",
             client.futures_account_balance,
+            weight=5,
         )
 
         for item in balances:
@@ -716,6 +731,7 @@ def _fetch_open_position_detail(symbol):
         f"futures_position_information:{symbol}",
         client.futures_position_information,
         symbol=symbol,
+        weight=5,
     )
 
     for position in positions or []:
@@ -759,6 +775,7 @@ def get_all_open_positions():
         positions = _private_rest_call(
             "futures_position_information:all",
             client.futures_position_information,
+            weight=5,
         )
         result = []
 
@@ -852,6 +869,7 @@ def get_open_algo_orders(symbol):
                 f"futures_get_open_algo_orders:{symbol}",
                 method,
                 symbol=symbol,
+                weight=1,
             )
         else:
             response = _private_rest_call(
@@ -861,6 +879,7 @@ def get_open_algo_orders(symbol):
                 "openAlgoOrders",
                 True,
                 data={"symbol": symbol},
+                weight=1,
             )
 
         if isinstance(response, dict):
@@ -883,6 +902,7 @@ def setup_leverage(symbol):
             client.futures_change_leverage,
             symbol=symbol,
             leverage=config.LEVERAGE,
+            weight=1,
         )
         actual = int(response["leverage"])
 
@@ -1057,6 +1077,7 @@ def cancel_algo_order(symbol, algo_id):
                 method,
                 symbol=symbol,
                 algoId=algo_id,
+                weight=1,
             )
 
         return _private_rest_call(
@@ -1066,6 +1087,7 @@ def cancel_algo_order(symbol, algo_id):
             "algoOrder",
             True,
             data={"symbol": symbol, "algoId": algo_id},
+            weight=1,
         )
     except Exception as exc:
         log_warning(f"{symbol} algo order {algo_id} cancel warning: {exc}")
@@ -1085,6 +1107,7 @@ def cancel_all_open_orders(symbol):
             f"futures_cancel_all_open_orders:{symbol}",
             client.futures_cancel_all_open_orders,
             symbol=symbol,
+            weight=1,
         )
     except Exception as exc:
         log_warning(f"{symbol} cancel-all regular orders warning: {exc}")
@@ -1095,6 +1118,7 @@ def cancel_all_open_orders(symbol):
             client.futures_cancel_all_open_orders,
             symbol=symbol,
             conditional=True,
+            weight=1,
         )
     except Exception as exc:
         log_warning(f"{symbol} cancel-all algo orders warning: {exc}")
@@ -1113,6 +1137,7 @@ def get_algo_order_status(symbol, algo_id):
                 method,
                 symbol=symbol,
                 algoId=algo_id,
+                weight=1,
             )
         else:
             order = _private_rest_call(
@@ -1122,6 +1147,7 @@ def get_algo_order_status(symbol, algo_id):
                 "algoOrder",
                 True,
                 data={"symbol": symbol, "algoId": algo_id},
+                weight=1,
             )
 
         data = order.get("data") if isinstance(order, dict) and isinstance(order.get("data"), dict) else order
@@ -1159,6 +1185,7 @@ def get_income_history(symbol=None, income_type=None, start_time=None, end_time=
         records = _private_rest_call(
             "futures_income_history",
             client.futures_income_history,
+            weight=30,
             **params,
         )
         return records if isinstance(records, list) else []

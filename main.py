@@ -173,6 +173,17 @@ def main():
 
     eval_interval = max(config.SIGNAL_EVAL_INTERVAL_SECONDS, 1)
     heartbeat_every = max(int(30 / eval_interval), 1)
+    # Position polling makes several private REST calls per open position
+    # (SL/TP1/TP2 order-status lookups, etc.) - paced on its own cadence
+    # instead of every single signal-eval tick, so a large
+    # MAX_TOTAL_POSITIONS doesn't multiply REST traffic by the (much
+    # faster) eval interval. Real bug found live (2026-08-11):
+    # POSITION_POLL_INTERVAL_SECONDS existed in config but was never
+    # actually wired to anything - positions were polled on every eval
+    # tick regardless, which (combined with the private REST layer's
+    # throttle being a no-op - see exchange._private_rest_call) directly
+    # contributed to a real Binance IP ban (-1003 Way too many requests).
+    poll_every_ticks = max(round(config.POSITION_POLL_INTERVAL_SECONDS / eval_interval), 1)
     tick = 0
 
     try:
@@ -181,8 +192,10 @@ def main():
             tick += 1
 
             balance = _current_balance()
-            _poll_positions(feed, positions)
-            _resolve_break_confirmations(feed, positions)
+
+            if tick % poll_every_ticks == 0:
+                _poll_positions(feed, positions)
+                _resolve_break_confirmations(feed, positions)
 
             for symbol in symbols:
                 _evaluate_symbol(feed, symbol, positions, balance)
