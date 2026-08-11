@@ -78,6 +78,24 @@ QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 # ORDER_FLOW_SHADOW_MAX_SYMBOLS pattern).
 WATCHLIST_SIZE = env_int("WATCHLIST_SIZE", 15)
 WATCHLIST_REFRESH_SECONDS = env_int("WATCHLIST_REFRESH_SECONDS", 300)
+# How often ws_client refreshes the 24h-quote-volume map (a single bulk
+# REST call covering every symbol, not per-symbol) that backs
+# MIN_24H_QUOTE_VOLUME_USDT below.
+VOLUME_POLL_INTERVAL_SECONDS = env_int("VOLUME_POLL_INTERVAL_SECONDS", 300)
+# Signal-time liquidity floor - independent of watchlist selection, so a
+# broad/unfiltered watchlist (e.g. SCAN_SYMBOLS pinned to the full 500+
+# symbol universe) can still be scanned for structure without illiquid/
+# vanity-ticker symbols actually being tradeable. 0 disables it. Real
+# motivation (2026-08-11): reintroducing the full original symbol list
+# for broader coverage reintroduced exactly the illiquid-symbol noise
+# that narrowing the watchlist had removed - this restores that quality
+# filter at signal time instead of watchlist time, so both can be tuned
+# independently. Starting value is a reasonable floor, not yet calibrated
+# against real trade data - revisit once there's evidence for where the
+# real quality cutoff sits. A symbol with no volume data yet (poll hasn't
+# completed, or the ticker endpoint has nothing for it) is let through
+# rather than blocked - never gate on data we don't actually have.
+MIN_24H_QUOTE_VOLUME_USDT = env_float("MIN_24H_QUOTE_VOLUME_USDT", 3000000)
 
 # =========================
 # WEBSOCKET DATA LAYER

@@ -30,7 +30,7 @@ FIELDNAMES = [
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
     "liquidation_cluster", "liquidation_aligned", "confluence_score", "confluence_total",
-    "confluence_ratio", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
+    "confluence_ratio", "quote_volume_usdt", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
     "break_confirmed_by_close", "outcome",
 ]
@@ -129,6 +129,7 @@ def append_signal(signal, plan):
         "confluence_score": signal.get("confluence_score"),
         "confluence_total": signal.get("confluence_total"),
         "confluence_ratio": signal.get("confluence_ratio"),
+        "quote_volume_usdt": signal.get("quote_volume_usdt"),
         "size_multiplier": plan.get("size_multiplier"),
         "tp1_r_multiple": config.TP1_R_MULTIPLE,
         "tp2_r_multiple": config.TP2_R_MULTIPLE,

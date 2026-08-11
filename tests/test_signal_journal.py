@@ -82,6 +82,12 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[1]["outcome"], "SL_HIT")
         self.assertEqual(rows[0]["outcome"], "")
 
+    def test_append_signal_writes_quote_volume_usdt(self):
+        signal_journal.append_signal(_signal(quote_volume_usdt=12_500_000), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["quote_volume_usdt"], "12500000")
+
     def test_zero_entry_price_does_not_crash_risk_distance_calc(self):
         signal_journal.append_signal(_signal(), _plan(entry_price=0))
         rows = self._read_rows()

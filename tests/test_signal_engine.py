@@ -57,6 +57,7 @@ class SignalEngineTests(unittest.TestCase):
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
+        quote_volume_usdt=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -80,6 +81,7 @@ class SignalEngineTests(unittest.TestCase):
             return signal_engine.evaluate(
                 "BTCUSDT", ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
+                quote_volume_usdt=quote_volume_usdt,
             )
 
     def test_full_buy_signal_when_everything_aligns(self):
@@ -353,6 +355,39 @@ class SignalEngineTests(unittest.TestCase):
         result = self._run(ltf_analysis=analysis)
 
         self.assertEqual(result["trigger_candle_open_time"], 456)
+
+    def test_no_signal_when_below_the_liquidity_floor(self):
+        with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 3_000_000):
+            result = self._run(quote_volume_usdt=1_500_000)
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("QUOTE_VOLUME_TOO_LOW", result["reason"])
+
+    def test_signal_allowed_at_or_above_the_liquidity_floor(self):
+        with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 3_000_000):
+            result = self._run(quote_volume_usdt=3_000_000)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_missing_volume_data_does_not_block_the_signal(self):
+        # Never gate on data we don't actually have - a symbol whose
+        # volume poll hasn't completed yet must not be silently excluded.
+        with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 3_000_000):
+            result = self._run(quote_volume_usdt=None)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_liquidity_floor_disabled_allows_thin_symbols(self):
+        with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 0):
+            result = self._run(quote_volume_usdt=100)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_quote_volume_usdt_is_carried_through_to_the_result(self):
+        with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 0):
+            result = self._run(quote_volume_usdt=42_000_000)
+
+        self.assertEqual(result["quote_volume_usdt"], 42_000_000)
 
     def test_no_signal_without_ltf_candles(self):
         result = signal_engine.evaluate("BTCUSDT", ["htf"], [], {}, {})

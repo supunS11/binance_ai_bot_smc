@@ -112,6 +112,40 @@ class OiPollLoopTests(unittest.TestCase):
         oi_mock.assert_called_once_with("BTCUSDT")
 
 
+class VolumePollLoopTests(unittest.TestCase):
+    """Backs config.MIN_24H_QUOTE_VOLUME_USDT, the signal-time liquidity
+    floor that replaces watchlist-selection-time filtering when
+    SCAN_SYMBOLS is pinned to a broad/unfiltered universe (2026-08-11)."""
+
+    def test_start_volume_poll_is_a_noop_when_the_liquidity_floor_is_disabled(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 0):
+            feed._start_volume_poll()
+
+        self.assertIsNone(feed.volume_poll_thread)
+
+    def test_volume_poll_loop_populates_feed_volumes(self):
+        feed = RealtimeMarketData(["BTCUSDT", "ETHUSDT"])
+        volumes = {"BTCUSDT": 5_000_000, "ETHUSDT": 9_000_000}
+
+        with patch("ws_client.get_24h_quote_volumes", return_value=volumes), \
+             patch.object(feed.stop_event, "wait", side_effect=[True]):
+            feed._volume_poll_loop(feed.generation)
+
+        self.assertEqual(feed.volumes, volumes)
+
+    def test_empty_response_does_not_clear_existing_volumes(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+        feed.volumes = {"BTCUSDT": 5_000_000}
+
+        with patch("ws_client.get_24h_quote_volumes", return_value={}), \
+             patch.object(feed.stop_event, "wait", side_effect=[True]):
+            feed._volume_poll_loop(feed.generation)
+
+        self.assertEqual(feed.volumes, {"BTCUSDT": 5_000_000})
+
+
 class RealtimeMarketDataMessageHandlingTests(unittest.TestCase):
     """These exercise the pure message-parsing/routing logic without ever
     opening a real socket (start()/connect() are never called)."""

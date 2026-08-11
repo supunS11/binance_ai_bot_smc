@@ -26,10 +26,20 @@ def _reject(reason, **extra):
 
 def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
-    oi_snapshot=None, liquidation_snapshot=None,
+    oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
 ):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
+
+    # Liquidity floor - independent of watchlist selection, see
+    # config.MIN_24H_QUOTE_VOLUME_USDT. A symbol with no volume data yet
+    # (poll hasn't completed, or the ticker endpoint has nothing for it)
+    # is let through rather than blocked - never gate on data we don't
+    # actually have.
+    min_volume = float(config.MIN_24H_QUOTE_VOLUME_USDT)
+
+    if min_volume > 0 and quote_volume_usdt is not None and quote_volume_usdt < min_volume:
+        return _reject(f"QUOTE_VOLUME_TOO_LOW volume={quote_volume_usdt}")
 
     htf_structure = market_structure.structure_state(htf_candles)
 
@@ -196,6 +206,7 @@ def evaluate(
         "htf_trend": htf_structure.get("trend"),
         "structure_level": live_break.get("level"),
         "trigger_candle_open_time": live_break.get("open_time"),
+        "quote_volume_usdt": quote_volume_usdt,
         "order_block": order_block,
         "fvg": matching_fvg,
         "sweep_confluence": sweep_confluence,

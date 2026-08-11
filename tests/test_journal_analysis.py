@@ -91,6 +91,20 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ja.classify("SOMETHING_ELSE"), "UNKNOWN")
 
 
+class BucketVolumeTests(unittest.TestCase):
+    def test_below_the_liquidity_floor(self):
+        self.assertEqual(ja._bucket_volume(2_999_999), "<3M (below the liquidity floor)")
+
+    def test_boundaries_are_inclusive_on_the_low_end(self):
+        self.assertEqual(ja._bucket_volume(3_000_000), "3M-10M")
+        self.assertEqual(ja._bucket_volume(10_000_000), "10M-50M")
+        self.assertEqual(ja._bucket_volume(50_000_000), ">=50M")
+
+    def test_non_numeric_is_unknown(self):
+        self.assertEqual(ja._bucket_volume(None), "unknown")
+        self.assertEqual(ja._bucket_volume(""), "unknown")
+
+
 class LoadTradesAndSummarizeTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -157,6 +171,19 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("By break confirmed by candle close (wick vs real break):", report)
         self.assertIn("False: n=2 WIN=0 BREAKEVEN=0 LOSS=2 loss_rate=100%", report)
         self.assertIn("True: n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
+
+    def test_summarize_breaks_down_by_24h_quote_volume(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", quote_volume_usdt=100_000_000)
+        _write_trade(self.journal_path, "B", "SHITCOINUSDT", outcome="SL_HIT", quote_volume_usdt=500_000)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By 24h quote volume (liquidity floor):", report)
+        self.assertIn(">=50M: n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
+        self.assertIn(
+            "<3M (below the liquidity floor): n=1 WIN=0 BREAKEVEN=0 LOSS=1 loss_rate=100%",
+            report,
+        )
 
     def test_outcome_only_trade_still_gets_its_symbol_from_the_outcome_row(self):
         # Real bug found live: a startup-reconciliation-adopted position

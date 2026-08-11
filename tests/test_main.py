@@ -23,13 +23,14 @@ class _FakeCandleSource:
 
 
 class _FakeFeed:
-    def __init__(self, ltf_candles=None, htf_candles=None):
+    def __init__(self, ltf_candles=None, htf_candles=None, volumes=None):
         self.candles = _FakeCandleSource(ltf_candles)
         self.htf_candles = _FakeCandleSource(htf_candles)
         self.cvd = _FakeSnapshotSource()
         self.depth = _FakeSnapshotSource()
         self.open_interest = _FakeSnapshotSource()
         self.liquidations = _FakeSnapshotSource()
+        self.volumes = volumes if volumes is not None else {}
 
 
 class _FakePositions:
@@ -120,6 +121,26 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
 
         self.assertEqual(len(reject_counts), 0)
         self.assertEqual(len(positions.registered), 1)
+
+    def test_quote_volume_is_passed_through_to_signal_engine(self):
+        feed = _FakeFeed(volumes={"BTCUSDT": 42_000_000})
+        positions = _FakePositions()
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "X"}) as evaluate_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        _, kwargs = evaluate_mock.call_args
+        self.assertEqual(kwargs["quote_volume_usdt"], 42_000_000)
+
+    def test_missing_volume_data_is_passed_through_as_none(self):
+        feed = _FakeFeed(volumes={})
+        positions = _FakePositions()
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "X"}) as evaluate_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        _, kwargs = evaluate_mock.call_args
+        self.assertIsNone(kwargs["quote_volume_usdt"])
 
     def test_reject_counts_none_is_safe_and_does_not_raise(self):
         feed = _FakeFeed(ltf_candles=[], htf_candles=[])

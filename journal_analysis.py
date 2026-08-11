@@ -83,6 +83,21 @@ def load_trades(journal_path=None):
     return trades
 
 
+def _bucket_volume(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < 3_000_000:
+        return "<3M (below the liquidity floor)"
+    if value < 10_000_000:
+        return "3M-10M"
+    if value < 50_000_000:
+        return "10M-50M"
+    return ">=50M"
+
+
 def _bucket_cvd(value):
     try:
         value = abs(float(value))
@@ -275,6 +290,7 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "liquidation cluster (informational)", lambda t: t.get("liquidation_cluster", "unknown") or "False")
     lines += _breakdown_lines(resolved, "liquidation aligned (informational)", lambda t: t.get("liquidation_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "confluence score (drives position sizing)", lambda t: t.get("confluence_score", "unknown") or "0")
+    lines += _breakdown_lines(resolved, "24h quote volume (liquidity floor)", lambda t: _bucket_volume(t.get("quote_volume_usdt")))
     lines += _breakdown_lines(resolved, "early breakeven applied (new 1R profit-lock trigger)", lambda t: t.get("early_breakeven_applied", "unknown") or "False")
     lines += _breakdown_lines(resolved, "break confirmed by candle close (wick vs real break)", lambda t: t.get("break_confirmed_by_close", "unknown") or "False")
     lines += _breakdown_lines(resolved, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
