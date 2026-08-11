@@ -37,6 +37,7 @@ _exchange_info_ttl_seconds = 3600
 
 _public_request_weights = deque()
 _public_request_lock = threading.Lock()
+_last_public_request_at = 0.0
 
 _public_rest_backoff_until = 0.0
 _public_rest_lock = threading.Lock()
@@ -72,13 +73,32 @@ def sync_client_time():
 # RATE LIMITING / BACKOFF (ported convention from v7/v8)
 # =========================
 def _rate_limit_public_request(weight=1):
-    max_weight = float(config.BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE)
+    """Two independent guards, both required before a call proceeds:
+    (1) cumulative weight within the sliding window stays under the
+    per-minute budget (the original mechanism), and (2) at least
+    BINANCE_MIN_REQUEST_GAP_SECONDS has passed since the previous call,
+    regardless of weight.
 
-    if max_weight <= 0:
+    Real bug found live (2026-08-11): an 80-symbol x 2-timeframe startup
+    seed loop (ws_client._seed_history) fired ~160 kline calls back-to-
+    back with no pacing between them - its SUMMED weight was nominally
+    well under the per-minute budget, so guard (1) alone never blocked
+    it, but Binance still returned a hard IP ban (-1003). Binance's real
+    abuse detection is evidently sensitive to burst RATE, not just weight
+    accounted for over a full minute - a weight budget alone can't catch
+    "100 calls in the same second" if their total weight is small. Guard
+    (2) is a general defense against that shape of bug in ANY caller
+    (present or future), not just the one instance found here."""
+    max_weight = float(config.BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE)
+    min_gap = max(float(config.BINANCE_MIN_REQUEST_GAP_SECONDS), 0.0)
+
+    if max_weight <= 0 and min_gap <= 0:
         return
 
     window_seconds = max(float(config.BINANCE_PUBLIC_RATE_WINDOW_SECONDS), 1.0)
     weight = max(float(weight or 1), 0.1)
+
+    global _last_public_request_at
 
     while True:
         now = time.time()
@@ -91,13 +111,21 @@ def _rate_limit_public_request(weight=1):
                 _public_request_weights.popleft()
 
             used_weight = sum(item[1] for item in _public_request_weights)
+            since_last = now - _last_public_request_at
+            weight_ok = max_weight <= 0 or used_weight + weight <= max_weight
+            gap_ok = since_last >= min_gap
 
-            if used_weight + weight <= max_weight:
-                _public_request_weights.append((now, weight))
+            if weight_ok and gap_ok:
+                if max_weight > 0:
+                    _public_request_weights.append((now, weight))
+                _last_public_request_at = now
                 return
 
-            oldest_at = _public_request_weights[0][0]
-            wait_seconds = window_seconds - (now - oldest_at) + 0.05
+            if not gap_ok:
+                wait_seconds = min_gap - since_last
+            else:
+                oldest_at = _public_request_weights[0][0]
+                wait_seconds = window_seconds - (now - oldest_at) + 0.05
 
         time.sleep(min(max(wait_seconds, 0.05), 5.0))
 

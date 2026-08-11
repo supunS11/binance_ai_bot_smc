@@ -106,6 +106,61 @@ class QuantityRuleMaxFilterTests(unittest.TestCase):
         self.assertEqual(rules["max_qty"], "900000.0")
 
 
+class RateLimitMinGapTests(unittest.TestCase):
+    """Real bug found live (2026-08-11): the weight-budget check alone let
+    an 80-symbol x 2-timeframe startup seed loop fire ~160 kline calls
+    back-to-back - their summed weight fit comfortably under
+    BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE, so that guard alone never
+    blocked it, but Binance still hard-banned the IP (-1003). Its abuse
+    detection is evidently sensitive to burst RATE, not just weight
+    accounted for over a full minute. These lock in the added minimum-gap
+    guard that's independent of weight - using small real sleeps (not
+    mocked) so a bug that makes the retry loop spin forever would hang
+    the test instead of silently passing."""
+
+    def setUp(self):
+        self._weights_backup = list(exchange._public_request_weights)
+        self._last_at_backup = exchange._last_public_request_at
+        exchange._public_request_weights.clear()
+        exchange._last_public_request_at = 0.0
+
+    def tearDown(self):
+        exchange._public_request_weights.clear()
+        exchange._public_request_weights.extend(self._weights_backup)
+        exchange._last_public_request_at = self._last_at_backup
+
+    def test_first_call_does_not_wait(self):
+        with patch.object(config, "BINANCE_MIN_REQUEST_GAP_SECONDS", 0.05), \
+             patch.object(config, "BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE", 1800):
+            start = time.perf_counter()
+            exchange._rate_limit_public_request(weight=1)
+            elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 0.05)
+
+    def test_rapid_second_call_is_paced_even_though_weight_budget_allows_it(self):
+        with patch.object(config, "BINANCE_MIN_REQUEST_GAP_SECONDS", 0.05), \
+             patch.object(config, "BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE", 1800):
+            exchange._rate_limit_public_request(weight=1)
+
+            start = time.perf_counter()
+            exchange._rate_limit_public_request(weight=1)  # weight 1+1=2, way under 1800
+            elapsed = time.perf_counter() - start
+
+        self.assertGreaterEqual(elapsed, 0.04)
+
+    def test_zero_gap_disables_the_guard(self):
+        with patch.object(config, "BINANCE_MIN_REQUEST_GAP_SECONDS", 0), \
+             patch.object(config, "BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE", 1800):
+            exchange._rate_limit_public_request(weight=1)
+
+            start = time.perf_counter()
+            exchange._rate_limit_public_request(weight=1)
+            elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 0.05)
+
+
 class PrivateRestWeightTests(unittest.TestCase):
     """Real bug found live (2026-08-11): every _private_rest_call site
     used to omit `weight`, so the pre-emptive throttle
@@ -304,8 +359,15 @@ class OpenInterestUnavailableSymbolTests(unittest.TestCase):
     def test_unavailable_symbol_is_retried_again_after_the_cooldown_expires(self):
         error = Exception("APIError(code=-4108): Symbol is on delivering or delivered or settling or closed or pre-trading.")
 
+        # _rate_limit_public_request mocked here too: it stamps
+        # _last_public_request_at from the SAME time.time() this test
+        # fakes 61s into the future - left real, that poisons the shared
+        # global rate-limit state for every other test that runs
+        # afterward (real bug hit live while adding the min-gap guard:
+        # the whole suite went from ~2s to 100s+ because of this).
         with patch.object(config, "OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 60), \
-             patch.object(exchange.client, "futures_open_interest", side_effect=error) as mock_call:
+             patch.object(exchange.client, "futures_open_interest", side_effect=error) as mock_call, \
+             patch.object(exchange, "_rate_limit_public_request"):
             exchange.get_open_interest("ALLOUSDT")
 
             with patch.object(exchange.time, "time", return_value=time.time() + 61):
@@ -324,11 +386,15 @@ class OpenInterestUnavailableSymbolTests(unittest.TestCase):
         error = Exception("APIError(code=-4108): Symbol is on delivering or delivered or settling or closed or pre-trading.")
 
         with patch.object(config, "OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 60), \
-             patch.object(exchange.client, "futures_open_interest", side_effect=error):
+             patch.object(exchange.client, "futures_open_interest", side_effect=error), \
+             patch.object(exchange, "_rate_limit_public_request"):
             exchange.get_open_interest("ALLOUSDT")
 
+        # Same fake-future-time.time() poisoning risk as the test above -
+        # rate limiter mocked here too so it doesn't affect later tests.
         with patch.object(exchange.time, "time", return_value=time.time() + 61), \
-             patch.object(exchange.client, "futures_open_interest", return_value={"symbol": "ALLOUSDT", "openInterest": "500"}):
+             patch.object(exchange.client, "futures_open_interest", return_value={"symbol": "ALLOUSDT", "openInterest": "500"}), \
+             patch.object(exchange, "_rate_limit_public_request"):
             result = exchange.get_open_interest("ALLOUSDT")
 
         self.assertEqual(result, 500.0)

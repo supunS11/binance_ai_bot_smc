@@ -54,6 +54,17 @@ BINANCE_PUBLIC_RATE_WINDOW_SECONDS = env_float(
 )
 KLINE_REQUEST_WEIGHT = env_float("KLINE_REQUEST_WEIGHT", 2)
 EXCHANGE_INFO_REQUEST_WEIGHT = env_float("EXCHANGE_INFO_REQUEST_WEIGHT", 1)
+# Minimum time between ANY two rate-limited REST calls (public, or private
+# calls that pass a weight), regardless of weight. Real bug found live
+# (2026-08-11): an unpaced per-symbol loop (80 symbols x 2 timeframes at
+# startup) fired ~160 calls back-to-back - their summed weight was well
+# under BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE, so the weight budget alone
+# never blocked it, but Binance still hard-banned the IP. A cumulative
+# weight-per-minute budget can't catch a burst of many calls landing in
+# the same second - this floor protects against that shape of bug in any
+# caller, not just the one instance found so far. 0 disables it (weight
+# budget alone, the original behavior).
+BINANCE_MIN_REQUEST_GAP_SECONDS = env_float("BINANCE_MIN_REQUEST_GAP_SECONDS", 0.05)
 
 # =========================
 # SYMBOL UNIVERSE / WATCHLIST
