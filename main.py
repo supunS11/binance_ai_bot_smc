@@ -297,15 +297,19 @@ def main():
     reject_counts = Counter()
     reject_symbols = {}
     stability = SignalStabilityTracker()
+    # Balance barely changes tick-to-tick, so it's refreshed on the same
+    # cadence as position polling rather than every eval tick - otherwise
+    # a faster SIGNAL_EVAL_INTERVAL_SECONDS would scale this REST call
+    # 1:1 with scan speed for no benefit (real issue found 2026-08-12).
+    balance = _current_balance()
 
     try:
         while not shutdown_event.is_set():
             time.sleep(eval_interval)
             tick += 1
 
-            balance = _current_balance()
-
             if tick % poll_every_ticks == 0:
+                balance = _current_balance()
                 _poll_positions(feed, positions)
                 _resolve_break_confirmations(feed, positions)
 
