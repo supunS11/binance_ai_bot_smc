@@ -219,6 +219,17 @@ FUNDING_POLL_INTERVAL_SECONDS = env_int("FUNDING_POLL_INTERVAL_SECONDS", 300)
 # in main.py, only for a candidate that's already passed every other
 # check, right before it would actually trade. Informational only.
 LONG_SHORT_RATIO_ENABLED = env_bool("LONG_SHORT_RATIO_ENABLED", "True")
+# Boolean "favorable" readings derived from efficiency_ratio/funding_rate/
+# long_short_ratio - informational only, journaled but NOT fed into
+# confluence_fields/confluence_ratio (see CONFLUENCE_SIZING_ENABLED below:
+# that mechanism is disabled on real negative evidence already, so mixing
+# new unvalidated fields into it would contaminate any future read of
+# either). Deliberately not gates either, same evidence-first treatment as
+# every other informational field above - promote to a real gate only if
+# journal_analysis.py's breakdown ever shows real separation.
+EFFICIENCY_RATIO_CHOP_THRESHOLD = env_float("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3)
+FUNDING_RATE_ADVERSE_THRESHOLD = env_float("FUNDING_RATE_ADVERSE_THRESHOLD", 0.0005)
+LONG_SHORT_RATIO_CROWD_THRESHOLD = env_float("LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0)
 # Require the LTF candle that broke structure to have actually CLOSED
 # beyond the level before entering, instead of reacting to a still-forming
 # candle's wick - a real behavior change (this bot's original premise was
@@ -398,6 +409,26 @@ SIGNAL_CONFIRM_TICKS = env_int("SIGNAL_CONFIRM_TICKS", 3)
 # Used only in SHADOW mode so risk-based position sizing has a balance to
 # size against without needing real API keys / an authenticated call.
 SHADOW_ACCOUNT_BALANCE_USDT = env_float("SHADOW_ACCOUNT_BALANCE_USDT", 1000)
+# Places entries as a resting GTC LIMIT at the signal's entry_price
+# instead of a market order, so the fill happens at the actual OTE/
+# structure price instead of wherever price has run to once
+# SIGNAL_CONFIRM_TICKS/REQUIRE_CLOSE_CONFIRMED_BREAK/MAX_ENTRY_EXTENSION_R
+# finish resolving. Deliberately has NO market-order fallback on expiry
+# or invalidation (see position_manager.poll_pending_entry) - an unfilled
+# limit is walked away from, never chased; that's the entire point of
+# this mode. Default OFF, same "don't silently change a running bot's
+# behavior" convention as every other feature this session.
+LIMIT_ENTRY_MODE_ENABLED = env_bool("LIMIT_ENTRY_MODE_ENABLED", "False")
+# Wall-clock, not tick-based - deliberately decoupled from
+# SIGNAL_EVAL_INTERVAL_SECONDS (see poll_every_ticks in main.py; tying
+# expiry to eval-ticks would make it silently rescale if that's ever
+# tuned, the same hidden-coupling bug already found once with
+# _current_balance()). 600s chosen against WS_KLINE_INTERVAL=1h /
+# HTF_KLINE_INTERVAL=4h - roughly 1/6 of the triggering hourly candle,
+# long enough for a genuine OTE retracement without the setup going
+# stale mid-candle. Starting value, not yet calibrated against real
+# fill-rate data.
+LIMIT_ENTRY_EXPIRY_SECONDS = env_int("LIMIT_ENTRY_EXPIRY_SECONDS", 600)
 
 # =========================
 # LOGGING / ALERTING

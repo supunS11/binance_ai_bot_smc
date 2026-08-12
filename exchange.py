@@ -491,6 +491,12 @@ def get_symbol_quantity_rules(symbol, order_type="MARKET"):
             if order_type == "MARKET":
                 lot_size = filters.get("MARKET_LOT_SIZE") or lot_size or {}
                 max_qty = lot_size.get("maxQty", "0")
+            elif order_type == "LIMIT":
+                # A plain resting LIMIT entry is neither a MARKET order nor
+                # one of the algo/conditional types below (it never
+                # executes-as-MARKET-once-triggered) - LOT_SIZE alone is
+                # the correct filter, not the tighter-of-both clamp.
+                max_qty = lot_size.get("maxQty", "0")
             else:
                 # Algo/conditional orders that carry an explicit quantity
                 # (TAKE_PROFIT_MARKET's partial TP1 leg) execute as a
@@ -991,6 +997,40 @@ def close_position_market(symbol, position_side, quantity):
     )
 
 
+def place_limit_order(symbol, side, quantity, price):
+    """Plain resting GTC LIMIT entry - config.LIMIT_ENTRY_MODE_ENABLED.
+    Unlike place_market_order this does NOT fill synchronously: it can sit
+    unfilled indefinitely, so callers must track and expire/cancel it
+    themselves (see position_manager.poll_pending_entry) rather than
+    assume a position exists once this call returns. Stays on the plain
+    order endpoint (python-binance does not auto-route "LIMIT" to the algo
+    namespace the way it does STOP_MARKET/TAKE_PROFIT_MARKET)."""
+    quantity = normalize_order_quantity(symbol, quantity, order_type="LIMIT")
+
+    if quantity <= 0:
+        raise ValueError(f"{symbol} entry quantity normalized to zero")
+
+    # Deliberately normalize_order_price, not normalize_trigger_price: a
+    # resting limit has no "must not fire immediately" constraint the way
+    # a stop/TP trigger does, so the away-from-market rounding that
+    # function applies doesn't belong here.
+    price = normalize_order_price(symbol, price, rounding="nearest")
+
+    if price <= 0:
+        raise ValueError(f"{symbol} entry price is invalid")
+
+    return _private_rest_call(
+        f"futures_create_order:{symbol}:limit",
+        client.futures_create_order,
+        symbol=symbol,
+        side=side,
+        type="LIMIT",
+        quantity=quantity,
+        price=price,
+        timeInForce="GTC",
+    )
+
+
 def place_algo_order(**params):
     """SL/TP conditional orders go through Binance's algo-order namespace
     (same as v7/v8), not the plain order endpoint - `algoStatus="FINISHED"`
@@ -1189,6 +1229,75 @@ def get_algo_order_status(symbol, algo_id):
 
         log_warning(f"{symbol} algo order {algo_id} status lookup warning: {exc}")
         return "UNKNOWN"
+
+
+def get_order_status(symbol, order_id):
+    """Ground truth for a plain (non-algo) order - config.LIMIT_ENTRY_MODE_ENABLED's
+    entry order is placed on this endpoint, not the algo namespace, so it
+    needs its own status/cancel pair rather than reusing
+    get_algo_order_status/cancel_algo_order. `executed_qty`/`avg_price`
+    (not just status) matter here specifically because a LIMIT order can
+    partially fill - see position_manager.poll_pending_entry."""
+    try:
+        order = _private_rest_call(
+            f"futures_get_order:{symbol}",
+            client.futures_get_order,
+            symbol=symbol,
+            orderId=order_id,
+            weight=1,
+        )
+        return {
+            "status": str(order.get("status") or "").upper(),
+            "executed_qty": float(order.get("executedQty") or 0),
+            "avg_price": float(order.get("avgPrice") or 0),
+            "orig_qty": float(order.get("origQty") or 0),
+        }
+
+    except Exception as exc:
+        message = str(exc).lower()
+
+        if "unknown order" in message or "order does not exist" in message or "not found" in message:
+            return {"status": "NOT_FOUND", "executed_qty": 0.0, "avg_price": 0.0, "orig_qty": 0.0}
+
+        log_warning(f"{symbol} order {order_id} status lookup warning: {exc}")
+        return {"status": "UNKNOWN", "executed_qty": 0.0, "avg_price": 0.0, "orig_qty": 0.0}
+
+
+def cancel_order(symbol, order_id):
+    """Plain (non-algo) cancel - distinct endpoint from cancel_algo_order.
+    Never raises; logs and returns None on failure, same convention as
+    cancel_algo_order (callers must always re-check get_order_status after
+    calling this rather than assume the cancel succeeded - see
+    position_manager.poll_pending_entry's post-cancel race re-check)."""
+    try:
+        return _private_rest_call(
+            f"futures_cancel_order:{symbol}",
+            client.futures_cancel_order,
+            symbol=symbol,
+            orderId=order_id,
+            weight=1,
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} order {order_id} cancel warning: {exc}")
+        return None
+
+
+def get_all_open_orders():
+    """Every open plain (non-algo) order, account-wide, one call - the
+    non-algo analog of get_all_open_positions(). Startup-only use (see
+    PositionManager.reconcile_pending_entries_on_startup) - never called
+    per-poll-tick, so its higher weight doesn't recur."""
+    try:
+        response = _private_rest_call(
+            "futures_get_open_orders",
+            client.futures_get_open_orders,
+            weight=40,
+        )
+        return response if isinstance(response, list) else []
+
+    except Exception as exc:
+        log_error(f"open orders fetch error: {exc}")
+        return []
 
 
 def get_income_history(symbol=None, income_type=None, start_time=None, end_time=None, limit=1000):

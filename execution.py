@@ -119,3 +119,50 @@ def enter_trade(plan):
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
     }
+
+
+def enter_trade_limit(plan):
+    """config.LIMIT_ENTRY_MODE_ENABLED - places a resting GTC LIMIT entry
+    at plan["entry_price"] instead of a market order. Deliberately a
+    separate function from enter_trade rather than a branch inside it:
+    the LIVE body here is structurally different, not just a different
+    order type - there is no fill yet, so there is nothing to protect and
+    no synchronous SL-after-fill step. Protection (SL/TP2/TP1) is placed
+    later, asynchronously, once position_manager.poll_pending_entry
+    actually detects a fill. Callers register the result via
+    positions.register_pending_entry(...), not positions.register(...)."""
+    symbol = plan["symbol"]
+    side = plan["side"]
+
+    if config.EXECUTION_MODE != "LIVE":
+        log_info(
+            f"[SHADOW] {symbol} would place a LIMIT {side} qty={plan['quantity']} "
+            f"@ {plan['entry_price']} SL={plan['sl_price']} "
+            f"TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
+        )
+        return {"ok": True, "shadow": True, "entry_order": None}
+
+    # Same abort-before-any-order-attempt discipline as enter_trade - no
+    # entry order is ever attempted if the configured leverage isn't
+    # actually available for this symbol.
+    if not exchange.setup_leverage(symbol):
+        error = f"leverage {config.LEVERAGE}x not available for {symbol}"
+        log_error(f"{symbol} limit entry aborted | {error}")
+        return {"ok": False, "shadow": False, "error": error}
+
+    try:
+        entry_order = exchange.place_limit_order(
+            symbol, side, plan["quantity"], plan["entry_price"]
+        )
+    except Exception as exc:
+        log_error(f"{symbol} limit entry order error: {exc}")
+        return {"ok": False, "shadow": False, "error": str(exc)}
+
+    log_info(
+        f"{symbol} limit entry placed {side} qty={plan['quantity']} "
+        f"@ {plan['entry_price']} | SL={plan['sl_price']} "
+        f"TP1={plan['tp1_price']} TP2={plan['tp2_price']} "
+        f"(pending fill, expires in {config.LIMIT_ENTRY_EXPIRY_SECONDS}s)"
+    )
+
+    return {"ok": True, "shadow": False, "entry_order": entry_order}

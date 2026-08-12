@@ -270,6 +270,25 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertEqual(plan["tp1_quantity"], 5.0)
         self.assertEqual(plan["tp2_quantity"], 5.0)
 
+    def test_plan_is_unaffected_by_limit_entry_mode(self):
+        # config.LIMIT_ENTRY_MODE_ENABLED only changes execution.py/
+        # position_manager.py (how the entry gets placed and tracked) -
+        # the risk plan itself (SL/TP/sizing) must be identical either
+        # way, since a LIMIT entry uses the same signal["entry_price"]
+        # build_trade_plan already computes off of today.
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False):
+                plan_off, status_off = risk_manager.build_trade_plan(self._signal(), balance=1000)
+            with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True):
+                plan_on, status_on = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status_off, status_on)
+        self.assertEqual(plan_off, plan_on)
+
     def test_sl_unavailable_when_no_structure_level(self):
         plan, status = risk_manager.build_trade_plan(
             self._signal(structure_level=None), balance=1000

@@ -1,6 +1,6 @@
 import unittest
 from collections import Counter
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import config
 import exchange
@@ -23,6 +23,9 @@ class _FakeCandleSource:
     def get(self, symbol):
         return self._candles
 
+    def latest(self, symbol):
+        return self._candles[-1] if self._candles else None
+
 
 class _FakeFeed:
     def __init__(self, ltf_candles=None, htf_candles=None, volumes=None, funding_rates=None):
@@ -42,6 +45,7 @@ class _FakePositions:
         self._in_cooldown = in_cooldown
         self._count = count
         self.registered = []
+        self.registered_pending = []
         self.positions = {}
 
     def has_open_position(self, symbol):
@@ -58,6 +62,9 @@ class _FakePositions:
 
     def register(self, plan, execution_result, trade_id=None):
         self.registered.append((plan, execution_result, trade_id))
+
+    def register_pending_entry(self, plan, execution_result, trade_id=None):
+        self.registered_pending.append((plan, execution_result, trade_id))
 
 
 class EvaluateSymbolRejectCountsTests(unittest.TestCase):
@@ -477,6 +484,124 @@ class LogHeartbeatRejectSummaryTests(unittest.TestCase):
         logged = " ".join(call.args[0] for call in log_mock.call_args_list)
         self.assertIn("UNKNOWN=3 ", logged + " ")
         self.assertNotIn("UNKNOWN=3[", logged)
+
+
+class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
+    """config.LIMIT_ENTRY_MODE_ENABLED - _evaluate_symbol routes to the
+    resting-limit path (enter_trade_limit + register_pending_entry)
+    instead of the market-order path, based purely on this one flag. The
+    has_open_position/cooldown/MAX_TOTAL_POSITIONS guards above need no
+    changes for this (see position_manager.PENDING_LIMIT_FILL design
+    notes) - not re-proven here with a fake, since that's only meaningful
+    against the real PositionManager dict (see test_position_manager.py's
+    RegisterPendingEntryTests.test_reserves_a_max_total_positions_slot_immediately)."""
+
+    def _plan(self):
+        return {
+            "symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+            "tp1_price": 102, "tp2_price": 104,
+        }
+
+    def test_limit_entry_mode_enabled_uses_the_limit_entry_path(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade_limit", return_value={"ok": True, "shadow": True}) as enter_limit, \
+             patch.object(execution, "enter_trade") as enter_market, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_limit.assert_called_once()
+        enter_market.assert_not_called()
+        self.assertEqual(len(positions.registered_pending), 1)
+        self.assertEqual(len(positions.registered), 0)
+
+    def test_limit_entry_mode_disabled_uses_the_market_entry_path(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}) as enter_market, \
+             patch.object(execution, "enter_trade_limit") as enter_limit, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_market.assert_called_once()
+        enter_limit.assert_not_called()
+        self.assertEqual(len(positions.registered), 1)
+        self.assertEqual(len(positions.registered_pending), 0)
+
+    def test_limit_entry_failure_marks_entry_failure_not_registered(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade_limit", return_value={"ok": False, "error": "boom"}):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        self.assertEqual(len(positions.registered_pending), 0)
+
+
+class PollPositionsDispatchTests(unittest.TestCase):
+    """main._poll_positions dispatches on stage == PENDING_LIMIT_FILL
+    first, before the existing shadow/live dispatch - a resting entry
+    must never be polled by poll_live/poll_shadow (which assume a real
+    fill already exists), and a filled position must never be polled by
+    the pending-entry methods."""
+
+    def _positions_with(self, stage, shadow):
+        positions = MagicMock()
+        positions.positions = {"BTCUSDT": {"shadow": shadow, "stage": stage}}
+        return positions
+
+    def test_pending_live_dispatches_to_poll_pending_entry(self):
+        feed = _FakeFeed()
+        positions = self._positions_with(main.PENDING_LIMIT_FILL, shadow=False)
+
+        main._poll_positions(feed, positions)
+
+        positions.poll_pending_entry.assert_called_once()
+        positions.poll_live.assert_not_called()
+        positions.poll_shadow.assert_not_called()
+        positions.poll_shadow_pending_entry.assert_not_called()
+
+    def test_pending_shadow_dispatches_to_poll_shadow_pending_entry(self):
+        feed = _FakeFeed()
+        positions = self._positions_with(main.PENDING_LIMIT_FILL, shadow=True)
+
+        main._poll_positions(feed, positions)
+
+        positions.poll_shadow_pending_entry.assert_called_once()
+        positions.poll_live.assert_not_called()
+        positions.poll_shadow.assert_not_called()
+        positions.poll_pending_entry.assert_not_called()
+
+    def test_filled_live_dispatches_to_poll_live_unchanged(self):
+        feed = _FakeFeed()
+        positions = self._positions_with("TP1_PENDING", shadow=False)
+
+        main._poll_positions(feed, positions)
+
+        positions.poll_live.assert_called_once_with("BTCUSDT")
+        positions.poll_pending_entry.assert_not_called()
+        positions.poll_shadow_pending_entry.assert_not_called()
+
+    def test_filled_shadow_dispatches_to_poll_shadow_unchanged(self):
+        feed = _FakeFeed()
+        positions = self._positions_with("TP1_PENDING", shadow=True)
+
+        main._poll_positions(feed, positions)
+
+        positions.poll_shadow.assert_called_once()
+        positions.poll_pending_entry.assert_not_called()
+        positions.poll_shadow_pending_entry.assert_not_called()
 
 
 if __name__ == "__main__":

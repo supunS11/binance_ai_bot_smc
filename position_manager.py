@@ -21,6 +21,14 @@ from logger import log_error, log_info, log_warning
 
 TP1_PENDING = "TP1_PENDING"
 BREAKEVEN_ACTIVE = "BREAKEVEN_ACTIVE"
+# config.LIMIT_ENTRY_MODE_ENABLED - a resting GTC LIMIT entry that hasn't
+# (fully) filled yet. Lives in the same `positions` dict as every other
+# stage (not a separate manager) so has_open_position()/open_count()/
+# cooldown accounting all work for it with no extra bookkeeping - a
+# pending entry reserves its MAX_TOTAL_POSITIONS slot the instant it's
+# placed, same as capital is nominally committed the moment it rests on
+# the book.
+PENDING_LIMIT_FILL = "PENDING_LIMIT_FILL"
 
 
 def _order_type(order):
@@ -133,6 +141,56 @@ class PositionManager:
         self.positions[symbol] = position
         return position
 
+    def register_pending_entry(self, plan, execution_result, trade_id=None):
+        """A resting LIMIT entry has been placed but not (yet) filled -
+        parallel to register(), but sl_order_id/tp1_order_id/tp2_order_id
+        all start None (nothing is placed until a real fill exists, see
+        poll_pending_entry) rather than being read from execution_result
+        the way register() reads real SL/TP order ids off a synchronously-
+        filled market order."""
+        symbol = plan["symbol"]
+        shadow = execution_result.get("shadow", True)
+
+        position = {
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "side": plan["side"],
+            "entry_price": plan["entry_price"],
+            "sl_price": plan["sl_price"],
+            "tp1_price": plan["tp1_price"],
+            "tp2_price": plan["tp2_price"],
+            "breakeven_price": plan["breakeven_price"],
+            "quantity": plan["quantity"],
+            "tp1_quantity": plan["tp1_quantity"],
+            "tp2_quantity": plan["tp2_quantity"],
+            "sl_order_id": None,
+            "tp1_order_id": None,
+            "tp2_order_id": None,
+            "limit_order_id": (
+                exchange._accepted_order_id(execution_result.get("entry_order"))
+                if not shadow else None
+            ),
+            "limit_placed_at": time.time(),
+            "filled_quantity": 0.0,
+            "stage": PENDING_LIMIT_FILL,
+            "shadow": shadow,
+            "opened_at": time.time(),
+            "confluence_ratio": plan.get("confluence_ratio"),
+            "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
+            # Tracking a not-yet-real fill's excursion is meaningless -
+            # seeded with a real price only once poll_pending_entry sees
+            # an actual fill (_apply_pending_fill).
+            "mae_price": None,
+            "mfe_price": None,
+            "risk_distance": plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"]),
+            "structure_level": plan.get("structure_level"),
+            "trigger_candle_open_time": plan.get("trigger_candle_open_time"),
+            "break_confirmed_by_close": None,
+        }
+        self.positions[symbol] = position
+        return position
+
     def reconcile_on_startup(self):
         """Rebuild tracking for positions already open on the exchange
         when the process starts - crash, manual restart, or a redeploy.
@@ -159,6 +217,48 @@ class PositionManager:
             log_info(
                 f"Startup reconciliation | {len(live_positions)} open "
                 f"position(s) found on the exchange | {adopted} adopted"
+            )
+
+    def reconcile_pending_entries_on_startup(self):
+        """A resting, not-yet-filled LIMIT entry has no recoverable plan
+        after a restart - unlike a filled position (adopted + emergency-
+        stopped by reconcile_on_startup/_adopt_position above), there's no
+        structure_level/expiry/original-signal data to reconstruct here,
+        only a guess. Cancel it outright and let the next eval tick
+        re-evaluate that symbol fresh, matching this codebase's existing
+        "close/cancel rather than guess" philosophy (_close_remainder_at_market,
+        _market_close_tp1). Must run AFTER reconcile_on_startup() so a
+        limit order that had already partially filled into a real
+        position gets adopted (and protected) by the existing self-heal
+        path first - this only ever touches still-resting orders with no
+        exchange position attached."""
+        if not config.LIMIT_ENTRY_MODE_ENABLED:
+            return
+
+        cancelled = 0
+
+        for order in exchange.get_all_open_orders():
+            if str(order.get("type") or "").upper() != "LIMIT":
+                continue
+
+            symbol = order.get("symbol")
+            order_id = order.get("orderId")
+
+            if not symbol or not order_id:
+                continue
+
+            exchange.cancel_order(symbol, order_id)
+            cancelled += 1
+            log_warning(
+                f"{symbol} cancelled a resting LIMIT order found on "
+                f"restart (order_id={order_id}) - no recoverable pending-"
+                f"entry plan survives a restart, re-evaluating fresh instead"
+            )
+
+        if cancelled:
+            log_info(
+                f"Startup reconciliation | {cancelled} resting limit "
+                f"entry order(s) cancelled"
             )
 
     def _adopt_position(self, symbol, live_position):
@@ -836,5 +936,263 @@ class PositionManager:
 
             if hit_tp2:
                 return self._close(symbol, "SHADOW_TP2_HIT")
+
+        return None
+
+    # =========================
+    # PENDING LIMIT ENTRY - config.LIMIT_ENTRY_MODE_ENABLED. A resting
+    # GTC LIMIT order can fill (fully or partially) at any arbitrary
+    # moment while unattended, unlike a market order's synchronous fill -
+    # so unlike enter_trade()/register(), there is no single call where
+    # "place entry, then immediately place SL" can happen atomically.
+    # Protection is instead placed the moment a fill is FIRST detected on
+    # poll (see _apply_pending_fill), keeping the same "never leave a real
+    # filled quantity unprotected" invariant the rest of this file already
+    # enforces, just detected asynchronously instead of synchronously.
+    # =========================
+    @staticmethod
+    def _pending_entry_invalidated(position, latest_candle):
+        """Cheap, no-extra-REST invalidation check for a still-unfilled
+        (or partially-filled) resting limit: has price already reached the
+        level where the eventual stop would sit, before the limit ever
+        finished filling? If so the setup that justified this entry has
+        already failed - don't keep it resting waiting to fill into a
+        broken trade. Uses the candle's full range (not just its close),
+        symmetric with poll_shadow's existing SL-touch check, so an
+        intrabar wick isn't missed. `latest_candle` comes from the free
+        websocket feed - no extra REST call."""
+        if not latest_candle:
+            return False
+
+        side = position["side"]
+        sl_price = position["sl_price"]
+
+        if side == "BUY":
+            return latest_candle["low"] <= sl_price
+
+        return latest_candle["high"] >= sl_price
+
+    def _settle_pending_entry_to_tp1_pending(self, position):
+        """The resting limit is done filling (either genuinely FILLED, or
+        cancelled with real quantity already on it) - place TP1 sized off
+        whatever actually filled (not the originally planned quantity,
+        which the real fill may differ from) and promote to the normal
+        TP1_PENDING lifecycle that poll_live already drives."""
+        symbol = position["symbol"]
+        side = position["side"]
+        filled_quantity = position["filled_quantity"]
+        tp1_close_pct = min(max(float(config.TP1_CLOSE_PCT), 0), 100)
+        tp1_quantity = round(filled_quantity * tp1_close_pct / 100, 8)
+        tp2_quantity = round(filled_quantity - tp1_quantity, 8)
+        position["quantity"] = filled_quantity
+        position["tp1_quantity"] = tp1_quantity
+        position["tp2_quantity"] = tp2_quantity
+
+        if tp1_quantity > 0:
+            try:
+                tp1_order = exchange.place_take_profit_partial(
+                    symbol, side, tp1_quantity, position["tp1_price"]
+                )
+                position["tp1_order_id"] = exchange._accepted_order_id(tp1_order)
+            except Exception as exc:
+                log_warning(
+                    f"{symbol} TP1 placement failed after limit fill "
+                    f"settled (SL is active): {exc}"
+                )
+
+        position["stage"] = TP1_PENDING
+        log_info(
+            f"{symbol} limit entry settled | qty={filled_quantity} "
+            f"entry={position['entry_price']} sl={position['sl_price']} "
+            f"tp1={position['tp1_price']} tp2={position['tp2_price']}"
+        )
+
+    def _apply_pending_fill(self, position, order, settle=False):
+        """A resting limit's executed_qty grew since it was last checked.
+        On the FIRST fill, place SL now (closePosition=true protects
+        whatever quantity is actually open right now, and stays valid
+        without resizing even if more of the resting remainder fills
+        later) and TP2 now (same closePosition=true property) - mirrors
+        execution.py's "SL is atomic, TP2/TP1 best-effort" discipline, just
+        triggered by a poll detecting the fill instead of a synchronous
+        return value. TP1 needs an exact quantity, so it's deferred until
+        the fill is final (`settle=True`, or the order itself reports
+        FILLED) rather than sized against a still-growing partial fill.
+        Returns an outcome string only if the position had to be closed
+        outright (SL placement failed); otherwise None, whether or not
+        settlement happened this call."""
+        symbol = position["symbol"]
+        side = position["side"]
+        first_fill = position["filled_quantity"] == 0
+        position["filled_quantity"] = order["executed_qty"]
+
+        if first_fill:
+            entry_price = order["avg_price"] or position["entry_price"]
+            position["entry_price"] = entry_price
+            position["risk_distance"] = abs(entry_price - position["sl_price"])
+            position["mae_price"] = entry_price
+            position["mfe_price"] = entry_price
+
+            try:
+                sl_order = exchange.place_stop_loss(symbol, side, position["sl_price"])
+                position["sl_order_id"] = exchange._accepted_order_id(sl_order)
+            except Exception as exc:
+                log_error(
+                    f"{symbol} SL placement failed after limit entry "
+                    f"filled - closing the filled quantity at market "
+                    f"rather than leave it unprotected: {exc}"
+                )
+                try:
+                    exchange.close_position_market(symbol, side, position["filled_quantity"])
+                except Exception as close_exc:
+                    log_error(
+                        f"{symbol} CRITICAL: failed to close unprotected "
+                        f"limit-fill position - manual intervention "
+                        f"needed: {close_exc}"
+                    )
+                exchange.cancel_all_open_orders(symbol)
+                return self._close(symbol, "LIMIT_FILL_SL_PLACEMENT_FAILED")
+
+            try:
+                tp2_order = exchange.place_take_profit_full(symbol, side, position["tp2_price"])
+                position["tp2_order_id"] = exchange._accepted_order_id(tp2_order)
+            except Exception as exc:
+                log_warning(
+                    f"{symbol} TP2 placement failed after limit fill (SL is active): {exc}"
+                )
+
+            log_info(
+                f"{symbol} limit entry filling | filled={position['filled_quantity']} "
+                f"avg_price={entry_price}"
+            )
+
+        if settle or order["status"] == "FILLED":
+            self._settle_pending_entry_to_tp1_pending(position)
+
+        return None
+
+    def _drop_unfilled_pending_entry(self, position, invalidated, shadow=False):
+        """Genuinely zero-fill cancel/expiry - nothing was ever protected,
+        nothing to unwind on the exchange side beyond the cancel already
+        issued by the caller. Invalidation gets the same cooldown
+        treatment as a real SL hit (the level failed); expiry does not
+        (nothing was wrong with the setup, price just didn't come back in
+        time) - same distinction SYMBOL_REENTRY_COOLDOWN_SECONDS's
+        docstring already draws for a real close."""
+        symbol = position["symbol"]
+        self.positions.pop(symbol, None)
+        reason = "LIMIT_INVALIDATED_UNFILLED" if invalidated else "LIMIT_EXPIRED_UNFILLED"
+
+        if invalidated:
+            self._closed_at[symbol] = time.time()
+
+        prefix = " [SHADOW]" if shadow else ""
+        log_info(f"{symbol}{prefix} pending limit entry cancelled | {reason}")
+        signal_journal.append_outcome(symbol, reason, position.get("trade_id"))
+        return reason
+
+    def poll_pending_entry(self, symbol, latest_candle):
+        """Returns an outcome string if the pending entry resolved this
+        call (closed outright on an SL-placement failure, or dropped
+        unfilled on cancel), otherwise None - including when it silently
+        settled into TP1_PENDING, which is not itself a closed-trade
+        outcome. Only meaningful for stage == PENDING_LIMIT_FILL,
+        non-shadow positions - see main.py's _poll_positions dispatch."""
+        position = self.positions.get(symbol)
+
+        if not position or position["shadow"] or position["stage"] != PENDING_LIMIT_FILL:
+            return None
+
+        order = exchange.get_order_status(symbol, position["limit_order_id"])
+
+        if order["status"] == "UNKNOWN":
+            return None  # transient fetch failure - retry next poll
+
+        if order["executed_qty"] > position["filled_quantity"]:
+            outcome = self._apply_pending_fill(position, order)
+
+            if outcome:
+                return outcome
+
+            if position["stage"] != PENDING_LIMIT_FILL:
+                return None  # settled into TP1_PENDING this call
+
+        invalidated = self._pending_entry_invalidated(position, latest_candle)
+        expired = (
+            time.time() - position["limit_placed_at"]
+        ) >= max(float(config.LIMIT_ENTRY_EXPIRY_SECONDS), 0)
+
+        if not invalidated and not expired:
+            return None
+
+        return self._resolve_pending_entry_cancel(position, invalidated)
+
+    def _resolve_pending_entry_cancel(self, position, invalidated):
+        symbol = position["symbol"]
+        exchange.cancel_order(symbol, position["limit_order_id"])
+
+        # A fill can race a cancel - Binance doesn't guarantee atomicity
+        # between them - so always re-check ground truth after cancelling
+        # instead of assuming the cancel definitely beat any last-moment
+        # fill. `settle=True` here because the remainder is now dead
+        # regardless of what status the exchange reports for it.
+        order = exchange.get_order_status(symbol, position["limit_order_id"])
+
+        if order["status"] != "UNKNOWN" and order["executed_qty"] > position["filled_quantity"]:
+            return self._apply_pending_fill(position, order, settle=True)
+
+        if position["filled_quantity"] > 0:
+            # Already protected via SL/TP2 from an earlier partial fill;
+            # the remainder is now cancelled - settle what's real rather
+            # than treat an already-real, protected quantity as unfilled.
+            self._settle_pending_entry_to_tp1_pending(position)
+            return None
+
+        return self._drop_unfilled_pending_entry(position, invalidated)
+
+    def poll_shadow_pending_entry(self, symbol, latest_candle):
+        """SHADOW equivalent of poll_pending_entry, simulated against the
+        live candle stream the same way poll_shadow already is."""
+        position = self.positions.get(symbol)
+
+        if (
+            not position or not position["shadow"]
+            or position["stage"] != PENDING_LIMIT_FILL or not latest_candle
+        ):
+            return None
+
+        side = position["side"]
+        entry_price = position["entry_price"]
+        sl_price = position["sl_price"]
+        low = latest_candle["low"]
+        high = latest_candle["high"]
+        touches_entry = low <= entry_price <= high
+        touches_sl = low <= sl_price if side == "BUY" else high >= sl_price
+
+        if touches_entry and touches_sl:
+            # Same deliberately conservative simplification poll_shadow
+            # already documents: assume the stop would have been touched
+            # first, don't overstate a would-be fill's win rate.
+            return self._drop_unfilled_pending_entry(position, invalidated=True, shadow=True)
+
+        if touches_entry:
+            position["filled_quantity"] = position["quantity"]
+            position["mae_price"] = entry_price
+            position["mfe_price"] = entry_price
+            position["stage"] = TP1_PENDING
+            log_info(f"{symbol} [SHADOW] limit entry would have filled | entry={entry_price}")
+            return None
+
+        if touches_sl:
+            # Reached the stop level without ever touching the entry -
+            # invalidated, never filled.
+            return self._drop_unfilled_pending_entry(position, invalidated=True, shadow=True)
+
+        expired = (
+            time.time() - position["limit_placed_at"]
+        ) >= max(float(config.LIMIT_ENTRY_EXPIRY_SECONDS), 0)
+
+        if expired:
+            return self._drop_unfilled_pending_entry(position, invalidated=False, shadow=True)
 
         return None

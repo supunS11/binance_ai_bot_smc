@@ -24,6 +24,21 @@ def _reject(reason, **extra):
     return {"signal": None, "reason": reason, **extra}
 
 
+def long_short_favorable(side, long_short_ratio):
+    """Contrarian reading of the global long/short account ratio - don't
+    buy into an already long-crowded market or short into an already
+    short-crowded one. Called from main.py once the on-demand
+    long_short_ratio fetch resolves (see config.LONG_SHORT_RATIO_ENABLED
+    for why that value can't be computed inside evaluate() itself).
+    Informational only, NOT a gate - same treatment as
+    efficiency_favorable/funding_favorable above."""
+    if long_short_ratio is None:
+        return None
+
+    threshold = max(float(config.LONG_SHORT_RATIO_CROWD_THRESHOLD), 0.0001)
+    return long_short_ratio < threshold if side == "BUY" else long_short_ratio > 1 / threshold
+
+
 def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
@@ -222,6 +237,26 @@ def evaluate(
     # squeeze/reversal); strongly negative is the mirror image.
     funding_rate = funding_rate if config.FUNDING_RATE_ENABLED else None
 
+    # Boolean "favorable" readings - informational only, journaled but
+    # deliberately NOT added to confluence_fields/confluence_ratio below
+    # (see config.EFFICIENCY_RATIO_CHOP_THRESHOLD: that sizing mechanism
+    # is disabled today on real negative evidence from its existing 5
+    # fields - mixing new, unvalidated ones into it would contaminate any
+    # future read of either). Kept independently named/journaled so
+    # journal_analysis.py can evaluate each on its own merits before any
+    # decision to fold it into sizing (or promote it to a real gate).
+    efficiency_favorable = (
+        efficiency_ratio > config.EFFICIENCY_RATIO_CHOP_THRESHOLD
+        if efficiency_ratio is not None else None
+    )
+    funding_favorable = None
+
+    if funding_rate is not None:
+        adverse = config.FUNDING_RATE_ADVERSE_THRESHOLD
+        funding_favorable = (
+            funding_rate <= adverse if side == "BUY" else funding_rate >= -adverse
+        )
+
     # Confluence score: how many of the informational fields above agree
     # with this signal's direction, out of how many were actually
     # available to check (a field that's None - e.g. liquidation, still
@@ -263,9 +298,17 @@ def evaluate(
         "liquidation_cluster": liquidation_cluster,
         "liquidation_aligned": liquidation_aligned,
         "efficiency_ratio": efficiency_ratio,
+        "efficiency_favorable": efficiency_favorable,
         "btc_correlation": btc_correlation,
         "btc_aligned": btc_aligned,
         "funding_rate": funding_rate,
+        "funding_favorable": funding_favorable,
+        # long_short_ratio/long_short_favorable are NOT set here - the
+        # raw ratio is only fetched on-demand in main.py, after a
+        # candidate has already passed every check in this function (see
+        # config.LONG_SHORT_RATIO_ENABLED - no bulk endpoint exists for
+        # it). main.py calls long_short_favorable() below once it has the
+        # real value.
         "confluence_score": confluence_score,
         "confluence_total": confluence_total,
         "confluence_ratio": confluence_ratio,

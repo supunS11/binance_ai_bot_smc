@@ -175,5 +175,60 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         self.assertIsNone(result["tp2_order"])
 
 
+class EnterTradeLimitShadowModeTests(unittest.TestCase):
+    def test_shadow_mode_places_no_real_orders(self):
+        with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_limit(_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        self.assertIsNone(result["entry_order"])
+        limit_order.assert_not_called()
+
+
+class EnterTradeLimitLiveModeTests(unittest.TestCase):
+    """config.LIMIT_ENTRY_MODE_ENABLED - structurally different from
+    enter_trade's LIVE path: nothing is filled yet at placement time, so
+    no SL/TP1/TP2 must ever be placed here (position_manager.poll_pending_entry
+    is where that happens, once a real fill is detected)."""
+
+    def test_live_mode_places_only_the_limit_entry_order(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}) as limit_order, \
+             patch.object(exchange, "place_stop_loss") as stop_loss, \
+             patch.object(exchange, "place_take_profit_partial") as tp1, \
+             patch.object(exchange, "place_take_profit_full") as tp2:
+            result = execution.enter_trade_limit(_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        self.assertIsNotNone(result["entry_order"])
+        limit_order.assert_called_once_with("BTCUSDT", "BUY", 1.0, 100)
+        stop_loss.assert_not_called()
+        tp1.assert_not_called()
+        tp2.assert_not_called()
+
+    def test_leverage_failure_aborts_before_any_entry_attempt(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=False), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_limit(_plan())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("leverage", result["error"])
+        limit_order.assert_not_called()
+
+    def test_entry_order_failure_returns_not_ok(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", side_effect=RuntimeError("boom")):
+            result = execution.enter_trade_limit(_plan())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("boom", result["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

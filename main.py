@@ -18,7 +18,7 @@ import risk_manager
 import signal_engine
 import signal_journal
 from logger import log_error, log_info, log_warning
-from position_manager import PositionManager
+from position_manager import PENDING_LIMIT_FILL, PositionManager
 from ws_client import RealtimeMarketData
 
 
@@ -168,6 +168,9 @@ def _evaluate_symbol(
     # per symbol per poll cycle.
     if config.LONG_SHORT_RATIO_ENABLED:
         result["long_short_ratio"] = exchange.get_long_short_ratio(symbol)
+        result["long_short_favorable"] = signal_engine.long_short_favorable(
+            result["signal"], result["long_short_ratio"]
+        )
 
     plan, status = risk_manager.build_trade_plan(result, balance)
 
@@ -195,7 +198,10 @@ def _evaluate_symbol(
         f"htf_trend={result.get('htf_trend')}"
     )
 
-    execution_result = execution.enter_trade(plan)
+    if config.LIMIT_ENTRY_MODE_ENABLED:
+        execution_result = execution.enter_trade_limit(plan)
+    else:
+        execution_result = execution.enter_trade(plan)
 
     if not execution_result.get("ok"):
         log_warning(f"{symbol} entry failed | {execution_result.get('error')}")
@@ -203,7 +209,11 @@ def _evaluate_symbol(
         return
 
     trade_id = signal_journal.append_signal(result, plan)
-    positions.register(plan, execution_result, trade_id=trade_id)
+
+    if config.LIMIT_ENTRY_MODE_ENABLED:
+        positions.register_pending_entry(plan, execution_result, trade_id=trade_id)
+    else:
+        positions.register(plan, execution_result, trade_id=trade_id)
 
     if stability is not None:
         # Clears the streak now that it's been acted on - without this, a
@@ -221,6 +231,16 @@ def _poll_positions(feed, positions):
         position = positions.positions.get(symbol)
 
         if not position:
+            continue
+
+        if position["stage"] == PENDING_LIMIT_FILL:
+            latest_candle = feed.candles.latest(symbol)
+
+            if position["shadow"]:
+                positions.poll_shadow_pending_entry(symbol, latest_candle)
+            else:
+                positions.poll_pending_entry(symbol, latest_candle)
+
             continue
 
         if position["shadow"]:
@@ -254,8 +274,12 @@ def _log_heartbeat(feed, symbols, positions, reject_counts=None, reject_symbols=
 
     for symbol in list(positions.positions.keys()):
         position = positions.positions[symbol]
+        filled_note = (
+            f" filled={position['filled_quantity']}"
+            if position["stage"] == PENDING_LIMIT_FILL else ""
+        )
         log_info(
-            f"  OPEN {symbol} {position['side']} stage={position['stage']} "
+            f"  OPEN {symbol} {position['side']} stage={position['stage']}{filled_note} "
             f"entry={position['entry_price']} sl={position['sl_price']} "
             f"tp1={position['tp1_price']} tp2={position['tp2_price']}"
         )
@@ -279,6 +303,7 @@ def main():
 
     if config.EXECUTION_MODE == "LIVE":
         positions.reconcile_on_startup()
+        positions.reconcile_pending_entries_on_startup()
 
     eval_interval = max(config.SIGNAL_EVAL_INTERVAL_SECONDS, 1)
     heartbeat_every = max(int(30 / eval_interval), 1)

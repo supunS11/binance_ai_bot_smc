@@ -340,6 +340,89 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertIsNone(result["funding_rate"])
 
+    def test_efficiency_favorable_true_above_the_chop_threshold(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.5)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(ltf_analysis=analysis)
+
+        self.assertTrue(result["efficiency_favorable"])
+
+    def test_efficiency_favorable_false_below_the_chop_threshold(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(ltf_analysis=analysis)
+
+        self.assertFalse(result["efficiency_favorable"])
+
+    def test_efficiency_favorable_is_none_when_efficiency_ratio_is_unavailable(self):
+        result = self._run()  # LTF_BULLISH_BREAK carries no efficiency_ratio key
+        self.assertIsNone(result["efficiency_favorable"])
+
+    def test_funding_favorable_for_buy_below_the_adverse_threshold(self):
+        with patch.object(config, "FUNDING_RATE_ADVERSE_THRESHOLD", 0.0005):
+            result = self._run(funding_rate=0.0001)  # not crowded long
+
+        self.assertTrue(result["funding_favorable"])
+
+    def test_funding_unfavorable_for_buy_above_the_adverse_threshold(self):
+        with patch.object(config, "FUNDING_RATE_ADVERSE_THRESHOLD", 0.0005):
+            result = self._run(funding_rate=0.001)  # crowded long, adverse to a BUY
+
+        self.assertFalse(result["funding_favorable"])
+
+    def test_funding_favorable_is_mirrored_for_sell(self):
+        with patch.object(config, "FUNDING_RATE_ADVERSE_THRESHOLD", 0.0005):
+            # SELL favorable requires funding_rate >= -adverse (not
+            # crowded-short, the squeeze-risk case for a SELL) - the
+            # mirror image of the BUY case above, which requires
+            # funding_rate <= +adverse (not crowded-long).
+            favorable = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0, funding_rate=-0.0001,
+            )
+            unfavorable = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0, funding_rate=-0.001,
+            )
+
+        self.assertTrue(favorable["funding_favorable"])
+        self.assertFalse(unfavorable["funding_favorable"])
+
+    def test_funding_favorable_is_none_when_funding_rate_is_unavailable(self):
+        result = self._run(funding_rate=None)
+        self.assertIsNone(result["funding_favorable"])
+
+    def test_funding_favorable_is_none_when_disabled(self):
+        with patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._run(funding_rate=0.0003)
+
+        self.assertIsNone(result["funding_favorable"])
+
+    def test_new_favorable_booleans_are_not_added_to_confluence(self):
+        # Operator-confirmed decision: efficiency_favorable/funding_favorable/
+        # long_short_favorable stay independently journaled, NOT mixed into
+        # confluence_fields/confluence_ratio (that mechanism is disabled on
+        # real negative evidence from its existing 5 fields - see
+        # config.CONFLUENCE_SIZING_ENABLED). This locks the decision in so
+        # a future edit can't silently reintroduce it.
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.9)
+        result = self._run(ltf_analysis=analysis, funding_rate=0.0001)
+
+        self.assertTrue(result["efficiency_favorable"])
+        self.assertTrue(result["funding_favorable"])
+        # Same confluence_total as test_confluence_score_full_agreement_
+        # gives_ratio_one below (4: sweep/ema/oi/liquidation - default
+        # symbol is the BTC reference symbol itself, so btc_aligned is
+        # skipped) - unaffected by either new favorable boolean being true.
+        self.assertEqual(result["confluence_total"], 4)
+
+
     def test_confluence_score_full_agreement_gives_ratio_one(self):
         # Defaults: sweep=BULLISH (matches direction), ema_value=85 <
         # ltf_close=93 (aligned for BUY), OI_RISING, LIQUIDATION_LONG_CLUSTER
@@ -456,6 +539,33 @@ class SignalEngineTests(unittest.TestCase):
     def test_no_signal_without_ltf_candles(self):
         result = signal_engine.evaluate("BTCUSDT", ["htf"], [], {}, {})
         self.assertEqual(result["reason"], "INSUFFICIENT_CANDLES")
+
+
+class LongShortFavorableTests(unittest.TestCase):
+    """signal_engine.long_short_favorable - called from main.py once the
+    on-demand long_short_ratio fetch resolves (see
+    config.LONG_SHORT_RATIO_ENABLED for why the raw value can't be
+    computed inside evaluate() itself)."""
+
+    def test_none_ratio_is_none(self):
+        self.assertIsNone(signal_engine.long_short_favorable("BUY", None))
+
+    def test_buy_favorable_below_the_crowd_threshold(self):
+        with patch.object(config, "LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0):
+            self.assertTrue(signal_engine.long_short_favorable("BUY", 1.5))
+
+    def test_buy_unfavorable_at_or_above_the_crowd_threshold(self):
+        with patch.object(config, "LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0):
+            self.assertFalse(signal_engine.long_short_favorable("BUY", 2.5))
+
+    def test_sell_favorable_above_the_inverse_crowd_threshold(self):
+        # threshold=2.0 -> SELL favorable above 1/2.0 = 0.5
+        with patch.object(config, "LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0):
+            self.assertTrue(signal_engine.long_short_favorable("SELL", 0.6))
+
+    def test_sell_unfavorable_at_or_below_the_inverse_crowd_threshold(self):
+        with patch.object(config, "LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0):
+            self.assertFalse(signal_engine.long_short_favorable("SELL", 0.4))
 
 
 if __name__ == "__main__":

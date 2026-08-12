@@ -89,6 +89,16 @@ class QuantityRuleMaxFilterTests(unittest.TestCase):
 
         self.assertEqual(rules["max_qty"], "300000")
 
+    def test_limit_order_type_uses_lot_size_only_not_the_tighter_of_both(self):
+        # config.LIMIT_ENTRY_MODE_ENABLED - a plain resting LIMIT entry is
+        # neither MARKET nor one of the algo/conditional types that
+        # execute-as-MARKET-once-triggered, so it should validate against
+        # LOT_SIZE alone, not the tighter-of-both clamp CONDITIONAL uses.
+        with patch.object(exchange, "get_exchange_info", return_value=_exchange_info("XAIUSDT", 900000, 300000)):
+            rules = exchange.get_symbol_quantity_rules("XAIUSDT", order_type="LIMIT")
+
+        self.assertEqual(rules["max_qty"], "900000")
+
     def test_conditional_falls_back_to_lot_size_when_market_lot_size_missing(self):
         info = {
             "symbols": [{
@@ -248,6 +258,34 @@ class PrivateRestWeightTests(unittest.TestCase):
             exchange.place_algo_order(symbol="BTCUSDT", side="SELL", type="STOP_MARKET")
 
         self.rate_limit_mock.assert_not_called()
+
+    def test_place_limit_order_is_not_weighted(self):
+        # config.LIMIT_ENTRY_MODE_ENABLED's entry order - same mutation
+        # convention as place_market_order/place_algo_order above.
+        with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
+             patch.object(exchange, "normalize_order_price", return_value=100.0), \
+             patch.object(exchange.client, "futures_create_order", return_value={}):
+            exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
+
+        self.rate_limit_mock.assert_not_called()
+
+    def test_get_order_status_is_weighted(self):
+        with patch.object(exchange.client, "futures_get_order", return_value={"status": "NEW"}):
+            exchange.get_order_status("BTCUSDT", "order1")
+
+        self.rate_limit_mock.assert_called_once_with(1)
+
+    def test_cancel_order_is_weighted(self):
+        with patch.object(exchange.client, "futures_cancel_order", return_value={}):
+            exchange.cancel_order("BTCUSDT", "order1")
+
+        self.rate_limit_mock.assert_called_once_with(1)
+
+    def test_get_all_open_orders_is_weighted(self):
+        with patch.object(exchange.client, "futures_get_open_orders", return_value=[]):
+            exchange.get_all_open_orders()
+
+        self.rate_limit_mock.assert_called_once_with(40)
 
 
 class GetFundingRatesTests(unittest.TestCase):
@@ -511,6 +549,127 @@ class ClosePositionMarketTests(unittest.TestCase):
         with patch.object(exchange, "normalize_order_quantity", return_value=0.0):
             with self.assertRaises(ValueError):
                 exchange.close_position_market("BTCUSDT", "BUY", 0.5)
+
+
+class LimitOrderTests(unittest.TestCase):
+    """config.LIMIT_ENTRY_MODE_ENABLED's entry order - a plain GTC LIMIT
+    on the regular order endpoint (python-binance does not auto-route
+    "LIMIT" to the algo namespace the way it does STOP_MARKET/
+    TAKE_PROFIT_MARKET)."""
+
+    def test_sends_limit_type_and_gtc(self):
+        with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
+             patch.object(exchange, "normalize_order_price", return_value=100.0), \
+             patch.object(exchange.client, "futures_create_order", return_value={}) as mock_order:
+            exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
+
+        _, kwargs = mock_order.call_args
+        self.assertEqual(kwargs["type"], "LIMIT")
+        self.assertEqual(kwargs["timeInForce"], "GTC")
+        self.assertEqual(kwargs["price"], 100.0)
+        self.assertEqual(kwargs["quantity"], 1.0)
+
+    def test_price_is_normalized_via_normalize_order_price_not_trigger_price(self):
+        # Deliberately not normalize_trigger_price - a resting limit has
+        # no "must not fire immediately" constraint, unlike a stop/TP.
+        with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
+             patch.object(exchange, "normalize_order_price", return_value=99.99) as normalize_price, \
+             patch.object(exchange, "normalize_trigger_price") as normalize_trigger, \
+             patch.object(exchange.client, "futures_create_order", return_value={}):
+            exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
+
+        normalize_price.assert_called_once_with("BTCUSDT", 100.0, rounding="nearest")
+        normalize_trigger.assert_not_called()
+
+    def test_zero_normalized_quantity_raises(self):
+        with patch.object(exchange, "normalize_order_quantity", return_value=0.0), \
+             patch.object(exchange, "normalize_order_price", return_value=100.0):
+            with self.assertRaises(ValueError):
+                exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
+
+    def test_zero_normalized_price_raises(self):
+        with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
+             patch.object(exchange, "normalize_order_price", return_value=0.0):
+            with self.assertRaises(ValueError):
+                exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
+
+
+class GetOrderStatusTests(unittest.TestCase):
+    """Ground truth for a plain (non-algo) order - config.LIMIT_ENTRY_MODE_ENABLED's
+    entry needs executed_qty/avg_price (not just status), since a LIMIT
+    order can partially fill."""
+
+    def test_maps_filled_status_and_fill_data(self):
+        order = {"status": "FILLED", "executedQty": "1.0", "avgPrice": "100.5", "origQty": "1.0"}
+
+        with patch.object(exchange.client, "futures_get_order", return_value=order):
+            result = exchange.get_order_status("BTCUSDT", "order1")
+
+        self.assertEqual(result, {
+            "status": "FILLED", "executed_qty": 1.0, "avg_price": 100.5, "orig_qty": 1.0,
+        })
+
+    def test_maps_partially_filled_status(self):
+        order = {"status": "PARTIALLY_FILLED", "executedQty": "0.4", "avgPrice": "100.0", "origQty": "1.0"}
+
+        with patch.object(exchange.client, "futures_get_order", return_value=order):
+            result = exchange.get_order_status("BTCUSDT", "order1")
+
+        self.assertEqual(result["status"], "PARTIALLY_FILLED")
+        self.assertEqual(result["executed_qty"], 0.4)
+
+    def test_order_does_not_exist_returns_not_found_sentinel(self):
+        with patch.object(
+            exchange.client, "futures_get_order",
+            side_effect=Exception("Order does not exist."),
+        ):
+            result = exchange.get_order_status("BTCUSDT", "order1")
+
+        self.assertEqual(result["status"], "NOT_FOUND")
+
+    def test_other_errors_return_unknown_and_do_not_raise(self):
+        with patch.object(
+            exchange.client, "futures_get_order", side_effect=Exception("timeout"),
+        ):
+            result = exchange.get_order_status("BTCUSDT", "order1")
+
+        self.assertEqual(result["status"], "UNKNOWN")
+
+
+class CancelOrderTests(unittest.TestCase):
+    def test_calls_the_plain_cancel_endpoint(self):
+        with patch.object(exchange.client, "futures_cancel_order", return_value={"status": "CANCELED"}) as mock_cancel:
+            exchange.cancel_order("BTCUSDT", "order1")
+
+        _, kwargs = mock_cancel.call_args
+        self.assertEqual(kwargs["symbol"], "BTCUSDT")
+        self.assertEqual(kwargs["orderId"], "order1")
+
+    def test_never_raises_on_failure(self):
+        with patch.object(exchange.client, "futures_cancel_order", side_effect=Exception("boom")):
+            result = exchange.cancel_order("BTCUSDT", "order1")  # must not raise
+
+        self.assertIsNone(result)
+
+
+class GetAllOpenOrdersTests(unittest.TestCase):
+    """Non-algo analog of get_all_open_positions() -
+    PositionManager.reconcile_pending_entries_on_startup's startup-only
+    call to find any resting LIMIT entry left over from before a restart."""
+
+    def test_returns_the_order_list(self):
+        orders = [{"symbol": "BTCUSDT", "orderId": "1", "type": "LIMIT"}]
+
+        with patch.object(exchange.client, "futures_get_open_orders", return_value=orders):
+            result = exchange.get_all_open_orders()
+
+        self.assertEqual(result, orders)
+
+    def test_error_returns_an_empty_list_not_a_raise(self):
+        with patch.object(exchange.client, "futures_get_open_orders", side_effect=Exception("boom")):
+            result = exchange.get_all_open_orders()  # must not raise
+
+        self.assertEqual(result, [])
 
 
 if __name__ == "__main__":

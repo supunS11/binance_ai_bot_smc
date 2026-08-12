@@ -90,6 +90,19 @@ class ClassifyTests(unittest.TestCase):
     def test_unknown_outcome_is_unknown(self):
         self.assertEqual(ja.classify("SOMETHING_ELSE"), "UNKNOWN")
 
+    def test_limit_fill_sl_placement_failure_is_loss(self):
+        # config.LIMIT_ENTRY_MODE_ENABLED - a resting limit that filled,
+        # then had to be emergency-closed when SL placement failed. Real
+        # (if degraded) exposure existed, so it's counted conservatively
+        # as a loss, same treatment as TP1_THEN_POSITION_ALREADY_CLOSED.
+        self.assertEqual(ja.classify("LIMIT_FILL_SL_PLACEMENT_FAILED"), "LOSS")
+
+    def test_unfilled_limit_outcomes_are_unknown_not_win_loss_or_breakeven(self):
+        # A limit that never filled has zero real P&L - must not pollute
+        # WIN/LOSS/BREAKEVEN stats, even though it's a resolved outcome.
+        self.assertEqual(ja.classify("LIMIT_EXPIRED_UNFILLED"), "UNKNOWN")
+        self.assertEqual(ja.classify("LIMIT_INVALIDATED_UNFILLED"), "UNKNOWN")
+
 
 class BucketVolumeTests(unittest.TestCase):
     def test_below_the_liquidity_floor(self):
@@ -319,6 +332,29 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         report = ja.summarize(self.journal_path, since_timestamp=None)
 
         self.assertIn("Resolved trades: 2", report)
+
+    def test_summarize_breaks_down_by_outcome_and_the_new_favorable_booleans(self):
+        _write_trade(
+            self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT",
+            efficiency_favorable=True, funding_favorable=True, long_short_favorable=True,
+        )
+        _write_trade(
+            self.journal_path, "B", "ETHUSDT", outcome="LIMIT_EXPIRED_UNFILLED",
+            efficiency_favorable=False, funding_favorable=False, long_short_favorable=False,
+        )
+
+        report = ja.summarize(self.journal_path)
+
+        # Both count as resolved (outcome is non-empty)...
+        self.assertIn("Resolved trades: 2", report)
+        # ...but only the real fill counts toward WIN/LOSS/BREAKEVEN.
+        self.assertIn("WIN=1 BREAKEVEN=0 LOSS=0 UNKNOWN=1", report)
+        self.assertIn("By outcome:", report)
+        self.assertIn("TP2_HIT: n=1", report)
+        self.assertIn("LIMIT_EXPIRED_UNFILLED: n=1", report)
+        self.assertIn("By efficiency favorable (informational):", report)
+        self.assertIn("By funding favorable (informational):", report)
+        self.assertIn("By long/short favorable (informational):", report)
 
     def test_no_trades_in_window_gives_a_clear_message(self):
         _write_trade(self.journal_path, "OLD", "BTCUSDT", outcome="TP2_HIT", closed_at=1000.0)

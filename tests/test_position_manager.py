@@ -4,7 +4,9 @@ from unittest.mock import patch
 
 import config
 import exchange
-from position_manager import BREAKEVEN_ACTIVE, TP1_PENDING, PositionManager, _order_type
+from position_manager import (
+    BREAKEVEN_ACTIVE, PENDING_LIMIT_FILL, TP1_PENDING, PositionManager, _order_type,
+)
 
 
 # _close() journals every outcome for real (signal_journal.append_outcome)
@@ -1416,6 +1418,337 @@ class PollLiveTests(unittest.TestCase):
 
         mark_price_mock.assert_called_once_with("BTCUSDT")
         self.assertEqual(manager.positions["BTCUSDT"]["mfe_price"], 101.0)
+
+
+def _pending_order_status(status, executed_qty=0.0, avg_price=0.0, orig_qty=1.0):
+    return {"status": status, "executed_qty": executed_qty, "avg_price": avg_price, "orig_qty": orig_qty}
+
+
+def _pending_manager(side="BUY"):
+    manager = PositionManager()
+    execution_result = {"shadow": False, "entry_order": {"orderId": "limit1"}}
+    manager.register_pending_entry(_plan(side), execution_result, trade_id="BTCUSDT_1")
+    return manager
+
+
+class RegisterPendingEntryTests(unittest.TestCase):
+    """config.LIMIT_ENTRY_MODE_ENABLED - a resting limit entry has no
+    protective orders yet (unlike register(), which reads real SL/TP ids
+    off a synchronously-filled market order) - see
+    position_manager.poll_pending_entry for where those get placed."""
+
+    def test_live_registration_has_no_protective_orders_yet(self):
+        manager = _pending_manager()
+        position = manager.positions["BTCUSDT"]
+
+        self.assertEqual(position["stage"], PENDING_LIMIT_FILL)
+        self.assertIsNone(position["sl_order_id"])
+        self.assertIsNone(position["tp1_order_id"])
+        self.assertIsNone(position["tp2_order_id"])
+        self.assertEqual(position["filled_quantity"], 0.0)
+        self.assertEqual(position["limit_order_id"], "limit1")
+        self.assertIsNone(position["mae_price"])
+        self.assertIsNone(position["mfe_price"])
+
+    def test_reserves_a_max_total_positions_slot_immediately(self):
+        # No separate pending-entry accounting - same dict as register(),
+        # so has_open_position/open_count already work correctly for a
+        # resting entry with no new code, which is the whole basis for
+        # not building a separate PendingEntryManager class.
+        manager = _pending_manager()
+
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+        self.assertEqual(manager.open_count(), 1)
+
+    def test_shadow_registration_has_no_limit_order_id(self):
+        manager = PositionManager()
+        position = manager.register_pending_entry(_plan(), {"shadow": True}, trade_id="BTCUSDT_1")
+        self.assertIsNone(position["limit_order_id"])
+        self.assertTrue(position["shadow"])
+
+
+class PollPendingEntryFillTests(unittest.TestCase):
+    def test_unknown_status_is_a_noop_retry_next_poll(self):
+        manager = _pending_manager()
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("UNKNOWN")):
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], PENDING_LIMIT_FILL)
+
+    def test_immediate_full_fill_places_sl_tp1_tp2_and_transitions(self):
+        manager = _pending_manager()
+
+        with patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("FILLED", executed_qty=1.0, avg_price=100.0)), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl1"}) as place_sl, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}) as place_tp2, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as place_tp1:
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["sl_order_id"], "sl1")
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+        self.assertEqual(position["tp2_order_id"], "tp2_1")
+        self.assertEqual(position["filled_quantity"], 1.0)
+        self.assertEqual(position["entry_price"], 100.0)  # real avg_price, not the planned entry
+        self.assertEqual(position["risk_distance"], abs(100.0 - position["sl_price"]))
+        place_sl.assert_called_once()
+        place_tp2.assert_called_once()
+        place_tp1.assert_called_once()
+
+    def test_partial_fill_places_sl_and_tp2_but_defers_tp1(self):
+        manager = _pending_manager()
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("PARTIALLY_FILLED", executed_qty=0.4, avg_price=100.0)), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch.object(exchange, "place_take_profit_partial") as place_tp1:
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], PENDING_LIMIT_FILL)
+        self.assertEqual(position["sl_order_id"], "sl1")
+        self.assertEqual(position["tp2_order_id"], "tp2_1")
+        self.assertEqual(position["filled_quantity"], 0.4)
+        place_tp1.assert_not_called()
+
+    def test_second_poll_growing_to_full_fill_places_the_deferred_tp1_only(self):
+        manager = _pending_manager()
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("PARTIALLY_FILLED", executed_qty=0.4, avg_price=100.0)), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch.object(exchange, "place_take_profit_partial") as place_tp1_first:
+            manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        place_tp1_first.assert_not_called()
+
+        with patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("FILLED", executed_qty=1.0, avg_price=100.0)), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as place_tp1_second, \
+             patch.object(exchange, "place_stop_loss") as place_sl_again, \
+             patch.object(exchange, "place_take_profit_full") as place_tp2_again:
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+        self.assertAlmostEqual(position["tp1_quantity"], 0.5)  # sized off the FINAL filled qty (1.0), not the first partial
+        place_tp1_second.assert_called_once()
+        place_sl_again.assert_not_called()  # SL/TP2 only placed on the FIRST fill
+        place_tp2_again.assert_not_called()
+
+    def test_sl_placement_failure_closes_the_filled_quantity_and_journals(self):
+        manager = _pending_manager()
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("FILLED", executed_qty=1.0, avg_price=100.0)), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
+             patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertEqual(outcome, "LIMIT_FILL_SL_PLACEMENT_FAILED")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        cancel_all.assert_called_once_with("BTCUSDT")
+        append_outcome.assert_called_once()
+
+
+class PollPendingEntryExpiryTests(unittest.TestCase):
+    def test_zero_fill_expiry_cancels_and_drops_without_cooldown(self):
+        manager = _pending_manager()
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+
+        with patch.object(config, "LIMIT_ENTRY_EXPIRY_SECONDS", 600), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW")), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertEqual(outcome, "LIMIT_EXPIRED_UNFILLED")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        self.assertFalse(manager.is_in_cooldown("BTCUSDT"))
+        cancel_order.assert_called_once_with("BTCUSDT", "limit1")
+        append_outcome.assert_called_once_with("BTCUSDT", "LIMIT_EXPIRED_UNFILLED", "BTCUSDT_1")
+
+    def test_zero_fill_invalidation_cancels_and_sets_cooldown(self):
+        manager = _pending_manager()  # BUY, sl_price=98
+
+        with patch.object(config, "LIMIT_ENTRY_EXPIRY_SECONDS", 600), \
+             patch.object(config, "SYMBOL_REENTRY_COOLDOWN_SECONDS", 900), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW")), \
+             patch.object(exchange, "cancel_order"), \
+             patch("position_manager.signal_journal.append_outcome"):
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=_candle(high=99, low=97))  # low <= sl(98)
+
+        self.assertEqual(outcome, "LIMIT_INVALIDATED_UNFILLED")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        self.assertTrue(manager.is_in_cooldown("BTCUSDT"))
+
+    def test_not_yet_expired_and_not_invalidated_is_a_noop(self):
+        manager = _pending_manager()
+
+        with patch.object(config, "LIMIT_ENTRY_EXPIRY_SECONDS", 600), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW")):
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=_candle(high=101, low=99))
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+
+class PollPendingEntryRaceTests(unittest.TestCase):
+    def test_cancel_races_a_fill_and_still_protects_it(self):
+        # A fill can land microseconds before the cancel takes effect -
+        # Binance doesn't guarantee atomicity between them. The
+        # post-cancel re-check must catch this instead of treating it as
+        # a clean, unfilled cancel.
+        manager = _pending_manager()
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000  # force the expiry path
+
+        order_statuses = iter([
+            _pending_order_status("NEW", executed_qty=0.0),  # the initial check
+            _pending_order_status("FILLED", executed_qty=1.0, avg_price=100.0),  # post-cancel re-check
+        ])
+
+        with patch.object(config, "LIMIT_ENTRY_EXPIRY_SECONDS", 600), \
+             patch.object(exchange, "get_order_status", side_effect=lambda *a, **k: next(order_statuses)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}):
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["filled_quantity"], 1.0)
+        self.assertEqual(position["sl_order_id"], "sl1")
+        cancel_order.assert_called_once_with("BTCUSDT", "limit1")
+
+
+class PollPendingEntryPartialThenExpireTests(unittest.TestCase):
+    def test_partial_fill_then_expiry_settles_the_remainder_without_touching_existing_sl_tp2(self):
+        manager = _pending_manager()
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("PARTIALLY_FILLED", executed_qty=0.4, avg_price=100.0)), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch.object(exchange, "place_take_profit_partial") as place_tp1_first:
+            manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        place_tp1_first.assert_not_called()
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000  # force expiry
+
+        with patch.object(config, "LIMIT_ENTRY_EXPIRY_SECONDS", 600), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("PARTIALLY_FILLED", executed_qty=0.4, avg_price=100.0)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_stop_loss") as place_sl_again, \
+             patch.object(exchange, "place_take_profit_full") as place_tp2_again, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as place_tp1_second:
+            outcome = manager.poll_pending_entry("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)  # not closed - settled into TP1_PENDING with real filled qty
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["sl_order_id"], "sl1")
+        self.assertEqual(position["tp2_order_id"], "tp2_1")
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+        place_sl_again.assert_not_called()
+        place_tp2_again.assert_not_called()
+        place_tp1_second.assert_called_once()
+        cancel_order.assert_called_once_with("BTCUSDT", "limit1")
+
+
+class PollShadowPendingEntryTests(unittest.TestCase):
+    def _shadow_manager(self, side="BUY"):
+        manager = PositionManager()
+        manager.register_pending_entry(_plan(side), {"shadow": True}, trade_id="BTCUSDT_1")
+        return manager
+
+    def test_no_candle_returns_none(self):
+        manager = self._shadow_manager()
+        self.assertIsNone(manager.poll_shadow_pending_entry("BTCUSDT", None))
+
+    def test_candle_touching_entry_fills_and_transitions(self):
+        manager = self._shadow_manager()  # entry=100
+        outcome = manager.poll_shadow_pending_entry("BTCUSDT", _candle(high=101, low=99))  # range covers 100
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["filled_quantity"], position["quantity"])
+        self.assertEqual(position["mae_price"], 100)
+        self.assertEqual(position["mfe_price"], 100)
+
+    def test_candle_touching_both_entry_and_sl_assumes_sl_first_no_fill(self):
+        manager = self._shadow_manager()  # entry=100, sl=98
+
+        with patch("position_manager.signal_journal.append_outcome"):
+            outcome = manager.poll_shadow_pending_entry("BTCUSDT", _candle(high=101, low=97))  # covers both
+
+        self.assertEqual(outcome, "LIMIT_INVALIDATED_UNFILLED")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_candle_reaching_sl_without_ever_touching_entry_is_invalidated(self):
+        manager = self._shadow_manager()  # entry=100, sl=98
+
+        with patch("position_manager.signal_journal.append_outcome"):
+            outcome = manager.poll_shadow_pending_entry("BTCUSDT", _candle(high=99.5, low=97.5))  # reaches sl, not entry
+
+        self.assertEqual(outcome, "LIMIT_INVALIDATED_UNFILLED")
+
+    def test_wall_clock_expiry_with_no_candle_touch(self):
+        manager = self._shadow_manager()
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+
+        with patch.object(config, "LIMIT_ENTRY_EXPIRY_SECONDS", 600), \
+             patch("position_manager.signal_journal.append_outcome"):
+            outcome = manager.poll_shadow_pending_entry("BTCUSDT", _candle(high=99.9, low=99.5))  # neither entry(100) nor sl(98)
+
+        self.assertEqual(outcome, "LIMIT_EXPIRED_UNFILLED")
+
+
+class ReconcilePendingEntriesOnStartupTests(unittest.TestCase):
+    def test_disabled_config_does_nothing(self):
+        manager = PositionManager()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False), \
+             patch.object(exchange, "get_all_open_orders") as get_orders:
+            manager.reconcile_pending_entries_on_startup()
+
+        get_orders.assert_not_called()
+
+    def test_stray_resting_limit_order_is_cancelled(self):
+        manager = PositionManager()
+        open_orders = [{"symbol": "ETHUSDT", "orderId": "limit9", "type": "LIMIT"}]
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_called_once_with("ETHUSDT", "limit9")
+
+    def test_algo_orders_in_the_same_response_are_left_alone(self):
+        # Proves this doesn't collide with reconcile_on_startup's own
+        # SL/TP algo-order handling - only plain LIMIT orders are touched.
+        manager = PositionManager()
+        open_orders = [{"symbol": "ETHUSDT", "orderId": "algo1", "type": "STOP_MARKET"}]
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_not_called()
 
 
 if __name__ == "__main__":

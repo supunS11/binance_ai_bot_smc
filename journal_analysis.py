@@ -24,7 +24,21 @@ from pathlib import Path
 from signal_journal import JOURNAL_PATH
 
 
-LOSS_OUTCOMES = {"SL_HIT", "SHADOW_SL_HIT", "TP1_THEN_POSITION_ALREADY_CLOSED"}
+LOSS_OUTCOMES = {
+    "SL_HIT", "SHADOW_SL_HIT", "TP1_THEN_POSITION_ALREADY_CLOSED",
+    # config.LIMIT_ENTRY_MODE_ENABLED - a resting limit filled, but SL
+    # placement then failed and the filled quantity was emergency-closed
+    # at market (position_manager._apply_pending_fill). Same conservative
+    # treatment as TP1_THEN_POSITION_ALREADY_CLOSED above: an emergency
+    # exit, counted as a loss rather than left unclassified.
+    "LIMIT_FILL_SL_PLACEMENT_FAILED",
+}
+# LIMIT_INVALIDATED_UNFILLED/LIMIT_EXPIRED_UNFILLED (config.LIMIT_ENTRY_MODE_ENABLED)
+# are deliberately NOT in any of the three sets below - a limit entry that
+# never filled has zero real P&L, so it falls through to classify()'s
+# UNKNOWN rather than pollute WIN/LOSS/BREAKEVEN stats. They still count
+# in `resolved` (outcome is non-empty) so fill-rate can be measured via
+# the outcome breakdown even though they're not a win/loss/breakeven.
 BREAKEVEN_OUTCOMES = {
     "BREAKEVEN_STOP_HIT", "SHADOW_BREAKEVEN_STOP_HIT",
     "BREAKEVEN_TRIGGER_MARKET_CLOSE",
@@ -335,6 +349,10 @@ def summarize(journal_path=None, since_timestamp=None):
         f"LOSS={overall['LOSS']} UNKNOWN={overall['UNKNOWN']}"
     )
 
+    # Raw outcome breakdown - the direct read on config.LIMIT_ENTRY_MODE_ENABLED's
+    # actual fill rate (LIMIT_EXPIRED_UNFILLED/LIMIT_INVALIDATED_UNFILLED
+    # vs. everything that did fill), not just the WIN/LOSS/BREAKEVEN roll-up above.
+    lines += _breakdown_lines(resolved, "outcome", lambda t: t.get("outcome", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
     lines += _breakdown_lines(resolved, "EMA aligned (informational)", lambda t: t.get("ema_aligned", "unknown") or "False")
@@ -344,10 +362,13 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "confluence score (drives position sizing)", lambda t: t.get("confluence_score", "unknown") or "0")
     lines += _breakdown_lines(resolved, "24h quote volume (liquidity floor)", lambda t: _bucket_volume(t.get("quote_volume_usdt")))
     lines += _breakdown_lines(resolved, "efficiency ratio (chop vs trend)", lambda t: _bucket_efficiency(t.get("efficiency_ratio")))
+    lines += _breakdown_lines(resolved, "efficiency favorable (informational)", lambda t: t.get("efficiency_favorable", "unknown") or "False")
     lines += _breakdown_lines(resolved, "BTC correlation strength", lambda t: _bucket_correlation(t.get("btc_correlation")))
     lines += _breakdown_lines(resolved, "BTC aligned (informational)", lambda t: t.get("btc_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "funding rate", lambda t: _bucket_funding_rate(t.get("funding_rate")))
+    lines += _breakdown_lines(resolved, "funding favorable (informational)", lambda t: t.get("funding_favorable", "unknown") or "False")
     lines += _breakdown_lines(resolved, "long/short account ratio", lambda t: _bucket_long_short_ratio(t.get("long_short_ratio")))
+    lines += _breakdown_lines(resolved, "long/short favorable (informational)", lambda t: t.get("long_short_favorable", "unknown") or "False")
     lines += _breakdown_lines(resolved, "early breakeven applied (new 1R profit-lock trigger)", lambda t: t.get("early_breakeven_applied", "unknown") or "False")
     lines += _breakdown_lines(resolved, "break confirmed by candle close (wick vs real break)", lambda t: t.get("break_confirmed_by_close", "unknown") or "False")
     lines += _breakdown_lines(resolved, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
