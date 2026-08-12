@@ -412,52 +412,52 @@ class EntryExtensionCapTests(unittest.TestCase):
     whatever price exists by then with no check on how far that already
     was from the level that made the setup valid in the first place."""
 
+    def test_extension_ratio_for_a_buy(self):
+        ratio = risk_manager._entry_extension_r(
+            {"structure_level": 98}, entry_price=98.8, side="BUY", risk_distance=2.0
+        )
+        self.assertAlmostEqual(ratio, 0.4)  # 0.8/2.0
+
+    def test_extension_ratio_for_a_sell_is_measured_in_the_opposite_direction(self):
+        ratio = risk_manager._entry_extension_r(
+            {"structure_level": 102}, entry_price=100, side="SELL", risk_distance=2.0
+        )
+        self.assertAlmostEqual(ratio, 1.0)  # (102-100)/2.0
+
+    def test_extension_ratio_is_none_without_a_structure_level(self):
+        # Never gate/route on data we don't actually have.
+        ratio = risk_manager._entry_extension_r(
+            {"structure_level": None}, entry_price=500, side="BUY", risk_distance=2.0
+        )
+        self.assertIsNone(ratio)
+
+    def test_extension_ratio_is_none_with_zero_risk_distance(self):
+        ratio = risk_manager._entry_extension_r(
+            {"structure_level": 98}, entry_price=100, side="BUY", risk_distance=0
+        )
+        self.assertIsNone(ratio)
+
     def test_within_the_cap_is_not_extended(self):
         with patch.object(config, "MAX_ENTRY_EXTENSION_R", 0.5):
-            too_extended = risk_manager._entry_too_extended(
-                {"structure_level": 98}, entry_price=98.8, side="BUY", risk_distance=2.0
-            )
+            too_extended = risk_manager._entry_too_extended(0.4)
 
-        self.assertFalse(too_extended)  # 0.8/2.0 = 0.4R <= 0.5R cap
+        self.assertFalse(too_extended)  # 0.4R <= 0.5R cap
 
     def test_beyond_the_cap_is_too_extended(self):
         with patch.object(config, "MAX_ENTRY_EXTENSION_R", 0.5):
-            too_extended = risk_manager._entry_too_extended(
-                {"structure_level": 98}, entry_price=100, side="BUY", risk_distance=2.0
-            )
+            too_extended = risk_manager._entry_too_extended(1.0)
 
-        self.assertTrue(too_extended)  # 2.0/2.0 = 1.0R > 0.5R cap
-
-    def test_sell_side_extension_is_measured_in_the_opposite_direction(self):
-        with patch.object(config, "MAX_ENTRY_EXTENSION_R", 0.5):
-            too_extended = risk_manager._entry_too_extended(
-                {"structure_level": 102}, entry_price=100, side="SELL", risk_distance=2.0
-            )
-
-        self.assertTrue(too_extended)  # (102-100)/2.0 = 1.0R > 0.5R cap
+        self.assertTrue(too_extended)  # 1.0R > 0.5R cap
 
     def test_zero_cap_disables_the_check(self):
         with patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
-            too_extended = risk_manager._entry_too_extended(
-                {"structure_level": 98}, entry_price=500, side="BUY", risk_distance=2.0
-            )
+            too_extended = risk_manager._entry_too_extended(100.0)
 
         self.assertFalse(too_extended)
 
-    def test_missing_structure_level_does_not_block(self):
-        # Never gate on data we don't actually have.
+    def test_none_extension_does_not_block(self):
         with patch.object(config, "MAX_ENTRY_EXTENSION_R", 0.5):
-            too_extended = risk_manager._entry_too_extended(
-                {"structure_level": None}, entry_price=500, side="BUY", risk_distance=2.0
-            )
-
-        self.assertFalse(too_extended)
-
-    def test_zero_risk_distance_does_not_block(self):
-        with patch.object(config, "MAX_ENTRY_EXTENSION_R", 0.5):
-            too_extended = risk_manager._entry_too_extended(
-                {"structure_level": 98}, entry_price=100, side="BUY", risk_distance=0
-            )
+            too_extended = risk_manager._entry_too_extended(None)
 
         self.assertFalse(too_extended)
 
@@ -488,6 +488,23 @@ class EntryExtensionCapTests(unittest.TestCase):
             )
 
         self.assertEqual(status, "OK")
+
+    def test_build_trade_plan_includes_entry_extension_r(self):
+        # config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R (main.py) reads this
+        # off the plan to decide market vs. limit routing per-signal.
+        with patch.object(config, "MAX_ENTRY_EXTENSION_R", 2.0), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(
+                {
+                    "signal": "BUY", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 98, "atr": 1,
+                },
+                balance=1000,
+            )
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["entry_extension_r"], 1.0)  # (100-98)/2.0
 
 
 class ConfluenceSizeMultiplierTests(unittest.TestCase):

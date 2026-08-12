@@ -487,28 +487,32 @@ class LogHeartbeatRejectSummaryTests(unittest.TestCase):
 
 
 class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
-    """config.LIMIT_ENTRY_MODE_ENABLED - _evaluate_symbol routes to the
-    resting-limit path (enter_trade_limit + register_pending_entry)
-    instead of the market-order path, based purely on this one flag. The
+    """config.LIMIT_ENTRY_MODE_ENABLED is a per-signal ROUTING switch
+    (main._evaluate_symbol), not "always place a limit order" - a signal
+    at or below ENTRY_ROUTING_EXTENSION_THRESHOLD_R still gets a market
+    order; only one above that threshold (but under the hard
+    MAX_ENTRY_EXTENSION_R reject risk_manager already applied) gets
+    routed to enter_trade_limit + register_pending_entry. The
     has_open_position/cooldown/MAX_TOTAL_POSITIONS guards above need no
     changes for this (see position_manager.PENDING_LIMIT_FILL design
     notes) - not re-proven here with a fake, since that's only meaningful
     against the real PositionManager dict (see test_position_manager.py's
     RegisterPendingEntryTests.test_reserves_a_max_total_positions_slot_immediately)."""
 
-    def _plan(self):
+    def _plan(self, entry_extension_r=0.5):
         return {
             "symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
-            "tp1_price": 102, "tp2_price": 104,
+            "tp1_price": 102, "tp2_price": 104, "entry_extension_r": entry_extension_r,
         }
 
-    def test_limit_entry_mode_enabled_uses_the_limit_entry_path(self):
+    def test_extended_signal_uses_the_limit_entry_path(self):
         feed = _FakeFeed()
         positions = _FakePositions()
 
         with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(config, "ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2), \
              patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
-             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.5), "OK")), \
              patch.object(execution, "enter_trade_limit", return_value={"ok": True, "shadow": True}) as enter_limit, \
              patch.object(execution, "enter_trade") as enter_market, \
              patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
@@ -519,13 +523,17 @@ class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
         self.assertEqual(len(positions.registered_pending), 1)
         self.assertEqual(len(positions.registered), 0)
 
-    def test_limit_entry_mode_disabled_uses_the_market_entry_path(self):
+    def test_unextended_signal_still_uses_the_market_entry_path(self):
+        # Below the routing threshold - guaranteed fill beats limit
+        # fill-uncertainty when the chase cost is minimal anyway, even
+        # with LIMIT_ENTRY_MODE_ENABLED=True.
         feed = _FakeFeed()
         positions = _FakePositions()
 
-        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False), \
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(config, "ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2), \
              patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
-             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.1), "OK")), \
              patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}) as enter_market, \
              patch.object(execution, "enter_trade_limit") as enter_limit, \
              patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
@@ -536,13 +544,70 @@ class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
         self.assertEqual(len(positions.registered), 1)
         self.assertEqual(len(positions.registered_pending), 0)
 
+    def test_exactly_at_the_threshold_uses_the_market_entry_path(self):
+        # Boundary is inclusive on the market side (">" not ">="),
+        # matching risk_manager._entry_too_extended's own convention.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(config, "ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.2), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}) as enter_market, \
+             patch.object(execution, "enter_trade_limit") as enter_limit, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_market.assert_called_once()
+        enter_limit.assert_not_called()
+
+    def test_limit_entry_mode_disabled_always_uses_the_market_entry_path(self):
+        # Even a heavily-extended signal stays on the market path when
+        # the feature is off entirely.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.9), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}) as enter_market, \
+             patch.object(execution, "enter_trade_limit") as enter_limit, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_market.assert_called_once()
+        enter_limit.assert_not_called()
+        self.assertEqual(len(positions.registered), 1)
+        self.assertEqual(len(positions.registered_pending), 0)
+
+    def test_missing_extension_data_defensively_falls_back_to_market(self):
+        # entry_extension_r is always a real float in practice
+        # (build_trade_plan only returns "OK" once it's computable) - this
+        # is a defensive-fallback test, not an expected real path.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(config, "ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=None), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}) as enter_market, \
+             patch.object(execution, "enter_trade_limit") as enter_limit, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_market.assert_called_once()
+        enter_limit.assert_not_called()
+
     def test_limit_entry_failure_marks_entry_failure_not_registered(self):
         feed = _FakeFeed()
         positions = _FakePositions()
 
         with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(config, "ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2), \
              patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
-             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.5), "OK")), \
              patch.object(execution, "enter_trade_limit", return_value={"ok": False, "error": "boom"}):
             main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
 

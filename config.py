@@ -409,16 +409,31 @@ SIGNAL_CONFIRM_TICKS = env_int("SIGNAL_CONFIRM_TICKS", 3)
 # Used only in SHADOW mode so risk-based position sizing has a balance to
 # size against without needing real API keys / an authenticated call.
 SHADOW_ACCOUNT_BALANCE_USDT = env_float("SHADOW_ACCOUNT_BALANCE_USDT", 1000)
-# Places entries as a resting GTC LIMIT at the signal's entry_price
-# instead of a market order, so the fill happens at the actual OTE/
-# structure price instead of wherever price has run to once
-# SIGNAL_CONFIRM_TICKS/REQUIRE_CLOSE_CONFIRMED_BREAK/MAX_ENTRY_EXTENSION_R
-# finish resolving. Deliberately has NO market-order fallback on expiry
-# or invalidation (see position_manager.poll_pending_entry) - an unfilled
-# limit is walked away from, never chased; that's the entire point of
-# this mode. Default OFF, same "don't silently change a running bot's
-# behavior" convention as every other feature this session.
+# Enables per-signal market-vs-limit ROUTING (main.py), not "always place
+# a limit order" - a signal whose entry_extension_r (risk_manager.build_trade_plan,
+# how far price already ran from the structure level, in R) is at or
+# below ENTRY_ROUTING_EXTENSION_THRESHOLD_R still gets a market order
+# (price is close enough to the ideal level that chase cost is minimal,
+# so a guaranteed fill beats limit fill-uncertainty); only a signal
+# that's already moderately extended (above the threshold, but still
+# under the hard MAX_ENTRY_EXTENSION_R reject) gets routed to a resting
+# GTC LIMIT at entry_price instead, so it either fills at (or better
+# than) the real level or is walked away from - never chased further by
+# a market order. This keeps trade count close to the market-only
+# baseline (most signals aren't extended enough to route to a limit) while
+# still fixing the late-chase problem for the subset that is. Deliberately
+# has NO market-order fallback on a limit's expiry/invalidation (see
+# position_manager.poll_pending_entry) - that's the entire point of
+# routing those specific entries away from market in the first place.
+# Default OFF, same "don't silently change a running bot's behavior"
+# convention as every other feature this session.
 LIMIT_ENTRY_MODE_ENABLED = env_bool("LIMIT_ENTRY_MODE_ENABLED", "False")
+# Must be less than MAX_ENTRY_EXTENSION_R for the "route to limit" band
+# to be non-empty (below this: market; between this and
+# MAX_ENTRY_EXTENSION_R: limit; above MAX_ENTRY_EXTENSION_R: rejected
+# outright, unchanged). Starting value, not yet calibrated against real
+# fill-rate/outcome data.
+ENTRY_ROUTING_EXTENSION_THRESHOLD_R = env_float("ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2)
 # Wall-clock, not tick-based - deliberately decoupled from
 # SIGNAL_EVAL_INTERVAL_SECONDS (see poll_every_ticks in main.py; tying
 # expiry to eval-ticks would make it silently rescale if that's ever

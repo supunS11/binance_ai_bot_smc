@@ -168,24 +168,39 @@ def compute_early_breakeven_price(entry_price, side, risk_distance):
     return entry_price - lock_distance
 
 
-def _entry_too_extended(signal, entry_price, side, risk_distance):
+def _entry_extension_r(signal, entry_price, side, risk_distance):
+    """How far entry_price has already run beyond the structure level that
+    triggered the setup, expressed in R (risk_distance-relative) - None
+    when there's nothing to measure against (no structure_level, or a
+    degenerate zero risk_distance). Shared by _entry_too_extended (the
+    hard MAX_ENTRY_EXTENSION_R reject) and build_trade_plan's
+    entry_extension_r output (used by main.py to route a moderately-
+    extended-but-not-rejected entry to a limit order instead of a market
+    order - see config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R)."""
+    if risk_distance <= 0:
+        return None
+
+    structure_level = signal.get("structure_level")
+
+    if structure_level is None:
+        return None
+
+    extension = (
+        entry_price - structure_level if side == "BUY" else structure_level - entry_price
+    )
+    return extension / risk_distance
+
+
+def _entry_too_extended(extension_r):
     """See config.MAX_ENTRY_EXTENSION_R - rejects an entry that's already
     run too far beyond the structure level that triggered it, instead of
     market-chasing whatever price exists once confirmation finishes."""
     max_extension_r = max(float(config.MAX_ENTRY_EXTENSION_R), 0)
 
-    if max_extension_r <= 0 or risk_distance <= 0:
+    if max_extension_r <= 0 or extension_r is None:
         return False
 
-    structure_level = signal.get("structure_level")
-
-    if structure_level is None:
-        return False
-
-    extension = (
-        entry_price - structure_level if side == "BUY" else structure_level - entry_price
-    )
-    return (extension / risk_distance) > max_extension_r
+    return extension_r > max_extension_r
 
 
 def _confluence_size_multiplier(signal):
@@ -232,8 +247,9 @@ def build_trade_plan(signal, balance):
         return None, "SL_ON_WRONG_SIDE"
 
     risk_distance = abs(entry_price - sl_price)
+    extension_r = _entry_extension_r(signal, entry_price, side, risk_distance)
 
-    if _entry_too_extended(signal, entry_price, side, risk_distance):
+    if _entry_too_extended(extension_r):
         return None, "ENTRY_TOO_EXTENDED"
 
     tp1_price, tp2_price = compute_targets(
@@ -280,4 +296,11 @@ def build_trade_plan(signal, balance):
         "risk_distance": risk_distance,
         "size_multiplier": size_multiplier,
         "confluence_ratio": signal.get("confluence_ratio"),
+        # How far entry_price already ran from the structure level, in R -
+        # main.py uses this (against config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R)
+        # to route a moderately-extended entry to a limit order instead of
+        # a market order, rather than an all-or-nothing switch. Guaranteed
+        # non-None here: build_trade_plan already returned SL_UNAVAILABLE
+        # above if structure_level/risk_distance weren't available.
+        "entry_extension_r": extension_r,
     }, "OK"

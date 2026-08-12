@@ -198,7 +198,23 @@ def _evaluate_symbol(
         f"htf_trend={result.get('htf_trend')}"
     )
 
-    if config.LIMIT_ENTRY_MODE_ENABLED:
+    # config.LIMIT_ENTRY_MODE_ENABLED is a per-signal ROUTING switch, not
+    # "always place a limit order" - a signal still close to the
+    # structure level (low entry_extension_r) gets a market order, since
+    # a guaranteed fill beats limit fill-uncertainty when the chase cost
+    # is minimal anyway. Only a signal that's already moderately extended
+    # (above the threshold, but under the hard MAX_ENTRY_EXTENSION_R
+    # reject risk_manager already applied) gets routed to a resting limit
+    # instead. entry_extension_r is always a real float here (build_trade_plan
+    # only returns "OK" once it's computable), so the None branch below
+    # is a defensive fallback (market), not an expected path.
+    use_limit = (
+        config.LIMIT_ENTRY_MODE_ENABLED
+        and plan.get("entry_extension_r") is not None
+        and plan["entry_extension_r"] > config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R
+    )
+
+    if use_limit:
         execution_result = execution.enter_trade_limit(plan)
     else:
         execution_result = execution.enter_trade(plan)
@@ -210,7 +226,7 @@ def _evaluate_symbol(
 
     trade_id = signal_journal.append_signal(result, plan)
 
-    if config.LIMIT_ENTRY_MODE_ENABLED:
+    if use_limit:
         positions.register_pending_entry(plan, execution_result, trade_id=trade_id)
     else:
         positions.register(plan, execution_result, trade_id=trade_id)
