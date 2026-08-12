@@ -88,6 +88,22 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["quote_volume_usdt"], "12500000")
 
+    def test_append_signal_writes_the_four_new_data_source_fields(self):
+        signal_journal.append_signal(
+            _signal(
+                efficiency_ratio=0.75, btc_correlation=0.6, btc_aligned=True,
+                funding_rate=0.0002, long_short_ratio=1.8,
+            ),
+            _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["efficiency_ratio"], "0.75")
+        self.assertEqual(rows[0]["btc_correlation"], "0.6")
+        self.assertEqual(rows[0]["btc_aligned"], "True")
+        self.assertEqual(rows[0]["funding_rate"], "0.0002")
+        self.assertEqual(rows[0]["long_short_ratio"], "1.8")
+
     def test_zero_entry_price_does_not_crash_risk_distance_calc(self):
         signal_journal.append_signal(_signal(), _plan(entry_price=0))
         rows = self._read_rows()

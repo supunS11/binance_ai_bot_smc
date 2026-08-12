@@ -136,6 +136,19 @@ PREMIUM_DISCOUNT_LOOKBACK_CANDLES = env_int(
 OTE_RETRACEMENT_MIN = env_float("OTE_RETRACEMENT_MIN", 0.618)
 OTE_RETRACEMENT_MAX = env_float("OTE_RETRACEMENT_MAX", 0.79)
 ATR_PERIOD = env_int("ATR_PERIOD", 14)
+# Kaufman's Efficiency Ratio lookback - net directional movement over the
+# window divided by total path length (1.0 = straight-line trend, near 0
+# = chop/round-trip noise). Informational only - computed and journaled
+# so a break inside a genuinely low-conviction, choppy market can be told
+# apart from one inside a real trend, evidence pending on whether it
+# actually separates winners from losers.
+CHOP_FILTER_LOOKBACK_CANDLES = env_int("CHOP_FILTER_LOOKBACK_CANDLES", 14)
+# BTC correlation - most alts move because BTC moves, not from their own
+# structure. Informational only: computed/journaled, not gated, same
+# evidence-first treatment as every other confluence field here.
+BTC_CORRELATION_ENABLED = env_bool("BTC_CORRELATION_ENABLED", "True")
+CORRELATION_LOOKBACK_CANDLES = env_int("CORRELATION_LOOKBACK_CANDLES", 20)
+CORRELATION_REFERENCE_SYMBOL = os.getenv("CORRELATION_REFERENCE_SYMBOL", "BTCUSDT").upper()
 
 # =========================
 # SIGNAL ENGINE - order-flow confirmation thresholds
@@ -188,6 +201,24 @@ LIQUIDATION_CONFIRMATION_ENABLED = env_bool("LIQUIDATION_CONFIRMATION_ENABLED", 
 LIQUIDATION_WINDOW_SECONDS = env_int("LIQUIDATION_WINDOW_SECONDS", 120)
 LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT = env_float("LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000)
 LIQUIDATION_MAX_EVENTS_PER_SYMBOL = env_int("LIQUIDATION_MAX_EVENTS_PER_SYMBOL", 200)
+# Funding rate - reflects how crowded long vs short positioning is
+# market-wide for a symbol (strongly positive = longs paying heavily to
+# stay long, a crowded trade more prone to a squeeze/reversal). Free:
+# reuses the same premiumIndex endpoint exchange.get_mark_price() already
+# calls per-position, just polled in bulk (every symbol, one call) like
+# 24h volume. Informational only, not gated.
+FUNDING_RATE_ENABLED = env_bool("FUNDING_RATE_ENABLED", "True")
+FUNDING_POLL_INTERVAL_SECONDS = env_int("FUNDING_POLL_INTERVAL_SECONDS", 300)
+# Long/short account ratio - who's positioned which way (distinct from
+# OI's "how much is open" and funding's "cost of holding"). Unlike the
+# endpoints above, Binance has no bulk "every symbol" version of this one
+# - only one symbol per call - so it's deliberately NOT polled across the
+# whole watchlist (that would mean one REST call per symbol per poll
+# cycle, the exact shape of traffic this bot spent real effort avoiding
+# elsewhere - see exchange._rate_limit_public_request). Fetched on-demand
+# in main.py, only for a candidate that's already passed every other
+# check, right before it would actually trade. Informational only.
+LONG_SHORT_RATIO_ENABLED = env_bool("LONG_SHORT_RATIO_ENABLED", "True")
 # Require the LTF candle that broke structure to have actually CLOSED
 # beyond the level before entering, instead of reacting to a still-forming
 # candle's wick - a real behavior change (this bot's original premise was

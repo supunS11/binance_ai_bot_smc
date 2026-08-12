@@ -146,6 +146,39 @@ class VolumePollLoopTests(unittest.TestCase):
         self.assertEqual(feed.volumes, {"BTCUSDT": 5_000_000})
 
 
+class FundingPollLoopTests(unittest.TestCase):
+    """Backs config.FUNDING_RATE_ENABLED - a bulk (one call, every symbol)
+    snapshot, same shape as VolumePollLoopTests above."""
+
+    def test_start_funding_poll_is_a_noop_when_disabled(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        with patch.object(config, "FUNDING_RATE_ENABLED", False):
+            feed._start_funding_poll()
+
+        self.assertIsNone(feed.funding_poll_thread)
+
+    def test_funding_poll_loop_populates_feed_funding_rates(self):
+        feed = RealtimeMarketData(["BTCUSDT", "ETHUSDT"])
+        rates = {"BTCUSDT": 0.0001, "ETHUSDT": -0.0002}
+
+        with patch("ws_client.get_funding_rates", return_value=rates), \
+             patch.object(feed.stop_event, "wait", side_effect=[True]):
+            feed._funding_poll_loop(feed.generation)
+
+        self.assertEqual(feed.funding_rates, rates)
+
+    def test_empty_response_does_not_clear_existing_funding_rates(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+        feed.funding_rates = {"BTCUSDT": 0.0001}
+
+        with patch("ws_client.get_funding_rates", return_value={}), \
+             patch.object(feed.stop_event, "wait", side_effect=[True]):
+            feed._funding_poll_loop(feed.generation)
+
+        self.assertEqual(feed.funding_rates, {"BTCUSDT": 0.0001})
+
+
 class RealtimeMarketDataMessageHandlingTests(unittest.TestCase):
     """These exercise the pure message-parsing/routing logic without ever
     opening a real socket (start()/connect() are never called)."""

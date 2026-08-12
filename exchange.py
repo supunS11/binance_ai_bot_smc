@@ -1242,6 +1242,62 @@ def get_24h_quote_volumes():
         return {}
 
 
+def get_funding_rates():
+    """Bulk snapshot (one call, every symbol) of the current funding
+    rate - reuses the same premiumIndex endpoint get_mark_price() already
+    calls per-symbol, just without a symbol filter, same pattern as
+    get_24h_quote_volumes(). Funding rate reflects how crowded long vs
+    short positioning is market-wide for a symbol: strongly positive
+    means longs are paying heavily to stay long (a crowded trade, more
+    prone to a squeeze/reversal); strongly negative is the mirror image
+    for shorts."""
+    try:
+        data = _public_rest_call(
+            "futures_mark_price:all",
+            client.futures_mark_price,
+            weight=10,
+        )
+        return {
+            item["symbol"]: _safe_float_local(item.get("lastFundingRate"))
+            for item in data
+            if item.get("symbol")
+        }
+    except Exception as exc:
+        log_error(f"funding rate fetch error: {exc}")
+        return {}
+
+
+def get_long_short_ratio(symbol):
+    """Global long/short account ratio for one symbol - who's positioned
+    which way, distinct from OI's "how much is open" and funding's "cost
+    of holding". Unlike premiumIndex/24h-ticker, Binance has no bulk
+    "every symbol" version of this endpoint - only one symbol per call -
+    so this is deliberately called on-demand (see config.py's
+    LONG_SHORT_RATIO_ENABLED comment), never polled across the whole
+    watchlist. Returns None (not 0.0 - a real ratio of exactly 0 doesn't
+    happen) if the data isn't available, so a missing value can never be
+    misread as a real "even" reading."""
+    try:
+        data = _public_rest_call(
+            f"futures_global_longshort_ratio:{symbol}",
+            client.futures_global_longshort_ratio,
+            symbol=symbol,
+            period="1h",
+            limit=1,
+            weight=1,
+        )
+
+        if not data:
+            return None
+
+        value = data[-1].get("longShortRatio")
+        return float(value) if value is not None else None
+
+    except Exception as exc:
+        log_warning(f"{symbol} long/short ratio fetch error: {exc}")
+        return None
+
+
 def _safe_float_local(value, default=0.0):
     try:
         return float(value)

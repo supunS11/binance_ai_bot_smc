@@ -105,6 +105,31 @@ class BucketVolumeTests(unittest.TestCase):
         self.assertEqual(ja._bucket_volume(""), "unknown")
 
 
+class NewDataSourceBucketTests(unittest.TestCase):
+    def test_efficiency_ratio_buckets(self):
+        self.assertEqual(ja._bucket_efficiency(0.1), "choppy (<0.3)")
+        self.assertEqual(ja._bucket_efficiency(0.4), "moderate (0.3-0.6)")
+        self.assertEqual(ja._bucket_efficiency(0.9), "trending (>=0.6)")
+        self.assertEqual(ja._bucket_efficiency(None), "unknown")
+
+    def test_correlation_buckets_use_absolute_value(self):
+        self.assertEqual(ja._bucket_correlation(-0.9), "strong (>=0.6)")
+        self.assertEqual(ja._bucket_correlation(0.1), "weak (<0.3)")
+        self.assertEqual(ja._bucket_correlation(None), "unknown")
+
+    def test_funding_rate_buckets(self):
+        self.assertEqual(ja._bucket_funding_rate(-0.001), "<-0.05% (crowded short)")
+        self.assertEqual(ja._bucket_funding_rate(0.0), "-0.05% to 0.05% (neutral)")
+        self.assertEqual(ja._bucket_funding_rate(0.001), ">0.05% (crowded long)")
+        self.assertEqual(ja._bucket_funding_rate(None), "unknown")
+
+    def test_long_short_ratio_buckets(self):
+        self.assertEqual(ja._bucket_long_short_ratio(0.5), "<0.8 (short-heavy)")
+        self.assertEqual(ja._bucket_long_short_ratio(1.0), "0.8-1.2 (balanced)")
+        self.assertEqual(ja._bucket_long_short_ratio(1.5), ">1.2 (long-heavy)")
+        self.assertEqual(ja._bucket_long_short_ratio(None), "unknown")
+
+
 class LoadTradesAndSummarizeTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -184,6 +209,34 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
             "<3M (below the liquidity floor): n=1 WIN=0 BREAKEVEN=0 LOSS=1 loss_rate=100%",
             report,
         )
+
+    def test_summarize_breaks_down_by_the_four_new_data_sources(self):
+        _write_trade(
+            self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT",
+            efficiency_ratio=0.8, btc_correlation=0.7, btc_aligned=True,
+            funding_rate=0.001, long_short_ratio=1.5,
+        )
+        _write_trade(
+            self.journal_path, "B", "ETHUSDT", outcome="SL_HIT",
+            efficiency_ratio=0.1, btc_correlation=0.1, btc_aligned=False,
+            funding_rate=-0.001, long_short_ratio=0.5,
+        )
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By efficiency ratio (chop vs trend):", report)
+        self.assertIn("trending (>=0.6): n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
+        self.assertIn("choppy (<0.3): n=1 WIN=0 BREAKEVEN=0 LOSS=1 loss_rate=100%", report)
+
+        self.assertIn("By BTC correlation strength:", report)
+        self.assertIn("By BTC aligned (informational):", report)
+        self.assertIn("True: n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
+
+        self.assertIn("By funding rate:", report)
+        self.assertIn(">0.05% (crowded long): n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
+
+        self.assertIn("By long/short account ratio:", report)
+        self.assertIn(">1.2 (long-heavy): n=1 WIN=1 BREAKEVEN=0 LOSS=0 loss_rate=0%", report)
 
     def test_outcome_only_trade_still_gets_its_symbol_from_the_outcome_row(self):
         # Real bug found live: a startup-reconciliation-adopted position

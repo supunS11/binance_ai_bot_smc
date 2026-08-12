@@ -250,6 +250,59 @@ class PrivateRestWeightTests(unittest.TestCase):
         self.rate_limit_mock.assert_not_called()
 
 
+class GetFundingRatesTests(unittest.TestCase):
+    """Bulk (one call, every symbol) funding rate snapshot - reuses the
+    same premiumIndex endpoint get_mark_price() already calls per-symbol,
+    same pattern as get_24h_quote_volumes()."""
+
+    def test_returns_a_symbol_to_rate_map(self):
+        data = [
+            {"symbol": "BTCUSDT", "markPrice": "100.0", "lastFundingRate": "0.0001"},
+            {"symbol": "ETHUSDT", "markPrice": "50.0", "lastFundingRate": "-0.0002"},
+        ]
+
+        with patch.object(exchange.client, "futures_mark_price", return_value=data):
+            result = exchange.get_funding_rates()
+
+        self.assertEqual(result, {"BTCUSDT": 0.0001, "ETHUSDT": -0.0002})
+
+    def test_error_returns_empty_dict_instead_of_raising(self):
+        with patch.object(exchange.client, "futures_mark_price", side_effect=RuntimeError("boom")):
+            result = exchange.get_funding_rates()
+
+        self.assertEqual(result, {})
+
+
+class GetLongShortRatioTests(unittest.TestCase):
+    """On-demand (not polled across the watchlist - see
+    config.LONG_SHORT_RATIO_ENABLED) global long/short account ratio."""
+
+    def test_returns_the_latest_ratio(self):
+        data = [
+            {"symbol": "BTCUSDT", "longShortRatio": "1.5", "timestamp": 1000},
+            {"symbol": "BTCUSDT", "longShortRatio": "1.8", "timestamp": 2000},
+        ]
+
+        with patch.object(exchange.client, "futures_global_longshort_ratio", return_value=data):
+            result = exchange.get_long_short_ratio("BTCUSDT")
+
+        self.assertEqual(result, 1.8)  # the last (most recent) entry, not the first
+
+    def test_empty_response_returns_none(self):
+        with patch.object(exchange.client, "futures_global_longshort_ratio", return_value=[]):
+            result = exchange.get_long_short_ratio("BTCUSDT")
+
+        self.assertIsNone(result)
+
+    def test_error_returns_none_instead_of_raising(self):
+        with patch.object(
+            exchange.client, "futures_global_longshort_ratio", side_effect=RuntimeError("boom")
+        ):
+            result = exchange.get_long_short_ratio("BTCUSDT")
+
+        self.assertIsNone(result)
+
+
 class GetIncomeHistoryTests(unittest.TestCase):
     def test_returns_the_records_list(self):
         records = [{"symbol": "BTCUSDT", "incomeType": "REALIZED_PNL", "income": "1.5", "time": 1000}]

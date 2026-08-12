@@ -27,6 +27,7 @@ def _reject(reason, **extra):
 def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
+    btc_candles=None, funding_rate=None,
 ):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
@@ -191,6 +192,36 @@ def evaluate(
     sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
     sweep_confluence = bool(sweep and sweep["direction"] == direction)
 
+    # Chop/volatility regime: informational only, NOT a gate. A structure
+    # break inside a low-efficiency (choppy, round-tripping) market is
+    # weaker evidence than the same break inside a genuinely trending
+    # one - see market_structure.efficiency_ratio.
+    efficiency_ratio = ltf_analysis.get("efficiency_ratio")
+
+    # BTC correlation: informational only, NOT a gate - see
+    # config.BTC_CORRELATION_ENABLED. Most alts move because BTC moves,
+    # not from their own structure; skipped entirely when evaluating BTC
+    # itself (self-correlation is meaningless).
+    btc_correlation = None
+    btc_aligned = None
+
+    if (
+        config.BTC_CORRELATION_ENABLED
+        and btc_candles
+        and symbol.upper() != config.CORRELATION_REFERENCE_SYMBOL
+    ):
+        btc_correlation = market_structure.price_correlation(ltf_candles, btc_candles)
+        btc_return = market_structure.price_return(btc_candles)
+
+        if btc_return is not None:
+            btc_aligned = (btc_return > 0) if side == "BUY" else (btc_return < 0)
+
+    # Funding rate: informational only, NOT a gate - see
+    # config.FUNDING_RATE_ENABLED. Strongly positive means longs are
+    # paying heavily to stay long (a crowded trade, more prone to a
+    # squeeze/reversal); strongly negative is the mirror image.
+    funding_rate = funding_rate if config.FUNDING_RATE_ENABLED else None
+
     # Confluence score: how many of the informational fields above agree
     # with this signal's direction, out of how many were actually
     # available to check (a field that's None - e.g. liquidation, still
@@ -199,7 +230,9 @@ def evaluate(
     # position sizing instead of gating entry on any of these individually
     # - every signal that reaches here still trades, only the size adapts.
     # See config.CONFLUENCE_SIZING_ENABLED.
-    confluence_fields = [sweep_confluence, ema_aligned, oi_rising, liquidation_aligned]
+    confluence_fields = [
+        sweep_confluence, ema_aligned, oi_rising, liquidation_aligned, btc_aligned,
+    ]
     confluence_available = [value for value in confluence_fields if value is not None]
     confluence_total = len(confluence_available)
     confluence_score = sum(1 for value in confluence_available if value)
@@ -229,6 +262,10 @@ def evaluate(
         "liquidation_notional_net": liquidation_notional_net,
         "liquidation_cluster": liquidation_cluster,
         "liquidation_aligned": liquidation_aligned,
+        "efficiency_ratio": efficiency_ratio,
+        "btc_correlation": btc_correlation,
+        "btc_aligned": btc_aligned,
+        "funding_rate": funding_rate,
         "confluence_score": confluence_score,
         "confluence_total": confluence_total,
         "confluence_ratio": confluence_ratio,

@@ -357,6 +357,64 @@ class ExponentialMovingAverageTests(unittest.TestCase):
         self.assertGreater(ema, candles[0]["close"])
 
 
+class EfficiencyRatioTests(unittest.TestCase):
+    """Kaufman's Efficiency Ratio - backs the chop/volatility-regime
+    filter (config.CHOP_FILTER_LOOKBACK_CANDLES), informational only."""
+
+    def test_straight_line_trend_is_close_to_one(self):
+        candles = [_candle(i, high=100 + i, low=99 + i, close=100 + i) for i in range(15)]
+        er = ms.efficiency_ratio(candles, period=14)
+        self.assertAlmostEqual(er, 1.0, places=6)
+
+    def test_round_trip_chop_is_close_to_zero(self):
+        # Up 10 then back down to the start - net move ~0, big path length.
+        closes = list(range(100, 110)) + list(range(110, 99, -1))
+        candles = [_candle(i, high=c + 1, low=c - 1, close=c) for i, c in enumerate(closes)]
+        er = ms.efficiency_ratio(candles, period=len(candles) - 1)
+        self.assertLess(er, 0.1)
+
+    def test_none_with_too_few_candles(self):
+        candles = [_candle(i, high=101, low=99, close=100) for i in range(5)]
+        self.assertIsNone(ms.efficiency_ratio(candles, period=14))
+
+    def test_none_with_zero_path_length(self):
+        candles = [_candle(i, high=100, low=100, close=100) for i in range(15)]
+        self.assertIsNone(ms.efficiency_ratio(candles, period=14))
+
+
+class PriceCorrelationTests(unittest.TestCase):
+    """Backs the BTC-correlation confluence field (config.BTC_CORRELATION_ENABLED)."""
+
+    def test_identical_series_are_fully_correlated(self):
+        candles_a = [_candle(i, high=101 + i, low=99 + i, close=100 + i) for i in range(20)]
+        candles_b = [_candle(i, high=101 + i, low=99 + i, close=100 + i) for i in range(20)]
+        self.assertAlmostEqual(ms.price_correlation(candles_a, candles_b, period=20), 1.0, places=6)
+
+    def test_inverse_series_are_fully_anti_correlated(self):
+        candles_a = [_candle(i, high=101 + i, low=99 + i, close=100 + i) for i in range(20)]
+        candles_b = [_candle(i, high=101 - i, low=99 - i, close=100 - i) for i in range(20)]
+        self.assertAlmostEqual(ms.price_correlation(candles_a, candles_b, period=20), -1.0, places=6)
+
+    def test_none_with_too_few_candles(self):
+        candles = [_candle(i, high=101, low=99, close=100) for i in range(5)]
+        self.assertIsNone(ms.price_correlation(candles, candles, period=20))
+
+    def test_none_when_one_series_has_zero_variance(self):
+        candles_a = [_candle(i, high=101 + i, low=99 + i, close=100 + i) for i in range(20)]
+        flat = [_candle(i, high=101, low=99, close=100) for i in range(20)]
+        self.assertIsNone(ms.price_correlation(candles_a, flat, period=20))
+
+
+class PriceReturnTests(unittest.TestCase):
+    def test_positive_return_for_a_rising_series(self):
+        candles = [_candle(0, high=101, low=99, close=100), _candle(1, high=111, low=109, close=110)]
+        self.assertAlmostEqual(ms.price_return(candles, period=2), 0.10, places=6)
+
+    def test_none_with_too_few_candles(self):
+        candles = [_candle(0, high=101, low=99, close=100)]
+        self.assertIsNone(ms.price_return(candles, period=2))
+
+
 class AnalyzeTests(unittest.TestCase):
     def test_unavailable_with_too_few_candles(self):
         result = ms.analyze([_candle(0, 10, 9)])

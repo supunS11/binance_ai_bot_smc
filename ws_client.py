@@ -19,7 +19,7 @@ import time
 
 import config
 from logger import log_error, log_info, log_warning
-from exchange import get_klines, get_open_interest, get_24h_quote_volumes
+from exchange import get_klines, get_open_interest, get_24h_quote_volumes, get_funding_rates
 from order_flow import CVDEngine
 from orderbook import DepthImbalanceEngine
 from open_interest import OpenInterestEngine
@@ -141,6 +141,9 @@ class RealtimeMarketData:
         # not a dedicated engine class: it's a single bulk snapshot
         # refreshed wholesale, not per-symbol accumulated state like OI.
         self.volumes = {}
+        # Current funding rate per symbol - same bulk-snapshot shape as
+        # volumes above, see config.FUNDING_RATE_ENABLED.
+        self.funding_rates = {}
 
         self.running = False
         self.resetting = False
@@ -156,6 +159,7 @@ class RealtimeMarketData:
         self.oi_poll_thread = None
         self.liquidation_thread = None
         self.volume_poll_thread = None
+        self.funding_poll_thread = None
         self.liquidation_websocket = None
 
     # =========================
@@ -191,6 +195,7 @@ class RealtimeMarketData:
         self._start_oi_poll()
         self._start_liquidation_stream()
         self._start_volume_poll()
+        self._start_funding_poll()
 
         log_info(
             f"Realtime market data websocket started | SYMBOLS={len(self.symbols)} | "
@@ -649,6 +654,42 @@ class RealtimeMarketData:
             if volumes:
                 with self.lock:
                     self.volumes = volumes
+
+            if self.stop_event.wait(interval):
+                return
+
+    # =========================
+    # FUNDING RATE (single bulk REST call, not per-symbol - see
+    # config.FUNDING_RATE_ENABLED)
+    # =========================
+    def _start_funding_poll(self):
+        if not config.FUNDING_RATE_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._funding_poll_loop,
+            args=(generation,),
+            name="realtime-funding-poll",
+            daemon=True,
+        )
+        thread.start()
+        self.funding_poll_thread = thread
+
+    def _funding_poll_loop(self, generation):
+        """Refreshes self.funding_rates from a single bulk call covering
+        every symbol (get_funding_rates, already weight-throttled) - same
+        shape as _volume_poll_loop, no per-symbol pacing needed."""
+        interval = max(float(config.FUNDING_POLL_INTERVAL_SECONDS), 30)
+
+        while self._worker_active(generation):
+            funding_rates = get_funding_rates()
+
+            if funding_rates:
+                with self.lock:
+                    self.funding_rates = funding_rates
 
             if self.stop_event.wait(interval):
                 return

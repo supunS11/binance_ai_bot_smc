@@ -111,6 +111,58 @@ def _bucket_cvd(value):
     return "strong (>=0.6)"
 
 
+def _bucket_efficiency(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < 0.3:
+        return "choppy (<0.3)"
+    if value < 0.6:
+        return "moderate (0.3-0.6)"
+    return "trending (>=0.6)"
+
+
+def _bucket_correlation(value):
+    try:
+        value = abs(float(value))
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < 0.3:
+        return "weak (<0.3)"
+    if value < 0.6:
+        return "moderate (0.3-0.6)"
+    return "strong (>=0.6)"
+
+
+def _bucket_funding_rate(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < -0.0005:
+        return "<-0.05% (crowded short)"
+    if value > 0.0005:
+        return ">0.05% (crowded long)"
+    return "-0.05% to 0.05% (neutral)"
+
+
+def _bucket_long_short_ratio(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < 0.8:
+        return "<0.8 (short-heavy)"
+    if value > 1.2:
+        return ">1.2 (long-heavy)"
+    return "0.8-1.2 (balanced)"
+
+
 _MAE_MFE_SANITY_BOUND = 1000  # R-multiples - see the outlier guard below
 
 
@@ -291,6 +343,11 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "liquidation aligned (informational)", lambda t: t.get("liquidation_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "confluence score (drives position sizing)", lambda t: t.get("confluence_score", "unknown") or "0")
     lines += _breakdown_lines(resolved, "24h quote volume (liquidity floor)", lambda t: _bucket_volume(t.get("quote_volume_usdt")))
+    lines += _breakdown_lines(resolved, "efficiency ratio (chop vs trend)", lambda t: _bucket_efficiency(t.get("efficiency_ratio")))
+    lines += _breakdown_lines(resolved, "BTC correlation strength", lambda t: _bucket_correlation(t.get("btc_correlation")))
+    lines += _breakdown_lines(resolved, "BTC aligned (informational)", lambda t: t.get("btc_aligned", "unknown") or "False")
+    lines += _breakdown_lines(resolved, "funding rate", lambda t: _bucket_funding_rate(t.get("funding_rate")))
+    lines += _breakdown_lines(resolved, "long/short account ratio", lambda t: _bucket_long_short_ratio(t.get("long_short_ratio")))
     lines += _breakdown_lines(resolved, "early breakeven applied (new 1R profit-lock trigger)", lambda t: t.get("early_breakeven_applied", "unknown") or "False")
     lines += _breakdown_lines(resolved, "break confirmed by candle close (wick vs real break)", lambda t: t.get("break_confirmed_by_close", "unknown") or "False")
     lines += _breakdown_lines(resolved, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")

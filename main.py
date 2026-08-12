@@ -140,11 +140,14 @@ def _evaluate_symbol(
     oi_snapshot = feed.open_interest.snapshot(symbol)
     liquidation_snapshot = feed.liquidations.snapshot(symbol)
     quote_volume_usdt = feed.volumes.get(symbol)
+    btc_candles = feed.candles.get(config.CORRELATION_REFERENCE_SYMBOL)
+    funding_rate = feed.funding_rates.get(symbol)
 
     result = signal_engine.evaluate(
         symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
         oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
-        quote_volume_usdt=quote_volume_usdt,
+        quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
+        funding_rate=funding_rate,
     )
 
     if not result.get("signal"):
@@ -156,6 +159,15 @@ def _evaluate_symbol(
     if stability is not None and not stability.confirm(symbol, result["signal"]):
         _tally_reject(reject_counts, reject_symbols, symbol, "SIGNAL_NOT_YET_STABLE")
         return
+
+    # Long/short ratio: fetched on-demand here, not polled across the
+    # whole watchlist like the fields above - see
+    # config.LONG_SHORT_RATIO_ENABLED for why (no bulk endpoint exists for
+    # it). Only reached for a candidate that's already passed every other
+    # check, so this is at most a handful of REST calls per hour, not one
+    # per symbol per poll cycle.
+    if config.LONG_SHORT_RATIO_ENABLED:
+        result["long_short_ratio"] = exchange.get_long_short_ratio(symbol)
 
     plan, status = risk_manager.build_trade_plan(result, balance)
 

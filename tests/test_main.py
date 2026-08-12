@@ -3,6 +3,7 @@ from collections import Counter
 from unittest.mock import patch
 
 import config
+import exchange
 import execution
 import main
 import risk_manager
@@ -24,7 +25,7 @@ class _FakeCandleSource:
 
 
 class _FakeFeed:
-    def __init__(self, ltf_candles=None, htf_candles=None, volumes=None):
+    def __init__(self, ltf_candles=None, htf_candles=None, volumes=None, funding_rates=None):
         self.candles = _FakeCandleSource(ltf_candles)
         self.htf_candles = _FakeCandleSource(htf_candles)
         self.cvd = _FakeSnapshotSource()
@@ -32,6 +33,7 @@ class _FakeFeed:
         self.open_interest = _FakeSnapshotSource()
         self.liquidations = _FakeSnapshotSource()
         self.volumes = volumes if volumes is not None else {}
+        self.funding_rates = funding_rates if funding_rates is not None else {}
 
 
 class _FakePositions:
@@ -132,6 +134,23 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
 
         _, kwargs = evaluate_mock.call_args
         self.assertEqual(kwargs["quote_volume_usdt"], 42_000_000)
+
+    def test_btc_candles_and_funding_rate_are_passed_through_to_signal_engine(self):
+        btc_candles = [{"open_time": 0, "close": 100}]
+        feed = _FakeFeed(funding_rates={"BTCUSDT": 0.0002})
+        feed.candles = _FakeCandleSource([{"open_time": 0, "close": 1}])
+        positions = _FakePositions()
+
+        with patch.object(config, "CORRELATION_REFERENCE_SYMBOL", "REFUSDT"), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "X"}) as evaluate_mock:
+            feed.candles.get = lambda symbol: (
+                btc_candles if symbol == "REFUSDT" else [{"open_time": 0, "close": 1}]
+            )
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        _, kwargs = evaluate_mock.call_args
+        self.assertEqual(kwargs["btc_candles"], btc_candles)
+        self.assertEqual(kwargs["funding_rate"], 0.0002)
 
     def test_missing_volume_data_is_passed_through_as_none(self):
         feed = _FakeFeed(volumes={})
@@ -329,6 +348,54 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
             main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
 
         self.assertNotIn("BTCUSDT", stability._streaks)
+
+    def test_long_short_ratio_is_fetched_only_once_the_signal_confirms(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        stability = main.SignalStabilityTracker()
+        result = {"signal": "BUY", "symbol": "BTCUSDT"}
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 1), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_long_short_ratio", return_value=1.8) as ratio_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")) as plan_mock, \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}), \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+        ratio_mock.assert_called_once_with("BTCUSDT")
+        passed_signal, _ = plan_mock.call_args.args
+        self.assertEqual(passed_signal["long_short_ratio"], 1.8)
+
+    def test_long_short_ratio_is_not_fetched_before_the_signal_is_stable(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        stability = main.SignalStabilityTracker()
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 3), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(exchange, "get_long_short_ratio") as ratio_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+        ratio_mock.assert_not_called()
+
+    def test_long_short_ratio_disabled_by_config_is_never_fetched(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        stability = main.SignalStabilityTracker()
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 1), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(exchange, "get_long_short_ratio") as ratio_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}), \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+        ratio_mock.assert_not_called()
 
     def test_stability_none_behaves_like_the_original_ungated_behavior(self):
         feed = _FakeFeed()

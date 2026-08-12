@@ -386,6 +386,82 @@ def exponential_moving_average(candles, period=None):
     return ema
 
 
+def efficiency_ratio(candles, period=None):
+    """Kaufman's Efficiency Ratio: net directional movement over the
+    window divided by total path length (sum of each candle's absolute
+    move). 1.0 means price moved in a straight line (strongly trending);
+    near 0 means it round-tripped back and forth without going anywhere
+    (chop). A structure break inside a low-ER market is weaker evidence
+    than the same break inside a genuinely trending one - a "break" in a
+    dead/choppy market is often just noise finding a random level, not
+    real conviction. Returns None with too little history or a flat
+    market (zero path length) rather than a misleading value."""
+    period = int(config.CHOP_FILTER_LOOKBACK_CANDLES if period is None else period)
+
+    if len(candles) < period + 1:
+        return None
+
+    window = candles[-(period + 1):]
+    net_move = abs(window[-1]["close"] - window[0]["close"])
+    path_length = sum(
+        abs(window[i]["close"] - window[i - 1]["close"]) for i in range(1, len(window))
+    )
+
+    if path_length <= 0:
+        return None
+
+    return net_move / path_length
+
+
+def price_correlation(candles_a, candles_b, period=None):
+    """Pearson correlation between two symbols' closes over the same
+    trailing window - how much of this symbol's move is just riding a
+    reference symbol's (typically BTC) move, versus genuinely independent
+    structure. -1..1, same convention as everywhere else this session.
+    Returns None with too little overlapping history or a symbol whose
+    price never moved in the window (zero variance) rather than a
+    misleading value."""
+    period = int(config.CORRELATION_LOOKBACK_CANDLES if period is None else period)
+
+    if len(candles_a) < period or len(candles_b) < period:
+        return None
+
+    closes_a = [c["close"] for c in candles_a[-period:]]
+    closes_b = [c["close"] for c in candles_b[-period:]]
+    mean_a = sum(closes_a) / period
+    mean_b = sum(closes_b) / period
+
+    covariance = sum((a - mean_a) * (b - mean_b) for a, b in zip(closes_a, closes_b))
+    variance_a = sum((a - mean_a) ** 2 for a in closes_a)
+    variance_b = sum((b - mean_b) ** 2 for b in closes_b)
+    denominator = (variance_a * variance_b) ** 0.5
+
+    if denominator <= 0:
+        return None
+
+    return covariance / denominator
+
+
+def price_return(candles, period=None):
+    """Simple return from the start to the end of the trailing window -
+    used to check whether a reference symbol (typically BTC) is itself
+    moving in the same direction as a signal, not just correlated in
+    magnitude (price_correlation above is symmetric and direction-blind
+    on its own)."""
+    period = int(config.CORRELATION_LOOKBACK_CANDLES if period is None else period)
+
+    if len(candles) < period:
+        return None
+
+    window = candles[-period:]
+    start = window[0]["close"]
+
+    if start == 0:
+        return None
+
+    return (window[-1]["close"] - start) / start
+
+
 def analyze(candles):
     """Consolidated structure snapshot for a candle list - what
     signal_engine.py actually consumes."""
@@ -400,6 +476,7 @@ def analyze(candles):
     pools = find_liquidity_pools(swings)
     fvgs = find_fair_value_gaps(candles)
     atr = average_true_range(candles)
+    efficiency = efficiency_ratio(candles)
 
     return {
         "available": True,
@@ -409,6 +486,7 @@ def analyze(candles):
         "last_swing_low": structure["last_swing_low"],
         "zone": zone,
         "live_break": live_break,
+        "efficiency_ratio": efficiency,
         "liquidity_pools": pools,
         "fair_value_gaps": fvgs,
         "atr": atr,

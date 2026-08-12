@@ -46,6 +46,7 @@ LIQUIDATION_LONG_CLUSTER = {
 class SignalEngineTests(unittest.TestCase):
     def _run(
         self,
+        symbol="BTCUSDT",
         ltf_close=93.0,
         cvd=None,
         depth=None,
@@ -58,6 +59,10 @@ class SignalEngineTests(unittest.TestCase):
         oi_snapshot=None,
         liquidation_snapshot=None,
         quote_volume_usdt=None,
+        btc_candles="default",
+        btc_correlation=0.5,
+        btc_return=0.02,
+        funding_rate=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -69,6 +74,7 @@ class SignalEngineTests(unittest.TestCase):
         liquidation_snapshot = (
             LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
         )
+        btc_candles = ["btc_candle_placeholder"] if btc_candles == "default" else btc_candles
 
         with patch.object(market_structure, "structure_state", return_value=htf_structure), \
              patch.object(market_structure, "premium_discount_zone", return_value=zone), \
@@ -77,11 +83,14 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
              patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
+             patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
+             patch.object(market_structure, "price_return", return_value=btc_return), \
              patch.object(liquidity_sweep, "detect_sweep", return_value=sweep):
             return signal_engine.evaluate(
-                "BTCUSDT", ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
+                symbol, ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
-                quote_volume_usdt=quote_volume_usdt,
+                quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
+                funding_rate=funding_rate,
             )
 
     def test_full_buy_signal_when_everything_aligns(self):
@@ -275,6 +284,61 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["liquidation_notional_net"])
         self.assertIsNone(result["liquidation_cluster"])
         self.assertIsNone(result["liquidation_aligned"])
+
+    def test_efficiency_ratio_is_read_from_ltf_analysis(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.75)
+        result = self._run(ltf_analysis=analysis)
+        self.assertEqual(result["efficiency_ratio"], 0.75)
+
+    def test_efficiency_ratio_defaults_to_none_when_absent(self):
+        result = self._run()  # LTF_BULLISH_BREAK carries no efficiency_ratio key
+        self.assertIsNone(result["efficiency_ratio"])
+
+    def test_btc_correlation_and_alignment_are_recorded_for_a_non_reference_symbol(self):
+        result = self._run(symbol="ETHUSDT", btc_correlation=0.8, btc_return=0.05)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["btc_correlation"], 0.8)
+        self.assertTrue(result["btc_aligned"])  # BUY + BTC rising -> aligned
+
+    def test_btc_misaligned_when_btc_moves_the_opposite_direction(self):
+        result = self._run(symbol="ETHUSDT", btc_return=-0.05)
+        self.assertFalse(result["btc_aligned"])
+
+    def test_btc_correlation_skipped_for_the_reference_symbol_itself(self):
+        # _run() defaults to symbol="BTCUSDT", the reference symbol -
+        # self-correlation is meaningless, must not be computed.
+        result = self._run()
+        self.assertIsNone(result["btc_correlation"])
+        self.assertIsNone(result["btc_aligned"])
+
+    def test_btc_correlation_skipped_when_no_btc_candles_available(self):
+        result = self._run(symbol="ETHUSDT", btc_candles=None)
+        self.assertIsNone(result["btc_correlation"])
+        self.assertIsNone(result["btc_aligned"])
+
+    def test_btc_correlation_disabled_by_config(self):
+        with patch.object(config, "BTC_CORRELATION_ENABLED", False):
+            result = self._run(symbol="ETHUSDT")
+
+        self.assertIsNone(result["btc_correlation"])
+        self.assertIsNone(result["btc_aligned"])
+
+    def test_btc_aligned_counts_toward_confluence_score(self):
+        result = self._run(symbol="ETHUSDT", btc_return=0.05)  # aligned
+
+        self.assertEqual(result["confluence_score"], 5)
+        self.assertEqual(result["confluence_total"], 5)
+
+    def test_funding_rate_is_carried_through(self):
+        result = self._run(funding_rate=0.0003)
+        self.assertEqual(result["funding_rate"], 0.0003)
+
+    def test_funding_rate_is_none_when_disabled(self):
+        with patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._run(funding_rate=0.0003)
+
+        self.assertIsNone(result["funding_rate"])
 
     def test_confluence_score_full_agreement_gives_ratio_one(self):
         # Defaults: sweep=BULLISH (matches direction), ema_value=85 <
