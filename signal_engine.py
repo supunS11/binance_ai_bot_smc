@@ -39,7 +39,7 @@ def evaluate(
     min_volume = float(config.MIN_24H_QUOTE_VOLUME_USDT)
 
     if min_volume > 0 and quote_volume_usdt is not None and quote_volume_usdt < min_volume:
-        return _reject(f"QUOTE_VOLUME_TOO_LOW volume={quote_volume_usdt}")
+        return _reject("QUOTE_VOLUME_TOO_LOW")
 
     htf_structure = market_structure.structure_state(htf_candles)
 
@@ -160,11 +160,18 @@ def evaluate(
 
     min_cvd = config.SIGNAL_MIN_CVD_SCORE
 
+    # Reason deliberately doesn't embed the raw score/imbalance value (same
+    # for DEPTH_OPPOSING and QUOTE_VOLUME_TOO_LOW below) - a continuous
+    # value baked into the reason string means every rejection gets its
+    # own distinct key, so main.py's reject-reason tally (a Counter keyed
+    # on this string) can never aggregate them into one meaningful count.
+    # The per-symbol detail that used to live in the number now lives in
+    # the tally's symbol sample instead.
     if side == "BUY" and cvd_score < min_cvd:
-        return _reject(f"CVD_NOT_CONFIRMED score={round(cvd_score, 4)} < {min_cvd}")
+        return _reject("CVD_NOT_CONFIRMED")
 
     if side == "SELL" and cvd_score > -min_cvd:
-        return _reject(f"CVD_NOT_CONFIRMED score={round(cvd_score, 4)} > {-min_cvd}")
+        return _reject("CVD_NOT_CONFIRMED")
 
     depth_imbalance = None
 
@@ -173,10 +180,10 @@ def evaluate(
         min_depth = config.SIGNAL_MIN_DEPTH_IMBALANCE
 
         if side == "BUY" and depth_imbalance < -min_depth:
-            return _reject(f"DEPTH_OPPOSING imbalance={depth_imbalance}")
+            return _reject("DEPTH_OPPOSING")
 
         if side == "SELL" and depth_imbalance > min_depth:
-            return _reject(f"DEPTH_OPPOSING imbalance={depth_imbalance}")
+            return _reject("DEPTH_OPPOSING")
 
     pools = market_structure.find_liquidity_pools(
         market_structure.find_swing_points(ltf_candles)

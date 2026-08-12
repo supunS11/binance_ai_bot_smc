@@ -148,6 +148,51 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
 
         main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts=None)
 
+    def test_reject_symbols_records_which_symbol_triggered_the_reason(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter()
+        reject_symbols = {}
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "NOT_IN_OTE"}):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols)
+
+        self.assertEqual(reject_symbols["NOT_IN_OTE"], ["BTCUSDT"])
+
+    def test_reject_symbols_sample_is_capped_but_the_count_keeps_growing(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter()
+        reject_symbols = {}
+        symbols = [f"SYM{i}USDT" for i in range(8)]
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "NOT_IN_OTE"}):
+            for symbol in symbols:
+                main._evaluate_symbol(feed, symbol, positions, 1000, reject_counts, reject_symbols)
+
+        self.assertEqual(reject_counts["NOT_IN_OTE"], 8)
+        self.assertEqual(len(reject_symbols["NOT_IN_OTE"]), main._MAX_REJECT_SAMPLE_SYMBOLS)
+
+    def test_same_symbol_rejected_twice_is_not_duplicated_in_the_sample(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter()
+        reject_symbols = {}
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "NOT_IN_OTE"}):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols)
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols)
+
+        self.assertEqual(reject_counts["NOT_IN_OTE"], 2)
+        self.assertEqual(reject_symbols["NOT_IN_OTE"], ["BTCUSDT"])
+
+    def test_reject_symbols_none_is_safe_and_does_not_raise(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "NOT_IN_OTE"}):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), reject_symbols=None)
+
     def test_operational_skips_are_not_tallied(self):
         # Routine skips (already has a position, cooldown, at capacity)
         # aren't signal-quality rejections - tallying them would dilute
@@ -193,6 +238,42 @@ class LogHeartbeatRejectSummaryTests(unittest.TestCase):
         positions = _FakePositions()
 
         main._log_heartbeat(feed, ["BTCUSDT"], positions)
+
+    def test_symbol_sample_is_included_next_to_its_reason(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter({"NOT_IN_OTE": 2})
+        reject_symbols = {"NOT_IN_OTE": ["BTCUSDT", "ETHUSDT"]}
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, reject_counts, reject_symbols)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("NOT_IN_OTE=2[BTCUSDT,ETHUSDT]", logged)
+
+    def test_truncated_sample_gets_an_ellipsis_marker(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter({"NO_LIVE_STRUCTURE_BREAK": 679})
+        reject_symbols = {"NO_LIVE_STRUCTURE_BREAK": ["BTCUSDT", "ETHUSDT", "SOLUSDT"]}
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, reject_counts, reject_symbols)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("NO_LIVE_STRUCTURE_BREAK=679[BTCUSDT,ETHUSDT,SOLUSDT,...]", logged)
+
+    def test_reason_without_a_sample_has_no_bracket_suffix(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter({"UNKNOWN": 3})
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, reject_counts, reject_symbols=None)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("UNKNOWN=3 ", logged + " ")
+        self.assertNotIn("UNKNOWN=3[", logged)
 
 
 if __name__ == "__main__":
