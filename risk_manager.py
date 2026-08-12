@@ -168,6 +168,26 @@ def compute_early_breakeven_price(entry_price, side, risk_distance):
     return entry_price - lock_distance
 
 
+def _entry_too_extended(signal, entry_price, side, risk_distance):
+    """See config.MAX_ENTRY_EXTENSION_R - rejects an entry that's already
+    run too far beyond the structure level that triggered it, instead of
+    market-chasing whatever price exists once confirmation finishes."""
+    max_extension_r = max(float(config.MAX_ENTRY_EXTENSION_R), 0)
+
+    if max_extension_r <= 0 or risk_distance <= 0:
+        return False
+
+    structure_level = signal.get("structure_level")
+
+    if structure_level is None:
+        return False
+
+    extension = (
+        entry_price - structure_level if side == "BUY" else structure_level - entry_price
+    )
+    return (extension / risk_distance) > max_extension_r
+
+
 def _confluence_size_multiplier(signal):
     """Scales risk per trade by how much of sweep/EMA/OI/liquidation
     confluence agrees with this signal (signal_engine's confluence_ratio),
@@ -211,6 +231,11 @@ def build_trade_plan(signal, balance):
     if side == "SELL" and sl_price <= entry_price:
         return None, "SL_ON_WRONG_SIDE"
 
+    risk_distance = abs(entry_price - sl_price)
+
+    if _entry_too_extended(signal, entry_price, side, risk_distance):
+        return None, "ENTRY_TOO_EXTENDED"
+
     tp1_price, tp2_price = compute_targets(
         entry_price, sl_price, side, pools=signal.get("liquidity_pools")
     )
@@ -252,7 +277,7 @@ def build_trade_plan(signal, balance):
         "quantity": quantity,
         "tp1_quantity": tp1_quantity,
         "tp2_quantity": tp2_quantity,
-        "risk_distance": abs(entry_price - sl_price),
+        "risk_distance": risk_distance,
         "size_multiplier": size_multiplier,
         "confluence_ratio": signal.get("confluence_ratio"),
     }, "OK"

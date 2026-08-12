@@ -229,6 +229,19 @@ STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # floor active (observed average stop distance on SL-hit trades was only
 # ~0.45%). Raised from 0.3 -> 0.6 on that evidence.
 MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.6)
+# Rejects an entry that's already run more than this many R beyond the
+# structure level that triggered it - chasing an already-extended move
+# instead of catching it near the level that made the setup valid. Real
+# motivation (2026-08-12, live): REQUIRE_CLOSE_CONFIRMED_BREAK (up to an
+# hour of delay on 1h candles) plus SIGNAL_CONFIRM_TICKS (another ~10-15s)
+# can let price run well past the break level before entry actually
+# fires, and execution.py always market-orders at whatever price exists
+# by then - there was no check on how far that already was from the
+# level that made the setup valid. Expressed in R (the same risk_distance
+# used everywhere else in this file), not raw price/ATR, so it scales
+# with each symbol's own volatility. Starting value is a reasonable
+# floor, not yet calibrated against real trade data. 0 disables it.
+MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
 # Confluence-weighted position sizing - see signal_engine.py's
 # confluence_ratio (how many of sweep/EMA/OI/liquidation agree with the
 # signal, out of how many were actually available to check). Scales the
