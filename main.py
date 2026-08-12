@@ -74,7 +74,39 @@ def _tally_reject(reject_counts, reject_symbols, symbol, reason):
         sample.append(symbol)
 
 
-def _evaluate_symbol(feed, symbol, positions, balance, reject_counts=None, reject_symbols=None):
+class SignalStabilityTracker:
+    """Requires a signal to keep qualifying for config.SIGNAL_CONFIRM_TICKS
+    consecutive evaluations - not just the single instant it first appears
+    - before it's acted on. See config.SIGNAL_CONFIRM_TICKS for the real
+    incident (IOTXUSDT) that motivated this: CVD flipped pass/fail within
+    16 seconds, and the resulting entry sat flat for 90+ minutes before
+    losing. A symbol's streak resets whenever it stops qualifying, flips
+    to the opposite side, or successfully enters a trade (so stale streak
+    state can never leak into a later, unrelated setup on the same symbol
+    once it's eligible again after that position closes and its cooldown
+    passes)."""
+
+    def __init__(self):
+        self._streaks = {}  # symbol -> (side, consecutive_qualifying_ticks)
+
+    def confirm(self, symbol, side):
+        """Call once per eval tick for a symbol with a currently-qualifying
+        signal. Returns True once `side` has qualified for the required
+        number of consecutive calls."""
+        required = max(int(config.SIGNAL_CONFIRM_TICKS), 1)
+        existing_side, count = self._streaks.get(symbol, (None, 0))
+        count = count + 1 if existing_side == side else 1
+        self._streaks[symbol] = (side, count)
+        return count >= required
+
+    def reset(self, symbol):
+        self._streaks.pop(symbol, None)
+
+
+def _evaluate_symbol(
+    feed, symbol, positions, balance,
+    reject_counts=None, reject_symbols=None, stability=None,
+):
     """`reject_counts`/`reject_symbols` (optional) tally why candidates
     don't convert to a trade - signal_engine.evaluate()'s `reason`, plus a
     couple of pre-signal/post-signal cases of our own - and which symbols
@@ -116,7 +148,13 @@ def _evaluate_symbol(feed, symbol, positions, balance, reject_counts=None, rejec
     )
 
     if not result.get("signal"):
+        if stability is not None:
+            stability.reset(symbol)
         _tally_reject(reject_counts, reject_symbols, symbol, result.get("reason") or "UNKNOWN")
+        return
+
+    if stability is not None and not stability.confirm(symbol, result["signal"]):
+        _tally_reject(reject_counts, reject_symbols, symbol, "SIGNAL_NOT_YET_STABLE")
         return
 
     plan, status = risk_manager.build_trade_plan(result, balance)
@@ -154,6 +192,13 @@ def _evaluate_symbol(feed, symbol, positions, balance, reject_counts=None, rejec
 
     trade_id = signal_journal.append_signal(result, plan)
     positions.register(plan, execution_result, trade_id=trade_id)
+
+    if stability is not None:
+        # Clears the streak now that it's been acted on - without this, a
+        # stale entry would sit in the tracker until this symbol becomes
+        # eligible again (position closed + cooldown passed), and could
+        # then wrongly count toward a completely unrelated future setup.
+        stability.reset(symbol)
 
 
 def _poll_positions(feed, positions):
@@ -239,6 +284,7 @@ def main():
     tick = 0
     reject_counts = Counter()
     reject_symbols = {}
+    stability = SignalStabilityTracker()
 
     try:
         while not shutdown_event.is_set():
@@ -252,7 +298,9 @@ def main():
                 _resolve_break_confirmations(feed, positions)
 
             for symbol in symbols:
-                _evaluate_symbol(feed, symbol, positions, balance, reject_counts, reject_symbols)
+                _evaluate_symbol(
+                    feed, symbol, positions, balance, reject_counts, reject_symbols, stability
+                )
 
             if tick % heartbeat_every == 0:
                 _log_heartbeat(feed, symbols, positions, reject_counts, reject_symbols)

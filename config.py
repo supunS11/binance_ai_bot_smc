@@ -337,6 +337,20 @@ MAE_TRACKING_ENABLED = env_bool("MAE_TRACKING_ENABLED", "True")
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "SHADOW").strip().upper()
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)
+# A signal must keep qualifying for this many consecutive eval ticks
+# before it's acted on - not just the single instant it first appears.
+# Real motivation (2026-08-12, live): IOTXUSDT was rejected for
+# CVD_NOT_CONFIRMED, then passed 16 seconds later on a marginal 0.29
+# score, then sat flat for 90+ minutes before losing - CVD is computed
+# over 1m/5m/15m windows (order_flow.py), so it can flip pass/fail within
+# seconds, meaning a single-instant pass can be noise rather than genuine
+# sustained order flow. Structure/OTE/HTF/order-block/FVG are all derived
+# from the last CLOSED candle (see REQUIRE_CLOSE_CONFIRMED_BREAK), so they
+# don't change tick-to-tick - CVD and depth imbalance are the only
+# genuinely volatile inputs, so requiring the full signal to hold for a
+# few ticks in a row is effectively a CVD/depth stability filter. 1
+# disables it (act on the first qualifying tick, original behavior).
+SIGNAL_CONFIRM_TICKS = env_int("SIGNAL_CONFIRM_TICKS", 3)
 # Used only in SHADOW mode so risk-based position sizing has a balance to
 # size against without needing real API keys / an authenticated call.
 SHADOW_ACCOUNT_BALANCE_USDT = env_float("SHADOW_ACCOUNT_BALANCE_USDT", 1000)

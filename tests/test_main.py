@@ -2,6 +2,7 @@ import unittest
 from collections import Counter
 from unittest.mock import patch
 
+import config
 import execution
 import main
 import risk_manager
@@ -205,6 +206,141 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
         main._evaluate_symbol(feed, "BTCUSDT", _FakePositions(count=999), 1000, reject_counts)
 
         self.assertEqual(len(reject_counts), 0)
+
+
+class SignalStabilityTrackerTests(unittest.TestCase):
+    """Real motivation (2026-08-12, live): IOTXUSDT was rejected for
+    CVD_NOT_CONFIRMED, then passed 16 seconds later on a marginal score,
+    then sat flat for 90+ minutes before losing - CVD is computed over 1m/
+    5m/15m windows, so it can flip pass/fail within seconds, meaning a
+    single-instant pass can be noise rather than genuine sustained order
+    flow. These lock in that a signal must hold for
+    config.SIGNAL_CONFIRM_TICKS consecutive calls before it's confirmed."""
+
+    def test_first_call_is_not_yet_confirmed(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 3):
+            tracker = main.SignalStabilityTracker()
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY"))
+
+    def test_confirmed_after_the_required_number_of_consecutive_calls(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 3):
+            tracker = main.SignalStabilityTracker()
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY"))
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY"))
+
+    def test_flipping_side_restarts_the_streak(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 3):
+            tracker = main.SignalStabilityTracker()
+            tracker.confirm("BTCUSDT", "BUY")
+            tracker.confirm("BTCUSDT", "BUY")
+            self.assertFalse(tracker.confirm("BTCUSDT", "SELL"))
+            self.assertFalse(tracker.confirm("BTCUSDT", "SELL"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "SELL"))
+
+    def test_reset_clears_the_streak(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2):
+            tracker = main.SignalStabilityTracker()
+            tracker.confirm("BTCUSDT", "BUY")
+            tracker.reset("BTCUSDT")
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY"))
+
+    def test_streaks_are_tracked_independently_per_symbol(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2):
+            tracker = main.SignalStabilityTracker()
+            tracker.confirm("BTCUSDT", "BUY")
+            self.assertFalse(tracker.confirm("ETHUSDT", "BUY"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY"))
+
+    def test_confirm_ticks_of_one_confirms_immediately(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 1):
+            tracker = main.SignalStabilityTracker()
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY"))
+
+
+class EvaluateSymbolStabilityTests(unittest.TestCase):
+    def _plan(self):
+        return {
+            "symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+            "tp1_price": 102, "tp2_price": 104,
+        }
+
+    def test_signal_is_rejected_as_not_yet_stable_before_the_required_ticks(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter()
+        stability = main.SignalStabilityTracker()
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 3), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts, {}, stability)
+
+        self.assertEqual(reject_counts["SIGNAL_NOT_YET_STABLE"], 1)
+        self.assertEqual(len(positions.registered), 0)
+
+    def test_entry_fires_once_the_signal_has_held_for_enough_ticks(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter()
+        stability = main.SignalStabilityTracker()
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 3), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}), \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            for _ in range(3):
+                main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts, {}, stability)
+
+        self.assertEqual(len(positions.registered), 1)
+        # Only the first two ticks were rejected as not-yet-stable; the
+        # third is the one that actually enters.
+        self.assertEqual(reject_counts["SIGNAL_NOT_YET_STABLE"], 2)
+
+    def test_a_gap_in_qualifying_resets_the_streak(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        stability = main.SignalStabilityTracker()
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2):
+            with patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}):
+                main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+            with patch.object(signal_engine, "evaluate", return_value={"signal": None, "reason": "NOT_IN_OTE"}):
+                main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+            with patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}):
+                # Would be the 2nd consecutive BUY (and confirm) if the gap
+                # hadn't reset the streak - it's only the 1st again.
+                main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+        self.assertEqual(len(positions.registered), 0)
+
+    def test_streak_resets_after_a_successful_entry(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        stability = main.SignalStabilityTracker()
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 1), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}), \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability)
+
+        self.assertNotIn("BTCUSDT", stability._streaks)
+
+    def test_stability_none_behaves_like_the_original_ungated_behavior(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True, "shadow": True}), \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, stability=None)
+
+        self.assertEqual(len(positions.registered), 1)
 
 
 class LogHeartbeatRejectSummaryTests(unittest.TestCase):
