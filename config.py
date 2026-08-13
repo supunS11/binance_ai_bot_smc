@@ -321,6 +321,31 @@ EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS = env_int("EXTRA_CONFIRM_TICKS_FOR_NEW_TRIG
 # EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS, not equal to it. 0 preserves the
 # original zero-extra-cost behavior.
 STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS = env_int("STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 1)
+# Instead of the fixed STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
+# CHOCH_RETEST priority order (first match wins, nothing else attempted),
+# gather every currently-qualifying trigger, gate each one for real (HTF
+# bias/zone/OTE/OB-FVG/CVD/depth - all direction-only, so this is at most
+# 2 pipeline runs per tick, not 4), and among the survivors prefer
+# whichever candidate's structure_level sits closest to current price
+# (least already-chased - same philosophy as MAX_ENTRY_EXTENSION_R)
+# INSTEAD of the fixed-priority default, but only when the edge is real -
+# see TRIGGER_QUALITY_EDGE_ATR_MULTIPLE. Default OFF: disabled reproduces
+# today's fixed-priority behavior byte-for-byte (confirmed via the
+# existing test suite requiring zero changes when this stays False).
+TRIGGER_QUALITY_RANKING_ENABLED = env_bool("TRIGGER_QUALITY_RANKING_ENABLED", "False")
+# How much better (in ATR-multiples of price distance from the trigger
+# level) an alternative same-direction candidate must be before it
+# overrides the fixed-priority default, when TRIGGER_QUALITY_RANKING_ENABLED
+# is on. Exists specifically to prevent a real risk found during design
+# review: two close-scoring candidates could flip which one "wins" from
+# ordinary tick-to-tick price noise, resetting main.py's
+# SignalStabilityTracker streak every time and starving the setup of ever
+# confirming - this hysteresis margin keeps the selection sticky unless
+# there's a real, not noise-level, quality difference. Starting value, not
+# yet calibrated against real trade data. 0 disables the hysteresis
+# (always take the best-scored candidate, no margin required) - not
+# recommended given the flapping risk above.
+TRIGGER_QUALITY_EDGE_ATR_MULTIPLE = env_float("TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0.25)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

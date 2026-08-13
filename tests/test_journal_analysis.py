@@ -193,6 +193,17 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         # The weak-CVD bucket should show the 2/2 loss rate concentration.
         self.assertIn("weak (<0.3): n=2", report)
 
+    def test_summarize_breaks_down_by_side(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", signal="BUY")
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", signal="BUY")
+        _write_trade(self.journal_path, "C", "SOLUSDT", outcome="SL_HIT", signal="SELL")
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By side (BUY/SELL):", report)
+        self.assertIn("BUY: n=2", report)
+        self.assertIn("SELL: n=1", report)
+
     def test_summarize_breaks_down_by_early_breakeven_applied(self):
         _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SHADOW_BREAKEVEN_STOP_HIT", early_breakeven_applied=True)
         _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SHADOW_TP2_HIT", early_breakeven_applied=True)

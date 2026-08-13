@@ -953,6 +953,122 @@ class SignalEngineTests(unittest.TestCase):
         self.assertGreater(plan["sl_price"], plan["entry_price"])
 
 
+    # config.TRIGGER_QUALITY_RANKING_ENABLED - instead of the fixed
+    # priority order (first candidate wins), gate every currently-
+    # qualifying candidate and rank the survivors by objective quality
+    # (distance from current price to the trigger level), overriding the
+    # fixed-priority default only when the edge is real - see
+    # config.TRIGGER_QUALITY_EDGE_ATR_MULTIPLE. Default OFF - every test
+    # above this point already proves the disabled path is byte-identical
+    # to the old if/elif chain (no changes were needed to any of them).
+
+    def test_ranking_overrides_the_default_when_the_edge_is_real(self):
+        # STRUCTURE_BREAK (level=90, distance=3 from entry=93) is the
+        # fixed-priority default; LIQUIDITY_SWEEP (level=92, distance=1)
+        # is closer by 2, well over the default 0.25*ATR(1.0) edge.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0.25):
+            result = self._run(sweep_direction="BULLISH", sweep_level=92)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "LIQUIDITY_SWEEP")
+        self.assertEqual(result["structure_level"], 92)
+
+    def test_ranking_sticks_with_the_default_when_the_edge_is_too_small(self):
+        # LIQUIDITY_SWEEP (level=90.1, distance=2.9) is objectively closer
+        # than STRUCTURE_BREAK (level=90, distance=3), but only by 0.1 -
+        # under the default 0.25*ATR edge, so the fixed-priority default
+        # must still win (the hysteresis margin exists precisely to
+        # prevent this kind of marginal difference from deciding it).
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0.25):
+            result = self._run(sweep_direction="BULLISH", sweep_level=90.1)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        self.assertEqual(result["structure_level"], 90)
+
+    def test_zero_edge_multiple_always_takes_the_best_scored_candidate(self):
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0):
+            result = self._run(sweep_direction="BULLISH", sweep_level=90.1)
+
+        self.assertEqual(result["signal_trigger"], "LIQUIDITY_SWEEP")
+
+    def test_ranking_recovers_a_signal_the_fixed_priority_default_would_have_missed(self):
+        # STRUCTURE_BREAK fires BEARISH here - against HTF_BULLISH bias,
+        # so it's the only candidate the OLD fixed-priority chain would
+        # ever attempt, and it fails AGAINST_HTF_BIAS outright. A
+        # simultaneous LIQUIDITY_SWEEP fires BULLISH (agrees with HTF
+        # bias) and would pass every gate. With ranking OFF this is a
+        # missed setup (matches today's real behavior); with ranking ON,
+        # the whole point of this feature, it's recovered.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": True, "direction": "BEARISH", "level": 110}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", False):
+            off_result = self._run(ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89)
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True):
+            on_result = self._run(ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89)
+
+        self.assertIsNone(off_result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", off_result["reason"])
+
+        self.assertEqual(on_result["signal"], "BUY")
+        self.assertEqual(on_result["signal_trigger"], "LIQUIDITY_SWEEP")
+        self.assertEqual(on_result["structure_level"], 89)
+
+    def test_direction_pipeline_runs_once_even_with_two_same_direction_candidates(self):
+        # STRUCTURE_BREAK and LIQUIDITY_SWEEP both fire BULLISH here -
+        # ranking has real candidates to choose between, but since they
+        # share a direction the shared gate pipeline must still only run
+        # once (cached by direction), not once per candidate.
+        with patch.object(market_structure, "structure_state", return_value=HTF_BULLISH), \
+             patch.object(market_structure, "premium_discount_zone", return_value=ZONE), \
+             patch.object(market_structure, "analyze", return_value=LTF_BULLISH_BREAK), \
+             patch.object(market_structure, "find_order_block", return_value=None) as mock_ob, \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]) as mock_pools, \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_fvg_retest", return_value=None), \
+             patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
+             patch.object(market_structure, "price_correlation", return_value=0.5), \
+             patch.object(market_structure, "price_return", return_value=0.02), \
+             patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 92}) as mock_detect, \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True):
+            result = signal_engine.evaluate(
+                "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
+                {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
+                oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(mock_pools.call_count, 1)
+        self.assertEqual(mock_detect.call_count, 1)
+        self.assertEqual(mock_ob.call_count, 1)
+
+    def test_hysteresis_keeps_the_winner_stable_across_a_small_price_move(self):
+        # Same two close-scoring candidates as the "sticks with default"
+        # test above, evaluated at two slightly different entry prices
+        # (ordinary tick-to-tick noise) - the winner must not flip, which
+        # is exactly what would otherwise reset main.py's
+        # SignalStabilityTracker streak every tick and starve the setup.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0.25):
+            result_a = self._run(ltf_close=93.0, sweep_direction="BULLISH", sweep_level=90.1)
+            result_b = self._run(ltf_close=93.05, sweep_direction="BULLISH", sweep_level=90.1)
+
+        self.assertEqual(result_a["signal_trigger"], "STRUCTURE_BREAK")
+        self.assertEqual(result_b["signal_trigger"], "STRUCTURE_BREAK")
+
+
 class LongShortFavorableTests(unittest.TestCase):
     """signal_engine.long_short_favorable - called from main.py once the
     on-demand long_short_ratio fetch resolves (see

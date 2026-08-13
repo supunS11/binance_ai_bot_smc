@@ -360,6 +360,7 @@ def summarize(journal_path=None, since_timestamp=None):
     # actual fill rate (LIMIT_EXPIRED_UNFILLED/LIMIT_INVALIDATED_UNFILLED
     # vs. everything that did fill), not just the WIN/LOSS/BREAKEVEN roll-up above.
     lines += _breakdown_lines(resolved, "outcome", lambda t: t.get("outcome", "unknown") or "unknown")
+    lines += _breakdown_lines(resolved, "side (BUY/SELL)", lambda t: t.get("side", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
     lines += _breakdown_lines(resolved, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")

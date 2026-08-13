@@ -73,15 +73,18 @@ def evaluate(
         return _reject("LTF_STRUCTURE_UNAVAILABLE")
 
     live_break = ltf_analysis["live_break"]
+    latest_price = ltf_candles[-1]["close"]
 
     # config.LIQUIDITY_SWEEP_TRIGGER_ENABLED - a second, alternative entry
     # trigger for symbols whose price rarely produces a clean structure
     # break but does sweep organized liquidity (see liquidity_sweep.py).
     # Hoisted here (instead of computed later, its original position -
-    # see the guarded recompute below) ONLY when the flag is on, so there
-    # is zero added cost across the watchlist every eval tick when it's
-    # off (the default) - pools/sweep are computed exactly once either
-    # way, never twice.
+    # see the guarded recompute inside _evaluate_direction below) ONLY
+    # when the flag is on, so there is zero added cost across the
+    # watchlist every eval tick when it's off (the default) - pools/sweep
+    # are computed exactly once either way, never twice, regardless of
+    # how many candidates/directions end up being evaluated (see the
+    # `nonlocal` note below).
     pools = None
     sweep = None
 
@@ -102,209 +105,19 @@ def evaluate(
             ltf_candles, fvgs=ltf_analysis["fair_value_gaps"]
         )
 
-    # Priority order (first match wins - exactly one signal_trigger per
-    # eval tick, same "never two independent pipelines" guarantee as
-    # every trigger here): STRUCTURE_BREAK (the one proven trigger) >
-    # OB_FVG_RETEST (an actual unmitigated structural imbalance plus a
-    # fresh rejection - stricter evidence than a single wick through a
-    # liquidity pool) > LIQUIDITY_SWEEP > CHOCH_RETEST (a persistent
-    # condition once eligible, and its own downstream OB/FVG gate is
-    # diluted - see config.py's CHOCH_RETEST_TRIGGER_ENABLED comment -
-    # so ranked last among the four as the weakest on its own merits).
-    if live_break.get("broken"):
-        direction = live_break["direction"]
-        structure_level = live_break.get("level")
-        trigger_candle_open_time = live_break.get("open_time")
-        signal_trigger = "STRUCTURE_BREAK"
-    elif config.OB_FVG_RETEST_TRIGGER_ENABLED and fvg_retest is not None:
-        direction = fvg_retest["direction"]
-        structure_level = fvg_retest.get("level")
-        # Unlike LIQUIDITY_SWEEP/CHOCH_RETEST, this trigger's defining
-        # event (wick-in-and-reject) IS the current forming candle - the
-        # exact shape position_manager.resolve_break_confirmations already
-        # validates (did it hold through close, or snap back), so this is
-        # real signal, not a placeholder.
-        trigger_candle_open_time = ltf_candles[-1]["open_time"]
-        signal_trigger = "OB_FVG_RETEST"
-    elif config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:
-        direction = sweep["direction"]
-        structure_level = sweep.get("level")
-        # No candle-close-confirmation concept applies to a sweep the way
-        # it does to a structure break (see
-        # position_manager.resolve_break_confirmations, which already
-        # skips gracefully whenever this is None - same path already used
-        # for startup-reconciliation-adopted positions).
-        trigger_candle_open_time = None
-        signal_trigger = "LIQUIDITY_SWEEP"
-    elif (
-        config.CHOCH_RETEST_TRIGGER_ENABLED
-        and ltf_analysis.get("last_event")
-        and ltf_analysis["last_event"]["type"] == "CHoCH"
-        and (len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"])
-            <= max(int(config.CHOCH_TRIGGER_MAX_AGE_CANDLES), 0)
-    ):
-        direction = ltf_analysis["last_event"]["direction"]
-        # Deliberately NOT last_event["price"] - that's the price of the
-        # NEW pivot that caused the event (e.g. a swing HIGH for a
-        # bullish reversal), not the level that was broken. The current
-        # retracement level is last_swing_low/last_swing_high, the same
-        # fields STRUCTURE_BREAK already derives from.
-        structure_level = (
-            ltf_analysis["last_swing_low"] if direction == "BULLISH"
-            else ltf_analysis["last_swing_high"]
-        )
-        trigger_candle_open_time = None
-        signal_trigger = "CHOCH_RETEST"
-    else:
-        return _reject("NO_LIVE_STRUCTURE_BREAK")
-
-    side = _BULLISH_TO_SIDE.get(direction)
-
-    if side is None:
-        return _reject("UNKNOWN_BREAK_DIRECTION")
-
-    htf_side = _BULLISH_TO_SIDE.get(htf_structure.get("trend"))
-
-    if htf_side and side != htf_side:
-        return _reject(f"AGAINST_HTF_BIAS htf={htf_structure.get('trend')} ltf={direction}")
-
-    latest_price = ltf_candles[-1]["close"]
-    price_zone = market_structure.zone_for_price(zone, latest_price)
-
-    if side == "BUY" and price_zone != "DISCOUNT":
-        return _reject(f"NOT_IN_DISCOUNT price_zone={price_zone}")
-
-    if side == "SELL" and price_zone != "PREMIUM":
-        return _reject(f"NOT_IN_PREMIUM price_zone={price_zone}")
-
-    if not market_structure.in_ote(zone, latest_price, direction):
-        return _reject("NOT_IN_OTE")
-
-    order_block = market_structure.find_order_block(
-        ltf_candles, len(ltf_candles) - 1, direction
-    )
-    fvgs = ltf_analysis["fair_value_gaps"]
-    matching_fvg = next(
-        (gap for gap in reversed(fvgs) if gap["type"] == direction), None
-    )
-
-    if config.REQUIRE_ORDER_BLOCK_OR_FVG and not order_block and not matching_fvg:
-        return _reject("NO_ORDER_BLOCK_OR_FVG")
-
-    # Informational only, not gating: an EMA is a lagging/smoothed
-    # indicator by construction, so requiring price to already be on its
-    # correct side can delay entry on a sharp move until price has run
-    # further - a real cost against this bot's real-time premise, and one
-    # not yet backed by evidence it's worth paying. Computed and logged
-    # here so that evidence can accumulate (same treatment as
-    # sweep_confluence below) before this is ever turned into a hard gate.
+    # ema_value/btc_correlation/btc_return hoisted here (same gating as
+    # before) because neither depends on direction - only the derived
+    # ema_aligned/btc_aligned booleans do, computed per-direction inside
+    # _evaluate_direction from these shared values. Avoids redundantly
+    # recomputing an O(60-candle) EMA sum / O(20-candle) correlation on
+    # the (uncommon) tick where both directions get attempted below.
     ema_value = None
-    ema_aligned = None
 
     if config.EMA_CONFIRMATION_ENABLED:
         ema_value = market_structure.exponential_moving_average(ltf_candles)
 
-        if ema_value is not None:
-            ema_aligned = (
-                latest_price > ema_value if side == "BUY" else latest_price < ema_value
-            )
-
-    # Open Interest: informational only, NOT a gate - see
-    # config.OI_CONFIRMATION_ENABLED for rationale. Rising OI during this
-    # break points at fresh positioning, not just the other side closing.
-    oi_snapshot = oi_snapshot or {}
-    oi_change_pct = None
-    oi_rising = None
-
-    if config.OI_CONFIRMATION_ENABLED and oi_snapshot.get("available"):
-        oi_change_pct = oi_snapshot.get("oi_change_pct")
-
-        if oi_change_pct is not None:
-            oi_rising = oi_change_pct > 0
-
-    # Liquidation clustering: informational only, NOT a gate - see
-    # config.LIQUIDATION_CONFIRMATION_ENABLED for rationale. A BULLISH
-    # break aligns with long-liquidation flow (forced SELL orders as the
-    # swept low was hit); a BEARISH break aligns with short-liquidation
-    # flow (forced BUY orders as the swept high was hit).
-    liquidation_snapshot = liquidation_snapshot or {}
-    liquidation_notional_net = None
-    liquidation_cluster = None
-    liquidation_aligned = None
-
-    if config.LIQUIDATION_CONFIRMATION_ENABLED and liquidation_snapshot.get("available"):
-        liquidation_notional_net = liquidation_snapshot.get("net_liquidation_notional")
-        total_notional = (
-            liquidation_snapshot.get("long_liquidation_notional", 0)
-            + liquidation_snapshot.get("short_liquidation_notional", 0)
-        )
-        liquidation_cluster = total_notional >= config.LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT
-
-        if liquidation_notional_net is not None:
-            liquidation_aligned = (
-                liquidation_notional_net > 0 if direction == "BULLISH"
-                else liquidation_notional_net < 0
-            )
-
-    if not cvd_snapshot.get("available"):
-        return _reject("ORDER_FLOW_DATA_UNAVAILABLE")
-
-    cvd_score = cvd_snapshot.get("cvd_score")
-
-    if cvd_score is None:
-        return _reject("ORDER_FLOW_SCORE_UNAVAILABLE")
-
-    min_cvd = config.SIGNAL_MIN_CVD_SCORE
-
-    # Reason deliberately doesn't embed the raw score/imbalance value (same
-    # for DEPTH_OPPOSING and QUOTE_VOLUME_TOO_LOW below) - a continuous
-    # value baked into the reason string means every rejection gets its
-    # own distinct key, so main.py's reject-reason tally (a Counter keyed
-    # on this string) can never aggregate them into one meaningful count.
-    # The per-symbol detail that used to live in the number now lives in
-    # the tally's symbol sample instead.
-    if side == "BUY" and cvd_score < min_cvd:
-        return _reject("CVD_NOT_CONFIRMED")
-
-    if side == "SELL" and cvd_score > -min_cvd:
-        return _reject("CVD_NOT_CONFIRMED")
-
-    depth_imbalance = None
-
-    if depth_snapshot.get("available"):
-        depth_imbalance = depth_snapshot.get("depth_imbalance", 0)
-        min_depth = config.SIGNAL_MIN_DEPTH_IMBALANCE
-
-        if side == "BUY" and depth_imbalance < -min_depth:
-            return _reject("DEPTH_OPPOSING")
-
-        if side == "SELL" and depth_imbalance > min_depth:
-            return _reject("DEPTH_OPPOSING")
-
-    if pools is None:
-        # Not already computed above - either LIQUIDITY_SWEEP_TRIGGER_ENABLED
-        # is off, or it's on but the structure break fired first and this
-        # candidate never needed sweep as a trigger. Still worth computing
-        # now for the sweep_confluence informational field below.
-        pools = market_structure.find_liquidity_pools(
-            market_structure.find_swing_points(ltf_candles)
-        )
-        sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
-
-    sweep_confluence = bool(sweep and sweep["direction"] == direction)
-
-    # Chop/volatility regime: informational only, NOT a gate. A structure
-    # break inside a low-efficiency (choppy, round-tripping) market is
-    # weaker evidence than the same break inside a genuinely trending
-    # one - see market_structure.efficiency_ratio.
-    efficiency_ratio = ltf_analysis.get("efficiency_ratio")
-
-    # BTC correlation: informational only, NOT a gate - see
-    # config.BTC_CORRELATION_ENABLED. Most alts move because BTC moves,
-    # not from their own structure; skipped entirely when evaluating BTC
-    # itself (self-correlation is meaningless).
     btc_correlation = None
-    btc_aligned = None
+    btc_return = None
 
     if (
         config.BTC_CORRELATION_ENABLED
@@ -314,89 +127,403 @@ def evaluate(
         btc_correlation = market_structure.price_correlation(ltf_candles, btc_candles)
         btc_return = market_structure.price_return(btc_candles)
 
+    # Candidate list - same detection conditions and same priority order
+    # as before (STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
+    # CHOCH_RETEST), but no longer short-circuited into if/elif: every
+    # currently-qualifying trigger becomes a candidate, and the selection
+    # logic below decides which one actually wins (see
+    # config.TRIGGER_QUALITY_RANKING_ENABLED). Building the full list
+    # unconditionally costs nothing extra worth caring about - pools/
+    # sweep/fvg_retest are already computed unconditionally above
+    # whenever their flags are on, and the CHoCH condition is a few dict
+    # lookups either way.
+    candidates = []
+
+    if live_break.get("broken"):
+        candidates.append({
+            "signal_trigger": "STRUCTURE_BREAK",
+            "direction": live_break["direction"],
+            "structure_level": live_break.get("level"),
+            "trigger_candle_open_time": live_break.get("open_time"),
+        })
+
+    if config.OB_FVG_RETEST_TRIGGER_ENABLED and fvg_retest is not None:
+        candidates.append({
+            "signal_trigger": "OB_FVG_RETEST",
+            "direction": fvg_retest["direction"],
+            "structure_level": fvg_retest.get("level"),
+            # Unlike LIQUIDITY_SWEEP/CHOCH_RETEST, this trigger's defining
+            # event (wick-in-and-reject) IS the current forming candle -
+            # the exact shape position_manager.resolve_break_confirmations
+            # already validates (did it hold through close, or snap
+            # back), so this is real signal, not a placeholder.
+            "trigger_candle_open_time": ltf_candles[-1]["open_time"],
+        })
+
+    if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:
+        candidates.append({
+            "signal_trigger": "LIQUIDITY_SWEEP",
+            "direction": sweep["direction"],
+            "structure_level": sweep.get("level"),
+            # No candle-close-confirmation concept applies to a sweep the
+            # way it does to a structure break (see
+            # position_manager.resolve_break_confirmations, which already
+            # skips gracefully whenever this is None - same path already
+            # used for startup-reconciliation-adopted positions).
+            "trigger_candle_open_time": None,
+        })
+
+    if (
+        config.CHOCH_RETEST_TRIGGER_ENABLED
+        and ltf_analysis.get("last_event")
+        and ltf_analysis["last_event"]["type"] == "CHoCH"
+        and (len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"])
+            <= max(int(config.CHOCH_TRIGGER_MAX_AGE_CANDLES), 0)
+    ):
+        choch_direction = ltf_analysis["last_event"]["direction"]
+        candidates.append({
+            "signal_trigger": "CHOCH_RETEST",
+            "direction": choch_direction,
+            # Deliberately NOT last_event["price"] - that's the price of
+            # the NEW pivot that caused the event (e.g. a swing HIGH for
+            # a bullish reversal), not the level that was broken. The
+            # current retracement level is last_swing_low/last_swing_high,
+            # the same fields STRUCTURE_BREAK already derives from.
+            "structure_level": (
+                ltf_analysis["last_swing_low"] if choch_direction == "BULLISH"
+                else ltf_analysis["last_swing_high"]
+            ),
+            "trigger_candle_open_time": None,
+        })
+
+    if not candidates:
+        return _reject("NO_LIVE_STRUCTURE_BREAK")
+
+    def _evaluate_direction(direction):
+        """Everything below this point in the original single-candidate
+        design (side resolution through the confluence roll-up) depends
+        only on `direction`/`side` - never on which trigger produced it,
+        confirmed by inspection before this refactor. So candidates that
+        share a direction always pass or fail identically, and this only
+        ever needs to run once per DISTINCT direction actually attempted
+        (see the caller below), not once per candidate. `structure_level`/
+        `trigger_candle_open_time`/`signal_trigger` are left as None
+        placeholders in the success dict - the caller overlays the
+        winning candidate's real values afterward."""
+        nonlocal pools, sweep
+
+        side = _BULLISH_TO_SIDE.get(direction)
+
+        if side is None:
+            return _reject("UNKNOWN_BREAK_DIRECTION")
+
+        htf_side = _BULLISH_TO_SIDE.get(htf_structure.get("trend"))
+
+        if htf_side and side != htf_side:
+            return _reject(f"AGAINST_HTF_BIAS htf={htf_structure.get('trend')} ltf={direction}")
+
+        price_zone = market_structure.zone_for_price(zone, latest_price)
+
+        if side == "BUY" and price_zone != "DISCOUNT":
+            return _reject(f"NOT_IN_DISCOUNT price_zone={price_zone}")
+
+        if side == "SELL" and price_zone != "PREMIUM":
+            return _reject(f"NOT_IN_PREMIUM price_zone={price_zone}")
+
+        if not market_structure.in_ote(zone, latest_price, direction):
+            return _reject("NOT_IN_OTE")
+
+        order_block = market_structure.find_order_block(
+            ltf_candles, len(ltf_candles) - 1, direction
+        )
+        fvgs = ltf_analysis["fair_value_gaps"]
+        matching_fvg = next(
+            (gap for gap in reversed(fvgs) if gap["type"] == direction), None
+        )
+
+        if config.REQUIRE_ORDER_BLOCK_OR_FVG and not order_block and not matching_fvg:
+            return _reject("NO_ORDER_BLOCK_OR_FVG")
+
+        # Informational only, not gating: an EMA is a lagging/smoothed
+        # indicator by construction, so requiring price to already be on
+        # its correct side can delay entry on a sharp move until price
+        # has run further - a real cost against this bot's real-time
+        # premise, and one not yet backed by evidence it's worth paying.
+        # ema_value itself is hoisted above (direction-independent) -
+        # only the alignment derived from it varies per direction.
+        ema_aligned = None
+
+        if ema_value is not None:
+            ema_aligned = (
+                latest_price > ema_value if side == "BUY" else latest_price < ema_value
+            )
+
+        # Open Interest: informational only, NOT a gate - see
+        # config.OI_CONFIRMATION_ENABLED for rationale. Rising OI during
+        # this break points at fresh positioning, not just the other
+        # side closing.
+        oi_snapshot_ = oi_snapshot or {}
+        oi_change_pct = None
+        oi_rising = None
+
+        if config.OI_CONFIRMATION_ENABLED and oi_snapshot_.get("available"):
+            oi_change_pct = oi_snapshot_.get("oi_change_pct")
+
+            if oi_change_pct is not None:
+                oi_rising = oi_change_pct > 0
+
+        # Liquidation clustering: informational only, NOT a gate - see
+        # config.LIQUIDATION_CONFIRMATION_ENABLED for rationale. A
+        # BULLISH break aligns with long-liquidation flow (forced SELL
+        # orders as the swept low was hit); a BEARISH break aligns with
+        # short-liquidation flow (forced BUY orders as the swept high
+        # was hit).
+        liquidation_snapshot_ = liquidation_snapshot or {}
+        liquidation_notional_net = None
+        liquidation_cluster = None
+        liquidation_aligned = None
+
+        if config.LIQUIDATION_CONFIRMATION_ENABLED and liquidation_snapshot_.get("available"):
+            liquidation_notional_net = liquidation_snapshot_.get("net_liquidation_notional")
+            total_notional = (
+                liquidation_snapshot_.get("long_liquidation_notional", 0)
+                + liquidation_snapshot_.get("short_liquidation_notional", 0)
+            )
+            liquidation_cluster = total_notional >= config.LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT
+
+            if liquidation_notional_net is not None:
+                liquidation_aligned = (
+                    liquidation_notional_net > 0 if direction == "BULLISH"
+                    else liquidation_notional_net < 0
+                )
+
+        if not cvd_snapshot.get("available"):
+            return _reject("ORDER_FLOW_DATA_UNAVAILABLE")
+
+        cvd_score = cvd_snapshot.get("cvd_score")
+
+        if cvd_score is None:
+            return _reject("ORDER_FLOW_SCORE_UNAVAILABLE")
+
+        min_cvd = config.SIGNAL_MIN_CVD_SCORE
+
+        # Reason deliberately doesn't embed the raw score/imbalance value
+        # (same for DEPTH_OPPOSING and QUOTE_VOLUME_TOO_LOW below) - a
+        # continuous value baked into the reason string means every
+        # rejection gets its own distinct key, so main.py's reject-reason
+        # tally (a Counter keyed on this string) can never aggregate them
+        # into one meaningful count. The per-symbol detail that used to
+        # live in the number now lives in the tally's symbol sample
+        # instead.
+        if side == "BUY" and cvd_score < min_cvd:
+            return _reject("CVD_NOT_CONFIRMED")
+
+        if side == "SELL" and cvd_score > -min_cvd:
+            return _reject("CVD_NOT_CONFIRMED")
+
+        depth_imbalance = None
+
+        if depth_snapshot.get("available"):
+            depth_imbalance = depth_snapshot.get("depth_imbalance", 0)
+            min_depth = config.SIGNAL_MIN_DEPTH_IMBALANCE
+
+            if side == "BUY" and depth_imbalance < -min_depth:
+                return _reject("DEPTH_OPPOSING")
+
+            if side == "SELL" and depth_imbalance > min_depth:
+                return _reject("DEPTH_OPPOSING")
+
+        if pools is None:
+            # Not already computed above - either
+            # LIQUIDITY_SWEEP_TRIGGER_ENABLED is off, or it's on but the
+            # structure break fired first and this candidate never
+            # needed sweep as a trigger. Still worth computing now for
+            # the sweep_confluence informational field below. Assigned
+            # via `nonlocal` so this only ever runs once total, even if
+            # _evaluate_direction runs a second time for the other
+            # direction.
+            pools = market_structure.find_liquidity_pools(
+                market_structure.find_swing_points(ltf_candles)
+            )
+            sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
+
+        sweep_confluence = bool(sweep and sweep["direction"] == direction)
+
+        # Chop/volatility regime: informational only, NOT a gate. A
+        # structure break inside a low-efficiency (choppy, round-
+        # tripping) market is weaker evidence than the same break inside
+        # a genuinely trending one - see market_structure.efficiency_ratio.
+        efficiency_ratio = ltf_analysis.get("efficiency_ratio")
+
+        # BTC correlation: informational only, NOT a gate - see
+        # config.BTC_CORRELATION_ENABLED. Most alts move because BTC
+        # moves, not from their own structure; skipped entirely when
+        # evaluating BTC itself (self-correlation is meaningless).
+        # btc_correlation/btc_return are hoisted above (direction-
+        # independent) - only the alignment derived from them varies per
+        # direction.
+        btc_aligned = None
+
         if btc_return is not None:
             btc_aligned = (btc_return > 0) if side == "BUY" else (btc_return < 0)
 
-    # Funding rate: informational only, NOT a gate - see
-    # config.FUNDING_RATE_ENABLED. Strongly positive means longs are
-    # paying heavily to stay long (a crowded trade, more prone to a
-    # squeeze/reversal); strongly negative is the mirror image.
-    funding_rate = funding_rate if config.FUNDING_RATE_ENABLED else None
+        # Funding rate: informational only, NOT a gate - see
+        # config.FUNDING_RATE_ENABLED. Strongly positive means longs are
+        # paying heavily to stay long (a crowded trade, more prone to a
+        # squeeze/reversal); strongly negative is the mirror image.
+        funding_rate_ = funding_rate if config.FUNDING_RATE_ENABLED else None
 
-    # Boolean "favorable" readings - informational only, journaled but
-    # deliberately NOT added to confluence_fields/confluence_ratio below
-    # (see config.EFFICIENCY_RATIO_CHOP_THRESHOLD: that sizing mechanism
-    # is disabled today on real negative evidence from its existing 5
-    # fields - mixing new, unvalidated ones into it would contaminate any
-    # future read of either). Kept independently named/journaled so
-    # journal_analysis.py can evaluate each on its own merits before any
-    # decision to fold it into sizing (or promote it to a real gate).
-    efficiency_favorable = (
-        efficiency_ratio > config.EFFICIENCY_RATIO_CHOP_THRESHOLD
-        if efficiency_ratio is not None else None
-    )
-    funding_favorable = None
+        # Boolean "favorable" readings - informational only, journaled
+        # but deliberately NOT added to confluence_fields/confluence_ratio
+        # below (see config.EFFICIENCY_RATIO_CHOP_THRESHOLD: that sizing
+        # mechanism is disabled today on real negative evidence from its
+        # existing 5 fields - mixing new, unvalidated ones into it would
+        # contaminate any future read of either). Kept independently
+        # named/journaled so journal_analysis.py can evaluate each on
+        # its own merits before any decision to fold it into sizing (or
+        # promote it to a real gate).
+        efficiency_favorable = (
+            efficiency_ratio > config.EFFICIENCY_RATIO_CHOP_THRESHOLD
+            if efficiency_ratio is not None else None
+        )
+        funding_favorable = None
 
-    if funding_rate is not None:
-        adverse = config.FUNDING_RATE_ADVERSE_THRESHOLD
-        funding_favorable = (
-            funding_rate <= adverse if side == "BUY" else funding_rate >= -adverse
+        if funding_rate_ is not None:
+            adverse = config.FUNDING_RATE_ADVERSE_THRESHOLD
+            funding_favorable = (
+                funding_rate_ <= adverse if side == "BUY" else funding_rate_ >= -adverse
+            )
+
+        # Confluence score: how many of the informational fields above
+        # agree with this signal's direction, out of how many were
+        # actually available to check (a field that's None - e.g.
+        # liquidation, still silent for most alts - is excluded from the
+        # denominator rather than counted against the signal). Feeds
+        # risk_manager's confluence-weighted position sizing instead of
+        # gating entry on any of these individually - every signal that
+        # reaches here still trades, only the size adapts. See
+        # config.CONFLUENCE_SIZING_ENABLED.
+        confluence_fields = [
+            sweep_confluence, ema_aligned, oi_rising, liquidation_aligned, btc_aligned,
+        ]
+        confluence_available = [value for value in confluence_fields if value is not None]
+        confluence_total = len(confluence_available)
+        confluence_score = sum(1 for value in confluence_available if value)
+        confluence_ratio = confluence_score / confluence_total if confluence_total else None
+
+        return {
+            "signal": side,
+            "reason": "OK",
+            "symbol": symbol,
+            "entry_price": latest_price,
+            "htf_trend": htf_structure.get("trend"),
+            # Placeholders - the candidate (not the direction) determines
+            # these; the caller overlays the winning candidate's real
+            # values once a direction's pipeline has actually passed.
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "signal_trigger": None,
+            "quote_volume_usdt": quote_volume_usdt,
+            "order_block": order_block,
+            "fvg": matching_fvg,
+            "sweep_confluence": sweep_confluence,
+            "cvd_score": cvd_score,
+            "depth_imbalance": depth_imbalance,
+            "atr": ltf_analysis.get("atr"),
+            "premium_discount_zone": price_zone,
+            "liquidity_pools": pools,
+            "ema_value": ema_value,
+            "ema_aligned": ema_aligned,
+            "oi_change_pct": oi_change_pct,
+            "oi_rising": oi_rising,
+            "liquidation_notional_net": liquidation_notional_net,
+            "liquidation_cluster": liquidation_cluster,
+            "liquidation_aligned": liquidation_aligned,
+            "efficiency_ratio": efficiency_ratio,
+            "efficiency_favorable": efficiency_favorable,
+            "btc_correlation": btc_correlation,
+            "btc_aligned": btc_aligned,
+            "funding_rate": funding_rate_,
+            "funding_favorable": funding_favorable,
+            # long_short_ratio/long_short_favorable are NOT set here - the
+            # raw ratio is only fetched on-demand in main.py, after a
+            # candidate has already passed every check in this function (see
+            # config.LONG_SHORT_RATIO_ENABLED - no bulk endpoint exists for
+            # it). main.py calls long_short_favorable() below once it has the
+            # real value.
+            "confluence_score": confluence_score,
+            "confluence_total": confluence_total,
+            "confluence_ratio": confluence_ratio,
+        }
+
+    # Selection: unchanged single-candidate path when
+    # TRIGGER_QUALITY_RANKING_ENABLED is off (byte-identical to the old
+    # if/elif chain - only ever attempts candidates[0], the same one the
+    # old code would have picked). When on, attempt every candidate's
+    # direction (deduped via pipeline_results - at most 2 distinct
+    # directions ever exist among up to 4 candidates, and at most ONE of
+    # them can ever pass: the HTF-bias gate and the premium/discount zone
+    # gate are each independently deterministic/exclusive per tick, so
+    # opposite-direction candidates can never both survive gating).
+    selected = candidates if config.TRIGGER_QUALITY_RANKING_ENABLED else [candidates[0]]
+    pipeline_results = {}
+    passing = []
+
+    for candidate in selected:
+        direction = candidate["direction"]
+
+        if direction not in pipeline_results:
+            pipeline_results[direction] = _evaluate_direction(direction)
+
+        result = pipeline_results[direction]
+
+        if result["signal"] is not None:
+            passing.append((candidate, result))
+
+    if not passing:
+        # Top-priority ATTEMPTED candidate's own reason - preserves
+        # today's reject-tally behavior exactly in the (common)
+        # single-candidate case, and avoids inventing a new composite
+        # reject string that would fragment main.py's reject-reason tally.
+        return pipeline_results[selected[0]["direction"]]
+
+    if len(passing) == 1:
+        winner_candidate, winner_result = passing[0]
+    else:
+        # Ranking: prefer whichever same-direction candidate's
+        # structure_level sits closest to current price (least
+        # already-chased - same philosophy as risk_manager's
+        # MAX_ENTRY_EXTENSION_R), but only override the fixed-priority
+        # default (passing[0] - candidates was built in priority order)
+        # when the edge is real, not infinitesimal - see
+        # config.TRIGGER_QUALITY_EDGE_ATR_MULTIPLE for why (prevents
+        # ordinary tick-to-tick price noise from flipping the winner and
+        # resetting main.py's SignalStabilityTracker streak every time).
+        default_candidate, default_result = passing[0]
+        best_candidate, best_result = min(
+            passing, key=lambda pair: abs(latest_price - pair[0]["structure_level"])
         )
 
-    # Confluence score: how many of the informational fields above agree
-    # with this signal's direction, out of how many were actually
-    # available to check (a field that's None - e.g. liquidation, still
-    # silent for most alts - is excluded from the denominator rather than
-    # counted against the signal). Feeds risk_manager's confluence-weighted
-    # position sizing instead of gating entry on any of these individually
-    # - every signal that reaches here still trades, only the size adapts.
-    # See config.CONFLUENCE_SIZING_ENABLED.
-    confluence_fields = [
-        sweep_confluence, ema_aligned, oi_rising, liquidation_aligned, btc_aligned,
-    ]
-    confluence_available = [value for value in confluence_fields if value is not None]
-    confluence_total = len(confluence_available)
-    confluence_score = sum(1 for value in confluence_available if value)
-    confluence_ratio = confluence_score / confluence_total if confluence_total else None
+        if best_candidate is default_candidate:
+            winner_candidate, winner_result = default_candidate, default_result
+        else:
+            atr = ltf_analysis.get("atr") or 0
+            edge = atr * max(float(config.TRIGGER_QUALITY_EDGE_ATR_MULTIPLE), 0)
+            default_score = abs(latest_price - default_candidate["structure_level"])
+            best_score = abs(latest_price - best_candidate["structure_level"])
 
-    return {
-        "signal": side,
-        "reason": "OK",
-        "symbol": symbol,
-        "entry_price": latest_price,
-        "htf_trend": htf_structure.get("trend"),
-        "structure_level": structure_level,
-        "trigger_candle_open_time": trigger_candle_open_time,
-        "signal_trigger": signal_trigger,
-        "quote_volume_usdt": quote_volume_usdt,
-        "order_block": order_block,
-        "fvg": matching_fvg,
-        "sweep_confluence": sweep_confluence,
-        "cvd_score": cvd_score,
-        "depth_imbalance": depth_imbalance,
-        "atr": ltf_analysis.get("atr"),
-        "premium_discount_zone": price_zone,
-        "liquidity_pools": pools,
-        "ema_value": ema_value,
-        "ema_aligned": ema_aligned,
-        "oi_change_pct": oi_change_pct,
-        "oi_rising": oi_rising,
-        "liquidation_notional_net": liquidation_notional_net,
-        "liquidation_cluster": liquidation_cluster,
-        "liquidation_aligned": liquidation_aligned,
-        "efficiency_ratio": efficiency_ratio,
-        "efficiency_favorable": efficiency_favorable,
-        "btc_correlation": btc_correlation,
-        "btc_aligned": btc_aligned,
-        "funding_rate": funding_rate,
-        "funding_favorable": funding_favorable,
-        # long_short_ratio/long_short_favorable are NOT set here - the
-        # raw ratio is only fetched on-demand in main.py, after a
-        # candidate has already passed every check in this function (see
-        # config.LONG_SHORT_RATIO_ENABLED - no bulk endpoint exists for
-        # it). main.py calls long_short_favorable() below once it has the
-        # real value.
-        "confluence_score": confluence_score,
-        "confluence_total": confluence_total,
-        "confluence_ratio": confluence_ratio,
-    }
+            # edge=0 disables the hysteresis entirely (always take the
+            # best-scored candidate) - best_score < default_score is
+            # already guaranteed here (best_candidate is not
+            # default_candidate, by construction of the min() above), so
+            # this difference is always >= 0.
+            if (default_score - best_score) >= edge:
+                winner_candidate, winner_result = best_candidate, best_result
+            else:
+                winner_candidate, winner_result = default_candidate, default_result
+
+    result = dict(winner_result)
+    result["structure_level"] = winner_candidate["structure_level"]
+    result["trigger_candle_open_time"] = winner_candidate["trigger_candle_open_time"]
+    result["signal_trigger"] = winner_candidate["signal_trigger"]
+    return result
