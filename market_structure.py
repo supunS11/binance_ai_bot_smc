@@ -285,6 +285,50 @@ def find_liquidity_pools(swings, tolerance_pct=None):
     return pools
 
 
+def find_fvg_retest(candles, fvgs=None, max_age_candles=None):
+    """A fresh rejection wick into an UNMITIGATED fair value gap on the
+    latest candle - the classic OB/FVG "retest" entry, independent of any
+    live structure break right now. "Unmitigated" means no candle strictly
+    between the gap's formation index and now has already CLOSED fully
+    through the zone (a wick through doesn't invalidate it - only a close
+    past the far edge does, the same "wick vs close" distinction
+    REQUIRE_CLOSE_CONFIRMED_BREAK already applies to structure breaks).
+    Returns the most recently formed qualifying gap (as a dict with
+    direction/level/gap), or None - only one signal can fire per tick, so
+    caller doesn't need every match, just whether one exists."""
+    if len(candles) < 3:
+        return None
+
+    fvgs = find_fair_value_gaps(candles) if fvgs is None else fvgs
+    max_age = int(
+        config.OB_FVG_RETEST_MAX_AGE_CANDLES if max_age_candles is None else max_age_candles
+    )
+    latest_index = len(candles) - 1
+    latest = candles[latest_index]
+
+    for gap in sorted(fvgs, key=lambda g: g["index"], reverse=True):
+        if gap["index"] >= latest_index or (latest_index - gap["index"]) > max_age:
+            continue
+
+        top, bottom = gap["top"], gap["bottom"]
+        mitigated = any(
+            (gap["type"] == "BULLISH" and candles[i]["close"] < bottom)
+            or (gap["type"] == "BEARISH" and candles[i]["close"] > top)
+            for i in range(gap["index"] + 1, latest_index)
+        )
+
+        if mitigated:
+            continue
+
+        if gap["type"] == "BULLISH" and latest["low"] <= top and latest["close"] > bottom:
+            return {"direction": "BULLISH", "level": bottom, "gap": gap}
+
+        if gap["type"] == "BEARISH" and latest["high"] >= bottom and latest["close"] < top:
+            return {"direction": "BEARISH", "level": top, "gap": gap}
+
+    return None
+
+
 def premium_discount_zone(candles, lookback=None):
     lookback = int(
         config.PREMIUM_DISCOUNT_LOOKBACK_CANDLES if lookback is None else lookback

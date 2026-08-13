@@ -4,6 +4,7 @@ from unittest.mock import patch
 import config
 import liquidity_sweep
 import market_structure
+import risk_manager
 import signal_engine
 
 
@@ -56,6 +57,8 @@ class SignalEngineTests(unittest.TestCase):
         order_block=None,
         sweep_direction="BULLISH",
         sweep_level=None,
+        fvg_retest_direction=None,
+        fvg_retest_level=None,
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -71,6 +74,10 @@ class SignalEngineTests(unittest.TestCase):
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
         sweep = {"direction": sweep_direction, "level": sweep_level} if sweep_direction else None
+        fvg_retest = (
+            {"direction": fvg_retest_direction, "level": fvg_retest_level, "gap": {}}
+            if fvg_retest_direction else None
+        )
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
         liquidation_snapshot = (
             LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
@@ -83,6 +90,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_order_block", return_value=order_block), \
              patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest), \
              patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
              patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
              patch.object(market_structure, "price_return", return_value=btc_return), \
@@ -134,7 +142,11 @@ class SignalEngineTests(unittest.TestCase):
     def test_no_signal_when_no_live_break(self):
         analysis = dict(LTF_BULLISH_BREAK)
         analysis["live_break"] = {"broken": False}
-        result = self._run(ltf_analysis=analysis)
+        # sweep_direction=None: this test predates every alternative
+        # trigger and asserts the "nothing at all fired" case - must not
+        # depend on whichever trigger flags happen to be True in the
+        # loaded .env (LIQUIDITY_SWEEP_TRIGGER_ENABLED is live-True today).
+        result = self._run(ltf_analysis=analysis, sweep_direction=None)
         self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
 
     def test_no_signal_against_htf_bias(self):
@@ -672,6 +684,273 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(mock_pools.call_count, 1)
         self.assertEqual(mock_detect.call_count, 1)
+
+    # config.OB_FVG_RETEST_TRIGGER_ENABLED - a fresh rejection wick into an
+    # unmitigated FVG, independent of any live break right now. Priority:
+    # STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP > CHOCH_RETEST.
+
+    def test_fvg_retest_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_fvg_retest_triggered_signal_when_no_break_but_trigger_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+        self.assertEqual(result["structure_level"], 90)
+        # Unlike LIQUIDITY_SWEEP/CHOCH_RETEST, this trigger's defining event
+        # IS the current forming candle - trigger_candle_open_time is real,
+        # not None, so resolve_break_confirmations can validate it.
+        self.assertEqual(result["trigger_candle_open_time"], 0)
+
+    def test_structure_break_takes_priority_over_ob_fvg_retest(self):
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(fvg_retest_direction="BEARISH", fvg_retest_level=77)
+
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        self.assertEqual(result["structure_level"], 90)
+
+    def test_ob_fvg_retest_takes_priority_over_liquidity_sweep(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis,
+                sweep_direction="BULLISH", sweep_level=89,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+            )
+
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+        self.assertEqual(result["structure_level"], 90)
+
+    def test_ob_fvg_retest_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_ob_fvg_retest_still_gated_by_cvd(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                cvd={"available": True, "cvd_score": 0.05},
+            )
+
+        self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
+
+    # config.CHOCH_RETEST_TRIGGER_ENABLED - an already-CONFIRMED reversal
+    # (last_event type CHoCH), retested within CHOCH_TRIGGER_MAX_AGE_CANDLES.
+    # Ranked last in priority: STRUCTURE_BREAK > OB_FVG_RETEST >
+    # LIQUIDITY_SWEEP > CHOCH_RETEST.
+
+    def _choch_analysis(self, direction, event_price, event_index=0, event_type="CHoCH"):
+        analysis = dict(LTF_BULLISH_BREAK if direction == "BULLISH" else LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        analysis["last_event"] = {
+            "type": event_type, "direction": direction, "index": event_index,
+            "price": event_price,
+        }
+        analysis["last_swing_low"] = 88
+        analysis["last_swing_high"] = 112
+        return analysis
+
+    def test_choch_retest_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", False):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_choch_retest_triggered_signal_when_recent_and_enabled(self):
+        # event_price=95 deliberately does NOT equal last_swing_low(88) -
+        # proves structure_level comes from the swing level, not the event.
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+        self.assertEqual(result["structure_level"], 88)  # last_swing_low, NOT event_price(95)
+        self.assertIsNone(result["trigger_candle_open_time"])
+
+    def test_choch_retest_uses_swing_high_not_event_price_for_sell(self):
+        analysis = self._choch_analysis("BEARISH", event_price=85)  # a LOW, deliberately wrong if used
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+        self.assertEqual(result["structure_level"], 112)  # last_swing_high, NOT event_price(85)
+
+    def test_choch_retest_ignored_when_event_too_old(self):
+        # _ltf_candles() always produces a single candle at index 0, so
+        # "age" (len(ltf_candles)-1 - event_index) is 0 unless event_index
+        # is negative - simulating an event that happened well before the
+        # start of this LTF buffer.
+        analysis = self._choch_analysis("BULLISH", event_price=95, event_index=-10)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_TRIGGER_MAX_AGE_CANDLES", 5):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_choch_retest_ignored_when_last_event_is_bos_not_choch(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95, event_type="BOS")
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_liquidity_sweep_takes_priority_over_choch_retest(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89,
+            )
+
+        self.assertEqual(result["signal_trigger"], "LIQUIDITY_SWEEP")
+
+    def test_choch_retest_still_respects_htf_bias(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None, htf_structure=HTF_BEARISH)
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_choch_retest_still_gated_by_cvd(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                cvd={"available": True, "cvd_score": 0.05},
+            )
+
+        self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
+
+    # Regression coverage for the structure_level bug caught during plan
+    # review: feeding a trigger's signal into a REAL risk_manager call must
+    # land the SL on the structurally correct side of entry, for both new
+    # triggers and both directions - the exact check that would have caught
+    # CHOCH_RETEST originally using last_event["price"] (a fresh HIGH/LOW,
+    # the wrong side) instead of last_swing_low/last_swing_high.
+
+    def test_choch_retest_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        # MAX_ENTRY_EXTENSION_R disabled: this test isolates SL-sidedness
+        # only, not the (unrelated) entry-extension gate - a retracement
+        # level several R away from entry is a realistic CHOCH_RETEST shape
+        # but would otherwise trip ENTRY_TOO_EXTENDED for reasons that have
+        # nothing to do with what this test is checking.
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_choch_retest_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = self._choch_analysis("BEARISH", event_price=85)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    def test_ob_fvg_retest_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_ob_fvg_retest_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                fvg_retest_direction="BEARISH", fvg_retest_level=110,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
 
 
 class LongShortFavorableTests(unittest.TestCase):

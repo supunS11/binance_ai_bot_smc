@@ -87,16 +87,37 @@ class SignalStabilityTracker:
     passes)."""
 
     def __init__(self):
-        self._streaks = {}  # symbol -> (side, consecutive_qualifying_ticks)
+        self._streaks = {}  # symbol -> (side, trigger, consecutive_qualifying_ticks)
 
-    def confirm(self, symbol, side):
+    def confirm(self, symbol, side, trigger=None):
         """Call once per eval tick for a symbol with a currently-qualifying
         signal. Returns True once `side` has qualified for the required
-        number of consecutive calls."""
+        number of consecutive calls.
+
+        `trigger` (signal_engine's signal_trigger, e.g. "STRUCTURE_BREAK")
+        raises the bar for every trigger, STRUCTURE_BREAK included - see
+        config.STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS (a smaller bump, kept
+        below config.EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS so the one
+        trigger with a real track record isn't slowed down as much as the
+        newer/unproven ones). The streak is keyed on (side, trigger), not
+        just side: a candidate
+        that qualified via one trigger type for a few ticks then flips to
+        a different trigger type shouldn't inherit that count - it's a
+        different setup. Known, accepted corner case: this also resets the
+        streak when a setup is genuinely STRENGTHENING (e.g. only
+        LIQUIDITY_SWEEP true on tick 1, STRUCTURE_BREAK also becomes true
+        and wins on priority on tick 2) even though two triggers now
+        agree - same simplicity tradeoff as the rest of this mechanism."""
         required = max(int(config.SIGNAL_CONFIRM_TICKS), 1)
-        existing_side, count = self._streaks.get(symbol, (None, 0))
-        count = count + 1 if existing_side == side else 1
-        self._streaks[symbol] = (side, count)
+
+        if trigger == "STRUCTURE_BREAK":
+            required += max(int(config.STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS), 0)
+        elif trigger is not None:
+            required += max(int(config.EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS), 0)
+
+        existing_side, existing_trigger, count = self._streaks.get(symbol, (None, None, 0))
+        count = count + 1 if (existing_side == side and existing_trigger == trigger) else 1
+        self._streaks[symbol] = (side, trigger, count)
         return count >= required
 
     def reset(self, symbol):
@@ -156,7 +177,9 @@ def _evaluate_symbol(
         _tally_reject(reject_counts, reject_symbols, symbol, result.get("reason") or "UNKNOWN")
         return
 
-    if stability is not None and not stability.confirm(symbol, result["signal"]):
+    if stability is not None and not stability.confirm(
+        symbol, result["signal"], result.get("signal_trigger")
+    ):
         _tally_reject(reject_counts, reject_symbols, symbol, "SIGNAL_NOT_YET_STABLE")
         return
 

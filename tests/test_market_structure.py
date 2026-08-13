@@ -259,6 +259,88 @@ class FairValueGapTests(unittest.TestCase):
         self.assertEqual(gaps, [])
 
 
+class FindFvgRetestTests(unittest.TestCase):
+    def test_wick_and_reject_into_bullish_gap(self):
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10.8, low=10.5, open_=10.7, close=10.6),  # wick in, close above bottom
+        ]
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["level"], 10)
+
+    def test_wick_and_reject_into_bearish_gap(self):
+        candles = [
+            _candle(0, high=12, low=11),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=10, low=9),  # gap: top=11, bottom=10, index=2
+            _candle(3, high=10.5, low=10.3, open_=10.4, close=10.8),  # wick in, close below top
+        ]
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertEqual(result["level"], 11)
+
+    def test_gap_mitigated_by_a_close_past_the_far_edge_is_excluded(self):
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10, low=8, open_=9.8, close=9.5),  # closes below bottom -> mitigates
+            _candle(4, high=10.8, low=10.5, open_=10.7, close=10.6),  # would otherwise retest
+        ]
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNone(result)
+
+    def test_wick_through_without_a_close_past_the_edge_does_not_mitigate(self):
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10.5, low=9.5, open_=9.8, close=10.3),  # wicks below bottom, closes back above
+            _candle(4, high=10.8, low=10.5, open_=10.7, close=10.6),  # retest candle
+        ]
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+
+    def test_gap_older_than_max_age_is_ignored(self):
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            # Flat fillers (high=11, low=10, matching the gap's own bounds)
+            # deliberately don't form any NEW gap of their own - a wider
+            # filler range would create a second, more recent gap and
+            # accidentally still satisfy the retest, defeating the point of
+            # this test.
+            _candle(3, high=11, low=10, open_=10.5, close=10.5),
+            _candle(4, high=11, low=10, open_=10.5, close=10.5),
+            _candle(5, high=10.8, low=10.5, open_=10.7, close=10.6),  # would retest, but age=3 > max_age=1
+        ]
+        result = ms.find_fvg_retest(candles, max_age_candles=1)
+
+        self.assertIsNone(result)
+
+    def test_no_gaps_is_none(self):
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=9.5),
+            _candle(2, high=10.2, low=9.8),
+        ]
+        self.assertIsNone(ms.find_fvg_retest(candles))
+
+    def test_insufficient_candles_is_none(self):
+        self.assertIsNone(ms.find_fvg_retest([_candle(0, high=10, low=9)]))
+
+
 class LiquidityPoolTests(unittest.TestCase):
     def test_two_equal_highs_form_a_buy_side_pool(self):
         swings = [

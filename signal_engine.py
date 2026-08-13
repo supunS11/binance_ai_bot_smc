@@ -91,11 +91,41 @@ def evaluate(
         )
         sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
 
+    # config.OB_FVG_RETEST_TRIGGER_ENABLED - a fourth, alternative entry
+    # trigger: a fresh rejection wick into an unmitigated FVG, independent
+    # of any live break right now. Reuses ltf_analysis's already-computed
+    # fair_value_gaps (zero extra cost) rather than recomputing them.
+    fvg_retest = None
+
+    if config.OB_FVG_RETEST_TRIGGER_ENABLED:
+        fvg_retest = market_structure.find_fvg_retest(
+            ltf_candles, fvgs=ltf_analysis["fair_value_gaps"]
+        )
+
+    # Priority order (first match wins - exactly one signal_trigger per
+    # eval tick, same "never two independent pipelines" guarantee as
+    # every trigger here): STRUCTURE_BREAK (the one proven trigger) >
+    # OB_FVG_RETEST (an actual unmitigated structural imbalance plus a
+    # fresh rejection - stricter evidence than a single wick through a
+    # liquidity pool) > LIQUIDITY_SWEEP > CHOCH_RETEST (a persistent
+    # condition once eligible, and its own downstream OB/FVG gate is
+    # diluted - see config.py's CHOCH_RETEST_TRIGGER_ENABLED comment -
+    # so ranked last among the four as the weakest on its own merits).
     if live_break.get("broken"):
         direction = live_break["direction"]
         structure_level = live_break.get("level")
         trigger_candle_open_time = live_break.get("open_time")
         signal_trigger = "STRUCTURE_BREAK"
+    elif config.OB_FVG_RETEST_TRIGGER_ENABLED and fvg_retest is not None:
+        direction = fvg_retest["direction"]
+        structure_level = fvg_retest.get("level")
+        # Unlike LIQUIDITY_SWEEP/CHOCH_RETEST, this trigger's defining
+        # event (wick-in-and-reject) IS the current forming candle - the
+        # exact shape position_manager.resolve_break_confirmations already
+        # validates (did it hold through close, or snap back), so this is
+        # real signal, not a placeholder.
+        trigger_candle_open_time = ltf_candles[-1]["open_time"]
+        signal_trigger = "OB_FVG_RETEST"
     elif config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:
         direction = sweep["direction"]
         structure_level = sweep.get("level")
@@ -106,6 +136,25 @@ def evaluate(
         # for startup-reconciliation-adopted positions).
         trigger_candle_open_time = None
         signal_trigger = "LIQUIDITY_SWEEP"
+    elif (
+        config.CHOCH_RETEST_TRIGGER_ENABLED
+        and ltf_analysis.get("last_event")
+        and ltf_analysis["last_event"]["type"] == "CHoCH"
+        and (len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"])
+            <= max(int(config.CHOCH_TRIGGER_MAX_AGE_CANDLES), 0)
+    ):
+        direction = ltf_analysis["last_event"]["direction"]
+        # Deliberately NOT last_event["price"] - that's the price of the
+        # NEW pivot that caused the event (e.g. a swing HIGH for a
+        # bullish reversal), not the level that was broken. The current
+        # retracement level is last_swing_low/last_swing_high, the same
+        # fields STRUCTURE_BREAK already derives from.
+        structure_level = (
+            ltf_analysis["last_swing_low"] if direction == "BULLISH"
+            else ltf_analysis["last_swing_high"]
+        )
+        trigger_candle_open_time = None
+        signal_trigger = "CHOCH_RETEST"
     else:
         return _reject("NO_LIVE_STRUCTURE_BREAK")
 

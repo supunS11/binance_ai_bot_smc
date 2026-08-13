@@ -283,6 +283,71 @@ class SignalStabilityTrackerTests(unittest.TestCase):
             tracker = main.SignalStabilityTracker()
             self.assertTrue(tracker.confirm("BTCUSDT", "BUY"))
 
+    # trigger param - every trigger now carries some extra-ticks
+    # requirement: config.STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS (small, the
+    # one proven trigger) vs config.EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS
+    # (larger, everything else) - except the back-compat untagged/None
+    # case, for callers that don't pass trigger at all.
+
+    def test_structure_break_trigger_requires_its_own_smaller_extra_ticks(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2), \
+             patch.object(config, "STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 1), \
+             patch.object(config, "EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 3):
+            tracker = main.SignalStabilityTracker()
+            # base(2) + structure_break_extra(1) = 3 required, NOT base(2)
+            # + the larger new-trigger extra(3) = 5.
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+
+    def test_structure_break_extra_ticks_of_zero_preserves_base_behavior(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2), \
+             patch.object(config, "STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 0):
+            tracker = main.SignalStabilityTracker()
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+
+    def test_untagged_none_trigger_uses_base_ticks_only(self):
+        # Back-compat: existing callers that never pass trigger (main.py's
+        # test doubles, or any future caller not yet trigger-aware) must
+        # not silently start requiring extra ticks.
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2), \
+             patch.object(config, "STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 1), \
+             patch.object(config, "EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 2):
+            tracker = main.SignalStabilityTracker()
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY"))
+
+    def test_non_structure_break_trigger_requires_more_extra_ticks_than_structure_break(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2), \
+             patch.object(config, "STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 1), \
+             patch.object(config, "EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 2):
+            tracker = main.SignalStabilityTracker()
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "LIQUIDITY_SWEEP"))
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "LIQUIDITY_SWEEP"))
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "LIQUIDITY_SWEEP"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY", "LIQUIDITY_SWEEP"))
+
+    def test_choch_retest_and_ob_fvg_retest_also_require_extra_ticks(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 1), \
+             patch.object(config, "EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 1):
+            tracker = main.SignalStabilityTracker()
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "CHOCH_RETEST"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY", "CHOCH_RETEST"))
+
+            tracker2 = main.SignalStabilityTracker()
+            self.assertFalse(tracker2.confirm("ETHUSDT", "BUY", "OB_FVG_RETEST"))
+            self.assertTrue(tracker2.confirm("ETHUSDT", "BUY", "OB_FVG_RETEST"))
+
+    def test_switching_trigger_type_restarts_the_streak_even_with_same_side(self):
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 2), \
+             patch.object(config, "STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 0), \
+             patch.object(config, "EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 0):
+            tracker = main.SignalStabilityTracker()
+            tracker.confirm("BTCUSDT", "BUY", "LIQUIDITY_SWEEP")
+            self.assertFalse(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+            self.assertTrue(tracker.confirm("BTCUSDT", "BUY", "STRUCTURE_BREAK"))
+
 
 class EvaluateSymbolStabilityTests(unittest.TestCase):
     def _plan(self):

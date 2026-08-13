@@ -261,6 +261,66 @@ REQUIRE_CLOSE_CONFIRMED_BREAK = env_bool("REQUIRE_CLOSE_CONFIRMED_BREAK", "True"
 # the existing one. Default OFF, same convention as every other feature
 # this session.
 LIQUIDITY_SWEEP_TRIGGER_ENABLED = env_bool("LIQUIDITY_SWEEP_TRIGGER_ENABLED", "False")
+# Third entry trigger: an LTF reversal already CONFIRMED (market_structure's
+# last_event classified "CHoCH" - a break AGAINST the prior trend, not a
+# continuation BOS) within CHOCH_TRIGGER_MAX_AGE_CANDLES candles of now,
+# feeding the same downstream pipeline as every other trigger. Different
+# from STRUCTURE_BREAK: that requires the CURRENT tick to be breaking a
+# level right now; this lets an entry fire on the retracement back into a
+# valid OTE/zone AFTER a reversal already confirmed, without needing a
+# fresh break. structure_level is deliberately last_swing_low/last_swing_high
+# (the current retracement level), NOT last_event["price"] (the NEW pivot
+# that caused the event, e.g. a swing HIGH for a bullish reversal) - that
+# distinction matters: the latter would place the stop just below a recent
+# high instead of below the actual pullback low. Known, accepted tradeoffs
+# (not solved here): (1) possible double-entry on the same reversal, since
+# last_event only updates once SWING_RIGHT candles confirm the new pivot -
+# often several candles (and past SYMBOL_REENTRY_COOLDOWN_SECONDS) after
+# STRUCTURE_BREAK already traded the same move; (2) the downstream
+# find_order_block gate only scans 10 candles back from NOW, so for a
+# retest firing near the max age, the real order block from the original
+# move is likely outside that window - weaker/noisier OB/FVG confirmation
+# than STRUCTURE_BREAK gets. journal_analysis.py's per-trigger breakdown
+# will show whether either is a real problem. Default OFF.
+CHOCH_RETEST_TRIGGER_ENABLED = env_bool("CHOCH_RETEST_TRIGGER_ENABLED", "False")
+CHOCH_TRIGGER_MAX_AGE_CANDLES = env_int("CHOCH_TRIGGER_MAX_AGE_CANDLES", 10)
+# Fourth entry trigger: a fresh rejection wick into an UNMITIGATED fair
+# value gap (market_structure.find_fvg_retest) - independent of any live
+# break right now, the classic OB/FVG "retest" entry. Scoped to FVGs only
+# (order-block retest would need a new forward-scanning variant of
+# find_order_block, meaningfully more engineering for a shape that's less
+# clean than the flat FVG list - deferred). A separate, tighter max-age
+# than FVG_LOOKBACK_CANDLES (50, fine as loose corroborating evidence for
+# STRUCTURE_BREAK's existing gate, too generous for a standalone trigger
+# where freshness should matter more). Default OFF.
+OB_FVG_RETEST_TRIGGER_ENABLED = env_bool("OB_FVG_RETEST_TRIGGER_ENABLED", "False")
+OB_FVG_RETEST_MAX_AGE_CANDLES = env_int("OB_FVG_RETEST_MAX_AGE_CANDLES", 20)
+# Extra consecutive SIGNAL_CONFIRM_TICKS (main.py's SignalStabilityTracker)
+# required for any trigger except the one proven trigger, STRUCTURE_BREAK -
+# LIQUIDITY_SWEEP (already live), CHOCH_RETEST, and OB_FVG_RETEST all get
+# the stricter bar. Deliberately includes LIQUIDITY_SWEEP even though it's
+# already running: it hasn't been validated against real outcomes any more
+# than the brand-new triggers have, so it's held to the same bar starting
+# now rather than grandfathered in - a conscious, evidence-first behavior
+# change on something already live, not an accident. Real evidence this
+# codebase already has (CONFLUENCE_SIZING_ENABLED disabled on flat-to-
+# inverse confluence-vs-outcome data; MIN_STOP_DISTANCE_PCT's comment on
+# CVD/sweep confirmation being statistically identical between winners and
+# losers) means the accuracy gain from adding more triggers has to come
+# from here and from each trigger's own detection strictness - NOT from
+# raising SIGNAL_MIN_CVD_SCORE/SIGNAL_MIN_DEPTH_IMBALANCE further, which
+# isn't evidence-backed.
+EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS = env_int("EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 2)
+# A smaller extra-ticks requirement specifically for STRUCTURE_BREAK - the
+# one trigger EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS deliberately left alone
+# above. With 4 trigger types now live, "the one proven trigger pays zero
+# stability cost" is worth revisiting, but STRUCTURE_BREAK's real advantage
+# is reacting fast to a genuine break - stacking it with the same +2 the
+# newer/unproven triggers carry would blunt that for the trigger with the
+# best track record. Kept deliberately smaller than
+# EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS, not equal to it. 0 preserves the
+# original zero-extra-cost behavior.
+STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS = env_int("STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 1)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)
