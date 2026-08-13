@@ -285,26 +285,44 @@ def find_liquidity_pools(swings, tolerance_pct=None):
     return pools
 
 
-def find_fvg_retest(candles, fvgs=None, max_age_candles=None):
-    """A fresh rejection wick into an UNMITIGATED fair value gap on the
-    latest candle - the classic OB/FVG "retest" entry, independent of any
-    live structure break right now. "Unmitigated" means no candle strictly
-    between the gap's formation index and now has already CLOSED fully
-    through the zone (a wick through doesn't invalidate it - only a close
-    past the far edge does, the same "wick vs close" distinction
-    REQUIRE_CLOSE_CONFIRMED_BREAK already applies to structure breaks).
-    Returns the most recently formed qualifying gap (as a dict with
-    direction/level/gap), or None - only one signal can fire per tick, so
-    caller doesn't need every match, just whether one exists."""
+def find_fvg_retest(candles, fvgs=None, max_age_candles=None, require_closed_candle=None):
+    """A fresh rejection wick into an UNMITIGATED fair value gap - the
+    classic OB/FVG "retest" entry, independent of any live structure break
+    right now. "Unmitigated" means no candle strictly between the gap's
+    formation index and the tested candle has already CLOSED fully through
+    the zone (a wick through doesn't invalidate it - only a close past the
+    far edge does).
+
+    By default (require_closed_candle=False) this tests the current,
+    possibly still-forming candle. When require_closed_candle is True
+    (config.REQUIRE_CLOSE_CONFIRMED_BREAK - the same flag live_break_check
+    uses, reused here as the same principle applied uniformly), this scans
+    back to the most recently CLOSED candle instead - same real motivation
+    as detect_sweep's identical change: a live-candle wick-and-reject read
+    that hadn't actually held by the time the candle finished forming.
+    Returns the most recently formed qualifying gap (direction/level/gap/
+    open_time - the candle actually tested), or None."""
     if len(candles) < 3:
         return None
+
+    if require_closed_candle is None:
+        require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if require_closed_candle:
+        closed_candles = [(i, c) for i, c in enumerate(candles) if c.get("closed")]
+
+        if not closed_candles:
+            return None
+
+        latest_index, latest = closed_candles[-1]
+    else:
+        latest_index = len(candles) - 1
+        latest = candles[latest_index]
 
     fvgs = find_fair_value_gaps(candles) if fvgs is None else fvgs
     max_age = int(
         config.OB_FVG_RETEST_MAX_AGE_CANDLES if max_age_candles is None else max_age_candles
     )
-    latest_index = len(candles) - 1
-    latest = candles[latest_index]
 
     for gap in sorted(fvgs, key=lambda g: g["index"], reverse=True):
         if gap["index"] >= latest_index or (latest_index - gap["index"]) > max_age:
@@ -321,10 +339,10 @@ def find_fvg_retest(candles, fvgs=None, max_age_candles=None):
             continue
 
         if gap["type"] == "BULLISH" and latest["low"] <= top and latest["close"] > bottom:
-            return {"direction": "BULLISH", "level": bottom, "gap": gap}
+            return {"direction": "BULLISH", "level": bottom, "gap": gap, "open_time": latest["open_time"]}
 
         if gap["type"] == "BEARISH" and latest["high"] >= bottom and latest["close"] < top:
-            return {"direction": "BEARISH", "level": top, "gap": gap}
+            return {"direction": "BEARISH", "level": top, "gap": gap, "open_time": latest["open_time"]}
 
     return None
 

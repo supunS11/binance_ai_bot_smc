@@ -1,10 +1,12 @@
 import unittest
+from unittest.mock import patch
 
+import config
 import liquidity_sweep as ls
 
 
-def _candle(high, low, close):
-    return {"open_time": 0, "open": close, "high": high, "low": low, "close": close, "volume": 1, "closed": False}
+def _candle(high, low, close, open_time=0, closed=True):
+    return {"open_time": open_time, "open": close, "high": high, "low": low, "close": close, "volume": 1, "closed": closed}
 
 
 class DetectSweepTests(unittest.TestCase):
@@ -42,6 +44,82 @@ class DetectSweepTests(unittest.TestCase):
     def test_no_candles_returns_none(self):
         pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
         self.assertIsNone(ls.detect_sweep([], pools))
+
+    def test_sweep_result_includes_the_tested_candles_open_time(self):
+        candles = [_candle(high=105, low=99, close=100, open_time=456)]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        sweep = ls.detect_sweep(candles, pools)
+
+        self.assertEqual(sweep["open_time"], 456)
+
+
+class RequireClosedCandleTests(unittest.TestCase):
+    """config.REQUIRE_CLOSE_CONFIRMED_BREAK - real motivation (2026-08-13,
+    two live trades traced against actual Binance price history): a sweep
+    read against a still-forming candle can flip before the candle
+    actually finishes, and both traced trades entered on exactly that kind
+    of premature read before immediately reversing. Reuses the same flag
+    market_structure.live_break_check already uses - the same principle,
+    applied uniformly."""
+
+    def test_forming_candles_sweep_is_ignored_when_required(self):
+        candles = [_candle(high=105, low=99, close=100, closed=False)]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        sweep = ls.detect_sweep(candles, pools, require_closed_candle=True)
+
+        self.assertIsNone(sweep)
+
+    def test_fires_once_the_sweeping_candle_closes(self):
+        candles = [
+            _candle(high=101, low=99, close=100, open_time=0, closed=True),
+            _candle(high=105, low=99, close=100, open_time=1, closed=True),
+        ]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        sweep = ls.detect_sweep(candles, pools, require_closed_candle=True)
+
+        self.assertIsNotNone(sweep)
+        self.assertEqual(sweep["direction"], "BEARISH")
+        self.assertEqual(sweep["open_time"], 1)
+
+    def test_ignores_a_forming_candle_even_if_an_earlier_closed_one_exists(self):
+        # The forming candle (open_time=1) sweeps the pool, but the last
+        # CLOSED candle (open_time=0) never did - must not fire on the
+        # forming one just because it's last in the list.
+        candles = [
+            _candle(high=101, low=99, close=100, open_time=0, closed=True),
+            _candle(high=105, low=99, close=100, open_time=1, closed=False),
+        ]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        sweep = ls.detect_sweep(candles, pools, require_closed_candle=True)
+
+        self.assertIsNone(sweep)
+
+    def test_no_closed_candle_at_all_returns_none(self):
+        candles = [_candle(high=105, low=99, close=100, closed=False)]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        self.assertIsNone(ls.detect_sweep(candles, pools, require_closed_candle=True))
+
+    def test_defaults_from_config(self):
+        candles = [_candle(high=105, low=99, close=100, closed=False)]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        with patch.object(config, "REQUIRE_CLOSE_CONFIRMED_BREAK", True):
+            sweep = ls.detect_sweep(candles, pools)
+
+        self.assertIsNone(sweep)
+
+    def test_require_closed_candle_false_checks_the_forming_candle(self):
+        candles = [_candle(high=105, low=99, close=100, closed=False)]
+        pools = [{"type": "BUY_SIDE", "price": 103, "touches": 2}]
+
+        sweep = ls.detect_sweep(candles, pools, require_closed_candle=False)
+
+        self.assertIsNotNone(sweep)
 
 
 if __name__ == "__main__":

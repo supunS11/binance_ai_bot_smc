@@ -57,8 +57,10 @@ class SignalEngineTests(unittest.TestCase):
         order_block=None,
         sweep_direction="BULLISH",
         sweep_level=None,
+        sweep_open_time=None,
         fvg_retest_direction=None,
         fvg_retest_level=None,
+        fvg_retest_open_time=0,
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -73,9 +75,15 @@ class SignalEngineTests(unittest.TestCase):
         htf_structure = HTF_BULLISH if htf_structure is None else htf_structure
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
-        sweep = {"direction": sweep_direction, "level": sweep_level} if sweep_direction else None
+        sweep = (
+            {"direction": sweep_direction, "level": sweep_level, "open_time": sweep_open_time}
+            if sweep_direction else None
+        )
         fvg_retest = (
-            {"direction": fvg_retest_direction, "level": fvg_retest_level, "gap": {}}
+            {
+                "direction": fvg_retest_direction, "level": fvg_retest_level, "gap": {},
+                "open_time": fvg_retest_open_time,
+            }
             if fvg_retest_direction else None
         )
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
@@ -583,6 +591,21 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["trigger_candle_open_time"])
         self.assertTrue(result["sweep_confluence"])  # sweep is its own trigger, necessarily aligned
 
+    def test_sweep_trigger_candle_open_time_comes_from_the_sweep_itself(self):
+        # Now that detect_sweep can be close-candle-gated, its own
+        # open_time (whichever candle it actually tested) is the real
+        # trigger_candle_open_time - not hardcoded None.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89,
+                sweep_open_time=789,
+            )
+
+        self.assertEqual(result["trigger_candle_open_time"], 789)
+
     def test_structure_break_takes_priority_over_a_simultaneous_sweep(self):
         # LTF_BULLISH_BREAK (level=90) is still active; sweep direction
         # deliberately conflicts (BEARISH) to prove the break wins outright
@@ -719,6 +742,23 @@ class SignalEngineTests(unittest.TestCase):
         # IS the current forming candle - trigger_candle_open_time is real,
         # not None, so resolve_break_confirmations can validate it.
         self.assertEqual(result["trigger_candle_open_time"], 0)
+
+    def test_ob_fvg_retest_trigger_candle_open_time_comes_from_the_retest_itself(self):
+        # find_fvg_retest can now be close-candle-gated, so its own
+        # open_time (whichever candle it actually tested) may differ from
+        # ltf_candles[-1] - confirm the real value flows through, not a
+        # blind read of the candle list.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                fvg_retest_open_time=321,
+            )
+
+        self.assertEqual(result["trigger_candle_open_time"], 321)
 
     def test_structure_break_takes_priority_over_ob_fvg_retest(self):
         with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True):
@@ -997,6 +1037,21 @@ class SignalEngineTests(unittest.TestCase):
             result = self._run(sweep_direction="BULLISH", sweep_level=90.1)
 
         self.assertEqual(result["signal_trigger"], "LIQUIDITY_SWEEP")
+
+    def test_ranking_does_not_crash_when_a_candidates_structure_level_is_none(self):
+        # A candidate's structure_level can legitimately be None (e.g.
+        # CHOCH_RETEST when only one side of last_swing_high/low has
+        # formed yet) - real bug found while verifying this session's
+        # fixes: ranking's abs(latest_price - structure_level) crashed
+        # with a TypeError instead of just deprioritizing it. The
+        # structure-break default (a real level) must still win.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True):
+            result = self._run(sweep_direction="BULLISH", sweep_level=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        self.assertEqual(result["structure_level"], 90)
 
     def test_ranking_recovers_a_signal_the_fixed_priority_default_would_have_missed(self):
         # STRUCTURE_BREAK fires BEARISH here - against HTF_BULLISH bias,

@@ -74,23 +74,34 @@ def _resolve_target(pools, entry_price, side, min_r_multiple, max_r_multiple, ri
     return entry_price + distance if side == "BUY" else entry_price - distance
 
 
-def _apply_min_stop_distance(sl_price, entry_price, side):
+def _apply_min_stop_distance(sl_price, entry_price, side, atr=0):
     """Structure can occasionally land pathologically close to entry - a
     fast/noisy market, or a tight fractal window finding a swing point
     right next to current price. Left alone, that produces a stop that's
     essentially inside normal noise (gets hit immediately) and, because
     position size is solved from the stop distance, an oversized position
     to match. Widen the stop out to a minimum distance from entry rather
-    than let one through at a size ordinary noise will trigger."""
-    entry_price = float(entry_price or 0)
-    min_pct = max(float(config.MIN_STOP_DISTANCE_PCT), 0) / 100
+    than let one through at a size ordinary noise will trigger.
 
-    if entry_price <= 0 or min_pct <= 0:
+    The floor is the WIDER of two measures, not just MIN_STOP_DISTANCE_PCT
+    alone: a flat percentage of price can't be "enough" for every symbol
+    at once - real evidence (2026-08-13, both a direct log-distance trace
+    of 24 real trades and three consecutive journal_analysis.py pulls)
+    showed MIN_STOP_DISTANCE_PCT (0.6%) getting hit on ~40% of trades, with
+    every floor-clamped trade resolving as a loss or scratch - 0.6% is
+    inside normal 1h noise for the volatile small/mid-cap symbols this
+    watchlist trades most often. MIN_STOP_DISTANCE_ATR_MULTIPLE scales the
+    floor with each symbol's own measured volatility instead."""
+    entry_price = float(entry_price or 0)
+
+    if entry_price <= 0:
         return sl_price
 
-    min_distance = entry_price * min_pct
+    min_pct = max(float(config.MIN_STOP_DISTANCE_PCT), 0) / 100
+    min_atr_multiple = max(float(config.MIN_STOP_DISTANCE_ATR_MULTIPLE), 0)
+    min_distance = max(entry_price * min_pct, float(atr or 0) * min_atr_multiple)
 
-    if abs(entry_price - sl_price) >= min_distance:
+    if min_distance <= 0 or abs(entry_price - sl_price) >= min_distance:
         return sl_price
 
     return entry_price - min_distance if side == "BUY" else entry_price + min_distance
@@ -106,7 +117,7 @@ def compute_stop_loss(signal, side):
     buffer = atr * max(float(config.STRUCTURE_STOP_ATR_BUFFER), 0)
     sl_price = level - buffer if side == "BUY" else level + buffer
 
-    return _apply_min_stop_distance(sl_price, signal.get("entry_price"), side)
+    return _apply_min_stop_distance(sl_price, signal.get("entry_price"), side, atr=atr)
 
 
 def compute_targets(entry_price, sl_price, side, pools=None):

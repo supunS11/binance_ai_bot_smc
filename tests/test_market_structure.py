@@ -340,6 +340,68 @@ class FindFvgRetestTests(unittest.TestCase):
     def test_insufficient_candles_is_none(self):
         self.assertIsNone(ms.find_fvg_retest([_candle(0, high=10, low=9)]))
 
+    def test_result_includes_the_tested_candles_open_time(self):
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10.8, low=10.5, open_=10.7, close=10.6),
+        ]
+        result = ms.find_fvg_retest(candles)
+
+        self.assertEqual(result["open_time"], 3)
+
+
+class FindFvgRetestRequireClosedCandleTests(unittest.TestCase):
+    """config.REQUIRE_CLOSE_CONFIRMED_BREAK - same real motivation as
+    liquidity_sweep.detect_sweep's identical change (2026-08-13, two live
+    trades traced against actual price history): a retest read against a
+    still-forming candle can flip before the candle actually finishes."""
+
+    def _gapped_candles(self, retest_closed):
+        return [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10.8, low=10.5, open_=10.7, close=10.6, closed=retest_closed),
+        ]
+
+    def test_forming_retest_candle_is_ignored_when_required(self):
+        candles = self._gapped_candles(retest_closed=False)
+
+        result = ms.find_fvg_retest(candles, require_closed_candle=True)
+
+        self.assertIsNone(result)
+
+    def test_fires_once_the_retest_candle_closes(self):
+        candles = self._gapped_candles(retest_closed=True)
+
+        result = ms.find_fvg_retest(candles, require_closed_candle=True)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["open_time"], 3)
+
+    def test_no_closed_candle_at_all_returns_none(self):
+        candles = [_candle(0, high=10, low=9, closed=False)]
+
+        self.assertIsNone(ms.find_fvg_retest(candles, require_closed_candle=True))
+
+    def test_defaults_from_config(self):
+        candles = self._gapped_candles(retest_closed=False)
+
+        with patch.object(config, "REQUIRE_CLOSE_CONFIRMED_BREAK", True):
+            result = ms.find_fvg_retest(candles)
+
+        self.assertIsNone(result)
+
+    def test_require_closed_candle_false_checks_the_forming_candle(self):
+        candles = self._gapped_candles(retest_closed=False)
+
+        result = ms.find_fvg_retest(candles, require_closed_candle=False)
+
+        self.assertIsNotNone(result)
+
 
 class LiquidityPoolTests(unittest.TestCase):
     def test_two_equal_highs_form_a_buy_side_pool(self):

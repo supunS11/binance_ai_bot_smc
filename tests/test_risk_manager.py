@@ -77,6 +77,68 @@ class MinStopDistanceFloorTests(unittest.TestCase):
         self.assertEqual(sl, 99.999)
 
 
+class MinStopDistanceAtrFloorTests(unittest.TestCase):
+    """The floor is the WIDER of MIN_STOP_DISTANCE_PCT and
+    MIN_STOP_DISTANCE_ATR_MULTIPLE*atr, not the percentage alone - real
+    evidence (2026-08-13: a direct log-distance trace of 24 real trades
+    plus three consecutive journal_analysis.py pulls) showed the flat 0.6%
+    floor alone getting hit on ~40% of trades, every one resolving as a
+    loss or scratch, because 0.6% is inside normal 1h noise for many of
+    this watchlist's volatile small/mid-cap symbols."""
+
+    def test_atr_floor_wins_when_wider_than_the_pct_floor_buy(self):
+        # pct floor: 100 * 0.1% = 0.1. atr floor: 2 * 1.0 = 2.0 (wider).
+        signal = {"structure_level": 99.95, "atr": 2, "entry_price": 100.0}
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.1), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertAlmostEqual(sl, 98.0)  # 100 - (2 * 1.0)
+
+    def test_atr_floor_wins_when_wider_than_the_pct_floor_sell(self):
+        signal = {"structure_level": 100.05, "atr": 2, "entry_price": 100.0}
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.1), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0):
+            sl = risk_manager.compute_stop_loss(signal, "SELL")
+
+        self.assertAlmostEqual(sl, 102.0)  # 100 + (2 * 1.0)
+
+    def test_pct_floor_still_wins_when_it_is_wider_than_the_atr_floor(self):
+        # pct floor: 100 * 0.6% = 0.6. atr floor: 0.1 * 1.0 = 0.1 (narrower).
+        signal = {"structure_level": 99.98, "atr": 0.1, "entry_price": 100.0}
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertAlmostEqual(sl, 99.4)  # 100 - 0.6%
+
+    def test_zero_atr_multiple_disables_the_atr_floor(self):
+        signal = {"structure_level": 99.95, "atr": 2, "entry_price": 100.0}
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.1), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertAlmostEqual(sl, 99.9)  # 100 - 0.1%, atr floor contributes nothing
+
+    def test_a_stop_wider_than_both_floors_is_left_untouched(self):
+        signal = {"structure_level": 90.0, "atr": 0.1, "entry_price": 100.0}
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 90.0)
+
+
 class ComputeTargetsTests(unittest.TestCase):
     def test_buy_targets_are_r_multiples_above_entry(self):
         with patch.object(config, "TP1_R_MULTIPLE", 1.0), patch.object(config, "TP2_R_MULTIPLE", 2.0):

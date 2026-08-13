@@ -370,6 +370,23 @@ STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # floor active (observed average stop distance on SL-hit trades was only
 # ~0.45%). Raised from 0.3 -> 0.6 on that evidence.
 MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.6)
+# A second minimum-stop-distance floor, in ATR multiples rather than a flat
+# percentage of price - risk_manager._apply_min_stop_distance takes
+# whichever of the two floors is WIDER. A flat percentage can't be "enough"
+# for every symbol at once: real evidence (2026-08-13, a direct log-
+# distance trace of 24 real trades plus three consecutive
+# journal_analysis.py pulls) showed MIN_STOP_DISTANCE_PCT (0.6%) getting
+# hit on ~40% of trades, with every floor-clamped trade resolving as a
+# loss or scratch - 0.6% sits inside normal 1h noise for the volatile
+# small/mid-cap symbols this watchlist trades most often. This scales the
+# floor with each symbol's own measured volatility instead of guessing one
+# number for all 400 watchlist symbols. Risk-REDUCING by construction
+# (only ever widens the stop further, which only ever shrinks position
+# size for the same $ risk) - so unlike every trade-count/entry-logic
+# feature this session, this ships live immediately rather than defaulting
+# off. Starting value, not yet calibrated against real trade data. 0
+# disables it (MIN_STOP_DISTANCE_PCT alone, the original behavior).
+MIN_STOP_DISTANCE_ATR_MULTIPLE = env_float("MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0)
 # Rejects an entry that's already run more than this many R beyond the
 # structure level that triggered it - chasing an already-extended move
 # instead of catching it near the level that made the setup valid. Real

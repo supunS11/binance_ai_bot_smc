@@ -152,12 +152,11 @@ def evaluate(
             "signal_trigger": "OB_FVG_RETEST",
             "direction": fvg_retest["direction"],
             "structure_level": fvg_retest.get("level"),
-            # Unlike LIQUIDITY_SWEEP/CHOCH_RETEST, this trigger's defining
-            # event (wick-in-and-reject) IS the current forming candle -
-            # the exact shape position_manager.resolve_break_confirmations
-            # already validates (did it hold through close, or snap
-            # back), so this is real signal, not a placeholder.
-            "trigger_candle_open_time": ltf_candles[-1]["open_time"],
+            # The candle find_fvg_retest actually tested (see its
+            # require_closed_candle behavior) - not blindly
+            # ltf_candles[-1], which may be a different, still-forming
+            # candle by now.
+            "trigger_candle_open_time": fvg_retest.get("open_time"),
         })
 
     if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:
@@ -165,12 +164,12 @@ def evaluate(
             "signal_trigger": "LIQUIDITY_SWEEP",
             "direction": sweep["direction"],
             "structure_level": sweep.get("level"),
-            # No candle-close-confirmation concept applies to a sweep the
-            # way it does to a structure break (see
-            # position_manager.resolve_break_confirmations, which already
-            # skips gracefully whenever this is None - same path already
-            # used for startup-reconciliation-adopted positions).
-            "trigger_candle_open_time": None,
+            # The candle detect_sweep actually tested (see its
+            # require_closed_candle behavior) - position_manager.
+            # resolve_break_confirmations already handles this generically
+            # whether it's a real value or None (e.g. if detect_sweep ever
+            # runs with require_closed_candle=False).
+            "trigger_candle_open_time": sweep.get("open_time"),
         })
 
     if (
@@ -499,18 +498,26 @@ def evaluate(
         # config.TRIGGER_QUALITY_EDGE_ATR_MULTIPLE for why (prevents
         # ordinary tick-to-tick price noise from flipping the winner and
         # resetting main.py's SignalStabilityTracker streak every time).
+        # A candidate's structure_level CAN legitimately be None (e.g.
+        # CHOCH_RETEST when only one side of last_swing_high/low has
+        # formed yet) - score it as worst-possible (inf) rather than
+        # crashing the abs() subtraction, so it's never preferred over a
+        # scoreable alternative but can still win if it's the only
+        # passing candidate at all (the len(passing)==1 branch above).
+        def _score(candidate):
+            level = candidate["structure_level"]
+            return abs(latest_price - level) if level is not None else float("inf")
+
         default_candidate, default_result = passing[0]
-        best_candidate, best_result = min(
-            passing, key=lambda pair: abs(latest_price - pair[0]["structure_level"])
-        )
+        best_candidate, best_result = min(passing, key=lambda pair: _score(pair[0]))
 
         if best_candidate is default_candidate:
             winner_candidate, winner_result = default_candidate, default_result
         else:
             atr = ltf_analysis.get("atr") or 0
             edge = atr * max(float(config.TRIGGER_QUALITY_EDGE_ATR_MULTIPLE), 0)
-            default_score = abs(latest_price - default_candidate["structure_level"])
-            best_score = abs(latest_price - best_candidate["structure_level"])
+            default_score = _score(default_candidate)
+            best_score = _score(best_candidate)
 
             # edge=0 disables the hysteresis entirely (always take the
             # best-scored candidate) - best_score < default_score is
