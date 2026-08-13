@@ -74,10 +74,41 @@ def evaluate(
 
     live_break = ltf_analysis["live_break"]
 
-    if not live_break.get("broken"):
+    # config.LIQUIDITY_SWEEP_TRIGGER_ENABLED - a second, alternative entry
+    # trigger for symbols whose price rarely produces a clean structure
+    # break but does sweep organized liquidity (see liquidity_sweep.py).
+    # Hoisted here (instead of computed later, its original position -
+    # see the guarded recompute below) ONLY when the flag is on, so there
+    # is zero added cost across the watchlist every eval tick when it's
+    # off (the default) - pools/sweep are computed exactly once either
+    # way, never twice.
+    pools = None
+    sweep = None
+
+    if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED:
+        pools = market_structure.find_liquidity_pools(
+            market_structure.find_swing_points(ltf_candles)
+        )
+        sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
+
+    if live_break.get("broken"):
+        direction = live_break["direction"]
+        structure_level = live_break.get("level")
+        trigger_candle_open_time = live_break.get("open_time")
+        signal_trigger = "STRUCTURE_BREAK"
+    elif config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:
+        direction = sweep["direction"]
+        structure_level = sweep.get("level")
+        # No candle-close-confirmation concept applies to a sweep the way
+        # it does to a structure break (see
+        # position_manager.resolve_break_confirmations, which already
+        # skips gracefully whenever this is None - same path already used
+        # for startup-reconciliation-adopted positions).
+        trigger_candle_open_time = None
+        signal_trigger = "LIQUIDITY_SWEEP"
+    else:
         return _reject("NO_LIVE_STRUCTURE_BREAK")
 
-    direction = live_break["direction"]
     side = _BULLISH_TO_SIDE.get(direction)
 
     if side is None:
@@ -201,10 +232,16 @@ def evaluate(
         if side == "SELL" and depth_imbalance > min_depth:
             return _reject("DEPTH_OPPOSING")
 
-    pools = market_structure.find_liquidity_pools(
-        market_structure.find_swing_points(ltf_candles)
-    )
-    sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
+    if pools is None:
+        # Not already computed above - either LIQUIDITY_SWEEP_TRIGGER_ENABLED
+        # is off, or it's on but the structure break fired first and this
+        # candidate never needed sweep as a trigger. Still worth computing
+        # now for the sweep_confluence informational field below.
+        pools = market_structure.find_liquidity_pools(
+            market_structure.find_swing_points(ltf_candles)
+        )
+        sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
+
     sweep_confluence = bool(sweep and sweep["direction"] == direction)
 
     # Chop/volatility regime: informational only, NOT a gate. A structure
@@ -279,8 +316,9 @@ def evaluate(
         "symbol": symbol,
         "entry_price": latest_price,
         "htf_trend": htf_structure.get("trend"),
-        "structure_level": live_break.get("level"),
-        "trigger_candle_open_time": live_break.get("open_time"),
+        "structure_level": structure_level,
+        "trigger_candle_open_time": trigger_candle_open_time,
+        "signal_trigger": signal_trigger,
         "quote_volume_usdt": quote_volume_usdt,
         "order_block": order_block,
         "fvg": matching_fvg,

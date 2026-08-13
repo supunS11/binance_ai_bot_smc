@@ -362,6 +362,26 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("By funding favorable (informational):", report)
         self.assertIn("By long/short favorable (informational):", report)
 
+    def test_summarize_breaks_down_by_entry_trigger(self):
+        # config.LIQUIDITY_SWEEP_TRIGGER_ENABLED - lets win rate be
+        # compared by trigger type before the sweep path is trusted as
+        # much as the existing structure-break path.
+        _write_trade(
+            self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", signal_trigger="STRUCTURE_BREAK",
+        )
+        _write_trade(
+            self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", signal_trigger="LIQUIDITY_SWEEP",
+        )
+        _write_trade(
+            self.journal_path, "C", "SOLUSDT", outcome="TP2_HIT", signal_trigger="LIQUIDITY_SWEEP",
+        )
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By entry trigger:", report)
+        self.assertIn("STRUCTURE_BREAK: n=1", report)
+        self.assertIn("LIQUIDITY_SWEEP: n=2", report)
+
     def test_no_trades_in_window_gives_a_clear_message(self):
         _write_trade(self.journal_path, "OLD", "BTCUSDT", outcome="TP2_HIT", closed_at=1000.0)
 

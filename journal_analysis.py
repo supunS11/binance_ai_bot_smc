@@ -361,6 +361,7 @@ def summarize(journal_path=None, since_timestamp=None):
     # vs. everything that did fill), not just the WIN/LOSS/BREAKEVEN roll-up above.
     lines += _breakdown_lines(resolved, "outcome", lambda t: t.get("outcome", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
+    lines += _breakdown_lines(resolved, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
     lines += _breakdown_lines(resolved, "EMA aligned (informational)", lambda t: t.get("ema_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")

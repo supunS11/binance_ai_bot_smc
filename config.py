@@ -247,6 +247,20 @@ LONG_SHORT_RATIO_CROWD_THRESHOLD = env_float("LONG_SHORT_RATIO_CROWD_THRESHOLD",
 # latency. Reversible at zero cost if the next batch doesn't show
 # separation - see market_structure.live_break_check.
 REQUIRE_CLOSE_CONFIRMED_BREAK = env_bool("REQUIRE_CLOSE_CONFIRMED_BREAK", "True")
+# Second, alternative entry trigger alongside a live LTF structure break -
+# a detected liquidity sweep (liquidity_sweep.detect_sweep: a wick through
+# a known pool that closes back inside, the "run the stops then reverse"
+# pattern), for symbols whose price rarely produces a clean structure
+# break but does sweep organized liquidity (equal highs/lows, round
+# numbers on major caps). Both triggers feed the SAME downstream pipeline
+# (HTF bias, zone/OTE, order block/FVG, CVD/depth, extension cap, sizing)
+# - never two independent pipelines, so at most one signal per symbol per
+# eval tick regardless of which trigger(s) fire. Every signal is tagged
+# signal_trigger=STRUCTURE_BREAK/LIQUIDITY_SWEEP (journaled) so win rate
+# can be broken down by trigger before this path is trusted as much as
+# the existing one. Default OFF, same convention as every other feature
+# this session.
+LIQUIDITY_SWEEP_TRIGGER_ENABLED = env_bool("LIQUIDITY_SWEEP_TRIGGER_ENABLED", "False")
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

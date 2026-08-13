@@ -55,6 +55,7 @@ class SignalEngineTests(unittest.TestCase):
         ltf_analysis=None,
         order_block=None,
         sweep_direction="BULLISH",
+        sweep_level=None,
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -69,7 +70,7 @@ class SignalEngineTests(unittest.TestCase):
         htf_structure = HTF_BULLISH if htf_structure is None else htf_structure
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
-        sweep = {"direction": sweep_direction} if sweep_direction else None
+        sweep = {"direction": sweep_direction, "level": sweep_level} if sweep_direction else None
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
         liquidation_snapshot = (
             LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
@@ -99,6 +100,7 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertTrue(result["sweep_confluence"])
         self.assertEqual(result["premium_discount_zone"], "DISCOUNT")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
 
     def test_full_sell_signal_when_everything_aligns(self):
         result = self._run(
@@ -114,6 +116,7 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "SELL")
         self.assertTrue(result["sweep_confluence"])
         self.assertEqual(result["premium_discount_zone"], "PREMIUM")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
 
     def test_no_signal_when_htf_structure_unavailable(self):
         result = self._run(htf_structure={"available": False})
@@ -539,6 +542,136 @@ class SignalEngineTests(unittest.TestCase):
     def test_no_signal_without_ltf_candles(self):
         result = signal_engine.evaluate("BTCUSDT", ["htf"], [], {}, {})
         self.assertEqual(result["reason"], "INSUFFICIENT_CANDLES")
+
+    # config.LIQUIDITY_SWEEP_TRIGGER_ENABLED - a second, alternative entry
+    # trigger alongside a live LTF structure break, feeding the exact same
+    # downstream pipeline (never a second independent pipeline - see
+    # config.py's comment for why).
+
+    def test_sweep_only_candidate_rejects_when_sweep_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run(ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_sweep_triggered_signal_when_no_break_but_sweep_trigger_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "LIQUIDITY_SWEEP")
+        self.assertEqual(result["structure_level"], 89)
+        self.assertIsNone(result["trigger_candle_open_time"])
+        self.assertTrue(result["sweep_confluence"])  # sweep is its own trigger, necessarily aligned
+
+    def test_structure_break_takes_priority_over_a_simultaneous_sweep(self):
+        # LTF_BULLISH_BREAK (level=90) is still active; sweep direction
+        # deliberately conflicts (BEARISH) to prove the break wins outright
+        # and sweep_confluence stays independently honest about the
+        # disagreement, rather than silently blending the two.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(sweep_direction="BEARISH", sweep_level=77)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        self.assertEqual(result["structure_level"], 90)  # from the break, not sweep's 77
+        self.assertFalse(result["sweep_confluence"])
+
+    def test_no_signal_when_neither_break_nor_sweep_even_with_trigger_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_sweep_triggered_signal_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_sweep_triggered_signal_still_requires_order_block_or_fvg(self):
+        analysis = dict(LTF_BULLISH_BREAK, fair_value_gaps=[])
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "REQUIRE_ORDER_BLOCK_OR_FVG", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89, order_block=None,
+            )
+
+        self.assertEqual(result["reason"], "NO_ORDER_BLOCK_OR_FVG")
+
+    def test_sweep_triggered_signal_still_gated_by_cvd(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction="BULLISH", sweep_level=89,
+                cvd={"available": True, "cvd_score": 0.05},
+            )
+
+        self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
+
+    def test_pools_and_sweep_computed_exactly_once_when_break_triggered_flag_off(self):
+        with patch.object(market_structure, "structure_state", return_value=HTF_BULLISH), \
+             patch.object(market_structure, "premium_discount_zone", return_value=ZONE), \
+             patch.object(market_structure, "analyze", return_value=LTF_BULLISH_BREAK), \
+             patch.object(market_structure, "find_order_block", return_value=None), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]) as mock_pools, \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
+             patch.object(market_structure, "price_correlation", return_value=0.5), \
+             patch.object(market_structure, "price_return", return_value=0.02), \
+             patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 89}) as mock_detect, \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            signal_engine.evaluate(
+                "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
+                {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
+                oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
+            )
+
+        self.assertEqual(mock_pools.call_count, 1)
+        self.assertEqual(mock_detect.call_count, 1)
+
+    def test_pools_and_sweep_computed_exactly_once_when_break_triggered_flag_on(self):
+        with patch.object(market_structure, "structure_state", return_value=HTF_BULLISH), \
+             patch.object(market_structure, "premium_discount_zone", return_value=ZONE), \
+             patch.object(market_structure, "analyze", return_value=LTF_BULLISH_BREAK), \
+             patch.object(market_structure, "find_order_block", return_value=None), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]) as mock_pools, \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
+             patch.object(market_structure, "price_correlation", return_value=0.5), \
+             patch.object(market_structure, "price_return", return_value=0.02), \
+             patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 89}) as mock_detect, \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            signal_engine.evaluate(
+                "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
+                {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
+                oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
+            )
+
+        self.assertEqual(mock_pools.call_count, 1)
+        self.assertEqual(mock_detect.call_count, 1)
 
 
 class LongShortFavorableTests(unittest.TestCase):

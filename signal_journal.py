@@ -26,7 +26,7 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
+    "structure_level", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
     "liquidation_cluster", "liquidation_aligned", "efficiency_ratio", "efficiency_favorable",
@@ -113,6 +113,7 @@ def append_signal(signal, plan):
             round(risk_distance / entry_price * 100, 4) if entry_price else ""
         ),
         "structure_level": signal.get("structure_level"),
+        "signal_trigger": signal.get("signal_trigger"),
         "atr": signal.get("atr"),
         "ema_value": signal.get("ema_value"),
         "ema_aligned": signal.get("ema_aligned"),
