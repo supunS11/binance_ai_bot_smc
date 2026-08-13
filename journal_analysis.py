@@ -171,6 +171,26 @@ def _bucket_funding_rate(value):
     return "-0.05% to 0.05% (neutral)"
 
 
+def _bucket_extension_r(value):
+    """How far entry_price had already run past structure_level, in R, at
+    signal time (see signal_journal.py's entry_extension_r comment) - the
+    hypothesis this buckets is "wrong from the first tick" losses chasing
+    an already-exhausted move, distinct from (and not covered by) any of
+    the existing informational fields."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < 0:
+        return "<0R (entry at/before the level)"
+    if value < 0.2:
+        return "0-0.2R (tight)"
+    if value < 0.5:
+        return "0.2-0.5R (extended - limit-routed if LIMIT_ENTRY_MODE_ENABLED)"
+    return ">=0.5R (should be rare - normally rejected outright)"
+
+
 def _bucket_long_short_ratio(value):
     try:
         value = float(value)
@@ -393,6 +413,7 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "side (BUY/SELL)", lambda t: t.get("side", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
     lines += _breakdown_lines(resolved, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
+    lines += _breakdown_lines(resolved, "entry extension (chase distance from the level)", lambda t: _bucket_extension_r(t.get("entry_extension_r")))
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
     lines += _breakdown_lines(resolved, "EMA aligned (informational)", lambda t: t.get("ema_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")
@@ -429,6 +450,7 @@ def summarize(journal_path=None, since_timestamp=None):
         )
         lines += _breakdown_lines(near_zero_mfe_losses, "side (BUY/SELL)", lambda t: t.get("side", "unknown") or "unknown")
         lines += _breakdown_lines(near_zero_mfe_losses, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
+        lines += _breakdown_lines(near_zero_mfe_losses, "entry extension (chase distance from the level)", lambda t: _bucket_extension_r(t.get("entry_extension_r")))
         lines += _breakdown_lines(near_zero_mfe_losses, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
         lines += _breakdown_lines(near_zero_mfe_losses, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
         lines += _breakdown_lines(near_zero_mfe_losses, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")

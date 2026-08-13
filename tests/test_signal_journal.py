@@ -117,6 +117,12 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["funding_favorable"], "False")
         self.assertEqual(rows[0]["long_short_favorable"], "True")
 
+    def test_append_signal_writes_entry_extension_r_from_the_plan(self):
+        signal_journal.append_signal(_signal(), _plan(entry_extension_r=0.35))
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["entry_extension_r"], "0.35")
+
     def test_zero_entry_price_does_not_crash_risk_distance_calc(self):
         signal_journal.append_signal(_signal(), _plan(entry_price=0))
         rows = self._read_rows()

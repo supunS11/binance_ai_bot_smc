@@ -148,6 +148,19 @@ class NewDataSourceBucketTests(unittest.TestCase):
         self.assertEqual(ja._bucket_long_short_ratio(1.5), ">1.2 (long-heavy)")
         self.assertEqual(ja._bucket_long_short_ratio(None), "unknown")
 
+    def test_extension_r_buckets(self):
+        self.assertEqual(ja._bucket_extension_r(-0.1), "<0R (entry at/before the level)")
+        self.assertEqual(ja._bucket_extension_r(0.1), "0-0.2R (tight)")
+        self.assertEqual(
+            ja._bucket_extension_r(0.35),
+            "0.2-0.5R (extended - limit-routed if LIMIT_ENTRY_MODE_ENABLED)",
+        )
+        self.assertEqual(
+            ja._bucket_extension_r(0.7),
+            ">=0.5R (should be rare - normally rejected outright)",
+        )
+        self.assertEqual(ja._bucket_extension_r(None), "unknown")
+
 
 class LoadTradesAndSummarizeTests(unittest.TestCase):
     def setUp(self):

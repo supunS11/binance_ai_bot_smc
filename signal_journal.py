@@ -26,7 +26,7 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
+    "structure_level", "entry_extension_r", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
     "liquidation_cluster", "liquidation_aligned", "efficiency_ratio", "efficiency_favorable",
@@ -113,6 +113,18 @@ def append_signal(signal, plan):
             round(risk_distance / entry_price * 100, 4) if entry_price else ""
         ),
         "structure_level": signal.get("structure_level"),
+        # How far entry_price had already run past structure_level, in R,
+        # at the moment this trade was taken (risk_manager.build_trade_plan's
+        # entry_extension_r - already computed and used for market/limit
+        # routing and the MAX_ENTRY_EXTENSION_R reject, but never
+        # journaled before now). Added specifically to test whether
+        # "wrong from the first tick" LOSS trades (see
+        # journal_analysis.py's near-zero-MFE cohort breakdown) are
+        # systematically entering on an already-exhausted move - none of
+        # the other informational fields (CVD, sweep, EMA, OI) discriminate
+        # that cohort from the rest, so this is the next real hypothesis
+        # worth having evidence for.
+        "entry_extension_r": plan.get("entry_extension_r"),
         "signal_trigger": signal.get("signal_trigger"),
         "atr": signal.get("atr"),
         "ema_value": signal.get("ema_value"),
