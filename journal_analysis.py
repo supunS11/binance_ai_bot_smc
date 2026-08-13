@@ -294,6 +294,36 @@ def _loss_mfe_distribution(resolved, sanity_bound=_MAE_MFE_SANITY_BOUND):
     return lines
 
 
+_NEAR_ZERO_MFE_THRESHOLD = _LOSS_MFE_BUCKETS[0][1]  # matches the first bucket above
+
+
+def _near_zero_mfe_losses(resolved, threshold=_NEAR_ZERO_MFE_THRESHOLD, sanity_bound=_MAE_MFE_SANITY_BOUND):
+    """The LOSS trades that never even briefly moved in the trade's favor
+    - the "wrong from the first tick" cohort _loss_mfe_distribution above
+    already surfaces as a single aggregate count. Isolating them lets
+    every other breakdown dimension (side, trigger, HTF trend, CVD
+    strength...) be reused against JUST this cohort instead of the full
+    resolved population, which dilutes the signal by mixing in every WIN/
+    BREAKEVEN trade and the LOSS trades that ran deep in profit before
+    reversing (a real, but completely different, trade-management
+    problem - not a directional one)."""
+    losses = {}
+
+    for trade_id, trade in resolved.items():
+        if classify(trade.get("outcome", "")) != "LOSS":
+            continue
+
+        try:
+            mfe = float(trade.get("mfe_r_multiple"))
+        except (TypeError, ValueError):
+            continue
+
+        if 0 <= mfe < threshold and mfe <= sanity_bound:
+            losses[trade_id] = trade
+
+    return losses
+
+
 def _breakdown_lines(resolved, label, key_fn):
     lines = [f"\nBy {label}:"]
     buckets = defaultdict(lambda: defaultdict(int))
@@ -388,6 +418,23 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _average_by_outcome(resolved, "MAE (adverse excursion)", "mae_r_multiple")
     lines += _average_by_outcome(resolved, "MFE (favorable excursion)", "mfe_r_multiple")
     lines += _loss_mfe_distribution(resolved)
+
+    near_zero_mfe_losses = _near_zero_mfe_losses(resolved)
+
+    if near_zero_mfe_losses:
+        lines.append(
+            f"\n--- Near-zero-MFE LOSS trades only (n={len(near_zero_mfe_losses)}) - "
+            "what characterizes a genuinely wrong-direction/timing entry, "
+            "isolated from the rest of the LOSS population ---"
+        )
+        lines += _breakdown_lines(near_zero_mfe_losses, "side (BUY/SELL)", lambda t: t.get("side", "unknown") or "unknown")
+        lines += _breakdown_lines(near_zero_mfe_losses, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
+        lines += _breakdown_lines(near_zero_mfe_losses, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
+        lines += _breakdown_lines(near_zero_mfe_losses, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
+        lines += _breakdown_lines(near_zero_mfe_losses, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
+        lines += _breakdown_lines(near_zero_mfe_losses, "24h quote volume (liquidity floor)", lambda t: _bucket_volume(t.get("quote_volume_usdt")))
+        lines += _breakdown_lines(near_zero_mfe_losses, "efficiency ratio (chop vs trend)", lambda t: _bucket_efficiency(t.get("efficiency_ratio")))
+        lines += _breakdown_lines(near_zero_mfe_losses, "symbol", lambda t: t.get("symbol", "unknown"))
 
     return "\n".join(lines)
 

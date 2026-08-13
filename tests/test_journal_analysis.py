@@ -448,5 +448,58 @@ class LossMfeDistributionTests(unittest.TestCase):
         self.assertIn("(no LOSS trades with mfe_r_multiple recorded yet)", report)
 
 
+class NearZeroMfeLossBreakdownTests(unittest.TestCase):
+    """The isolated-cohort breakdown (side/trigger/HTF trend/CVD/etc.)
+    restricted to just the near-zero-MFE LOSS trades - the diagnostic for
+    telling apart a genuinely wrong-direction/timing entry from the
+    unrelated "ran deep in profit then reversed" LOSS population, which
+    would otherwise dilute any breakdown run against all LOSS trades."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.journal_path = Path(self.tmpdir.name) / "journal.csv"
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_breaks_down_the_near_zero_cohort_by_side_and_trigger(self):
+        _write_trade(
+            self.journal_path, "A", "BTCUSDT", outcome="SL_HIT", mfe_r_multiple=0.05,
+            signal="BUY", signal_trigger="STRUCTURE_BREAK",
+        )
+        _write_trade(
+            self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", mfe_r_multiple=0.1,
+            signal="BUY", signal_trigger="LIQUIDITY_SWEEP",
+        )
+        # Real movement in favor before reversing - NOT part of the
+        # near-zero cohort, must not appear in the isolated breakdown.
+        _write_trade(
+            self.journal_path, "C", "SOLUSDT", outcome="SL_HIT", mfe_r_multiple=1.5,
+            signal="SELL", signal_trigger="STRUCTURE_BREAK",
+        )
+        # A WIN, also must not appear.
+        _write_trade(
+            self.journal_path, "D", "BNBUSDT", outcome="TP2_HIT", mfe_r_multiple=0.05,
+            signal="SELL", signal_trigger="STRUCTURE_BREAK",
+        )
+
+        report = ja.summarize(self.journal_path)
+
+        # n=2 total, both BUY - already proves trade C (real movement,
+        # SELL) and trade D (a WIN) didn't leak into this cohort, since
+        # there's no room left for either once both slots are BUY.
+        self.assertIn("Near-zero-MFE LOSS trades only (n=2)", report)
+        self.assertIn("BUY: n=2", report)
+        self.assertIn("STRUCTURE_BREAK: n=1", report)
+        self.assertIn("LIQUIDITY_SWEEP: n=1", report)
+
+    def test_no_near_zero_losses_omits_the_section_entirely(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SL_HIT", mfe_r_multiple=1.5)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertNotIn("Near-zero-MFE LOSS trades only", report)
+
+
 if __name__ == "__main__":
     unittest.main()
