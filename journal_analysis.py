@@ -51,6 +51,13 @@ WIN_OUTCOMES = {
     # position["early_breakeven_profit_locked"]) - distinct from
     # BREAKEVEN_STOP_HIT, which is a true zero-sum scratch.
     "EARLY_BREAKEVEN_PROFIT_HIT", "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT",
+    # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - a genuine profit lock
+    # from the post-TP1 structure-based trailing stop (position_manager
+    # only ever writes this when the trailed level actually sat above
+    # breakeven - see position["trailing_stop_locked_profit"]). Takes
+    # precedence over EARLY_BREAKEVEN_PROFIT_HIT when both flags could
+    # apply (_breakeven_stop_outcome).
+    "TRAILING_STOP_PROFIT_HIT", "SHADOW_TRAILING_STOP_PROFIT_HIT",
 }
 
 

@@ -261,9 +261,9 @@ def _poll_positions(feed, positions):
 
         if position["shadow"]:
             latest_candle = feed.candles.latest(symbol)
-            positions.poll_shadow(symbol, latest_candle)
+            positions.poll_shadow(symbol, latest_candle, candles=feed.candles.get(symbol))
         else:
-            positions.poll_live(symbol)
+            positions.poll_live(symbol, candles=feed.candles.get(symbol))
 
 
 def _resolve_break_confirmations(feed, positions):

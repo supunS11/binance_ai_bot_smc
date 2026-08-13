@@ -87,6 +87,12 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ja.classify("EARLY_BREAKEVEN_PROFIT_HIT"), "WIN")
         self.assertEqual(ja.classify("SHADOW_EARLY_BREAKEVEN_PROFIT_HIT"), "WIN")
 
+    def test_trailing_stop_profit_hit_is_win(self):
+        # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - a real profit lock
+        # from the post-TP1 structure-based trailing stop.
+        self.assertEqual(ja.classify("TRAILING_STOP_PROFIT_HIT"), "WIN")
+        self.assertEqual(ja.classify("SHADOW_TRAILING_STOP_PROFIT_HIT"), "WIN")
+
     def test_unknown_outcome_is_unknown(self):
         self.assertEqual(ja.classify("SOMETHING_ELSE"), "UNKNOWN")
 

@@ -4,8 +4,10 @@ from unittest.mock import patch
 
 import config
 import exchange
+import market_structure
 from position_manager import (
-    BREAKEVEN_ACTIVE, PENDING_LIMIT_FILL, TP1_PENDING, PositionManager, _order_type,
+    BREAKEVEN_ACTIVE, PENDING_LIMIT_FILL, TP1_PENDING, PositionManager,
+    _more_favorable, _order_type, _structure_stop_candidate,
 )
 
 
@@ -303,6 +305,16 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["tp2_order_id"], "")
         self.assertIsNotNone(position["tp1_price"])
         self.assertIsNotNone(position["tp2_price"])
+
+    def test_adopted_position_starts_with_no_trailing_profit_locked(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}):
+            manager.reconcile_on_startup()
+
+        self.assertFalse(manager.positions["BTCUSDT"]["trailing_stop_locked_profit"])
 
     def test_emergency_stop_placement_failure_does_not_raise(self):
         manager = PositionManager()
@@ -800,6 +812,441 @@ class ResolveBreakConfirmationsTests(unittest.TestCase):
         self.assertEqual(kwargs["break_confirmed_by_close"], False)
 
 
+class StructureStopCandidateTests(unittest.TestCase):
+    """config.STRUCTURE_STOP_MANAGEMENT_ENABLED - the pure "what would
+    structure say" query, independent of whether the feature is on."""
+
+    def _position(self, side="BUY", entry_price=100):
+        return {"side": side, "entry_price": entry_price}
+
+    def test_none_when_candles_falsy(self):
+        self.assertIsNone(_structure_stop_candidate(self._position(), None))
+        self.assertIsNone(_structure_stop_candidate(self._position(), []))
+
+    def test_none_when_structure_unavailable(self):
+        with patch.object(market_structure, "structure_state", return_value={"available": False}):
+            self.assertIsNone(_structure_stop_candidate(self._position(), ["candle"]))
+
+    def test_none_when_no_swing_in_the_favorable_direction(self):
+        with patch.object(
+            market_structure, "structure_state",
+            return_value={"available": True, "last_swing_low": None},
+        ):
+            self.assertIsNone(_structure_stop_candidate(self._position(side="BUY"), ["candle"]))
+
+    def test_buy_uses_swing_when_it_beats_breakeven(self):
+        with patch.object(
+            market_structure, "structure_state",
+            return_value={"available": True, "last_swing_low": 100.5},
+        ):
+            candidate = _structure_stop_candidate(self._position(side="BUY"), ["candle"])
+        self.assertAlmostEqual(candidate, 100.5)  # 100.5 > breakeven(~100.02)
+
+    def test_buy_clamps_to_breakeven_when_swing_is_worse(self):
+        with patch.object(
+            market_structure, "structure_state",
+            return_value={"available": True, "last_swing_low": 99.0},
+        ):
+            candidate = _structure_stop_candidate(self._position(side="BUY"), ["candle"])
+        self.assertAlmostEqual(candidate, 100.02)  # clamped up to breakeven, not 99.0
+
+    def test_sell_uses_swing_when_it_beats_breakeven(self):
+        with patch.object(
+            market_structure, "structure_state",
+            return_value={"available": True, "last_swing_high": 99.5},
+        ):
+            candidate = _structure_stop_candidate(self._position(side="SELL"), ["candle"])
+        self.assertAlmostEqual(candidate, 99.5)  # 99.5 < breakeven(~99.98)
+
+    def test_sell_clamps_to_breakeven_when_swing_is_worse(self):
+        with patch.object(
+            market_structure, "structure_state",
+            return_value={"available": True, "last_swing_high": 101.0},
+        ):
+            candidate = _structure_stop_candidate(self._position(side="SELL"), ["candle"])
+        self.assertAlmostEqual(candidate, 99.98)  # clamped down to breakeven, not 101.0
+
+
+class MoreFavorableTests(unittest.TestCase):
+    def test_buy_higher_is_more_favorable(self):
+        self.assertTrue(_more_favorable("BUY", 101, 100))
+        self.assertFalse(_more_favorable("BUY", 99, 100))
+        self.assertFalse(_more_favorable("BUY", 100, 100))  # strict, not >=
+
+    def test_sell_lower_is_more_favorable(self):
+        self.assertTrue(_more_favorable("SELL", 99, 100))
+        self.assertFalse(_more_favorable("SELL", 101, 100))
+        self.assertFalse(_more_favorable("SELL", 100, 100))
+
+
+class EarlyBreakevenLockPriceTests(unittest.TestCase):
+    def _position(self, side="BUY", entry_price=100, risk_distance=2.0):
+        return {"side": side, "entry_price": entry_price, "risk_distance": risk_distance}
+
+    def test_disabled_ignores_candles_and_uses_the_fixed_distance(self):
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", False), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 999},
+             ):
+            price = PositionManager._early_breakeven_lock_price(self._position(), ["candle"])
+
+        self.assertAlmostEqual(price, 100.6)  # fixed lock only - structure ignored entirely
+
+    def test_enabled_uses_the_structure_candidate_when_available(self):
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 100.8},
+             ):
+            price = PositionManager._early_breakeven_lock_price(self._position(), ["candle"])
+
+        self.assertAlmostEqual(price, 100.8)
+
+    def test_enabled_falls_back_to_fixed_distance_when_no_swing(self):
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3), \
+             patch.object(market_structure, "structure_state", return_value={"available": False}):
+            price = PositionManager._early_breakeven_lock_price(self._position(), ["candle"])
+
+        self.assertAlmostEqual(price, 100.6)
+
+    def test_enabled_falls_back_when_candles_missing(self):
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3):
+            price = PositionManager._early_breakeven_lock_price(self._position(), None)
+
+        self.assertAlmostEqual(price, 100.6)
+
+
+class ReplaceSlOrderTests(unittest.TestCase):
+    def _manager_with_position(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "sl_order": {"algoId": "sl1"},
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register(_plan(), execution_result)
+        return manager
+
+    def test_success_replaces_and_returns_replaced_true(self):
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}) as place:
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason"
+            )
+
+        self.assertIsNone(outcome)
+        self.assertTrue(replaced)
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_order_id"], "sl_new")
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 101.0)
+        cancel.assert_called_once_with("BTCUSDT", "sl1")
+        place.assert_called_once_with("BTCUSDT", "BUY", 101.0)
+
+    def test_uses_the_real_exchange_order_not_a_stale_local_id(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["sl_order_id"] = "stale_local_id"
+        real_sl = {"type": "STOP_MARKET", "closePosition": True, "algoId": "real_sl_on_exchange"}
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[real_sl]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}):
+            manager._replace_sl_order(manager.positions["BTCUSDT"], 101.0, "test reason")
+
+        cancel.assert_called_once_with("BTCUSDT", "real_sl_on_exchange")
+
+    def test_ground_truth_check_fails_retries_without_replacing(self):
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "_fetch_open_position_detail", side_effect=RuntimeError("timeout")), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss") as place:
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason"
+            )
+
+        self.assertIsNone(outcome)
+        self.assertFalse(replaced)
+        cancel.assert_not_called()
+        place.assert_not_called()
+
+    def test_already_closed_with_close_if_not_open_true_calls_close(self):
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value=None), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason", close_if_not_open=True,
+            )
+
+        self.assertEqual(outcome, "TP1_THEN_POSITION_ALREADY_CLOSED")
+        self.assertFalse(replaced)
+        cancel_all.assert_called_once_with("BTCUSDT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_already_closed_with_close_if_not_open_false_does_not_call_close(self):
+        # Trailing (close_if_not_open=False) must never guess an outcome
+        # here - it would misclassify a likely protected close as a LOSS
+        # (TP1_THEN_POSITION_ALREADY_CLOSED). The next poll's own status
+        # check resolves and journals the real outcome instead.
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value=None), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason", close_if_not_open=False,
+            )
+
+        self.assertIsNone(outcome)
+        self.assertFalse(replaced)
+        cancel_all.assert_not_called()
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_minus_2021_delegates_to_close_remainder_at_market(self):
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(
+                 exchange, "place_stop_loss",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "cancel_all_open_orders"):
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason"
+            )
+
+        self.assertEqual(outcome, "BREAKEVEN_TRIGGER_MARKET_CLOSE")  # neither profit flag set
+        self.assertFalse(replaced)
+        market_close.assert_called_once()
+
+    def test_other_error_logs_and_does_not_raise(self):
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")):
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason"
+            )  # must not raise
+
+        self.assertIsNone(outcome)
+        self.assertFalse(replaced)
+
+
+class TrailStopIfImprovedTests(unittest.TestCase):
+    def _manager_with_position(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "sl_order": {"algoId": "sl1"},
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register(_plan(), execution_result)
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        manager.positions["BTCUSDT"]["sl_price"] = 100.02  # flat breakeven
+        return manager
+
+    def test_disabled_is_a_noop(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", False), \
+             patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_no_candles_is_a_noop(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], None)
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_no_swing_available_is_a_noop(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(market_structure, "structure_state", return_value={"available": False}), \
+             patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_candidate_not_more_favorable_is_a_noop(self):
+        manager = self._manager_with_position()  # sl_price=100.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 100.02},
+             ), \
+             patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_improved_candidate_replaces_the_sl(self):
+        manager = self._manager_with_position()  # sl_price=100.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}) as place:
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertIsNone(outcome)
+        place.assert_called_once_with("BTCUSDT", "BUY", 101.5)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["sl_price"], 101.5)
+        self.assertTrue(position["trailing_stop_locked_profit"])
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)  # never transitions
+
+    def test_replace_failure_does_not_set_the_locked_profit_flag(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "_fetch_open_position_detail", side_effect=RuntimeError("timeout")):
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertIsNone(outcome)
+        self.assertFalse(manager.positions["BTCUSDT"]["trailing_stop_locked_profit"])
+
+    def test_minus_2021_returns_the_market_close_outcome(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(
+                 exchange, "place_stop_loss",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "cancel_all_open_orders"):
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertEqual(outcome, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
+        market_close.assert_called_once()
+
+    def test_already_closed_ground_truth_returns_none_without_closing(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value=None), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager._trail_stop_if_improved(manager.positions["BTCUSDT"], ["candle"])
+
+        self.assertIsNone(outcome)
+        cancel_all.assert_not_called()
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+
+class BreakevenStopOutcomeTests(unittest.TestCase):
+    def test_trailing_takes_precedence_over_early_lock(self):
+        position = {"trailing_stop_locked_profit": True, "early_breakeven_profit_locked": True}
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=False), "TRAILING_STOP_PROFIT_HIT"
+        )
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=True), "SHADOW_TRAILING_STOP_PROFIT_HIT"
+        )
+
+    def test_early_lock_when_no_trailing(self):
+        position = {"trailing_stop_locked_profit": False, "early_breakeven_profit_locked": True}
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=False), "EARLY_BREAKEVEN_PROFIT_HIT"
+        )
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=True), "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT"
+        )
+
+    def test_flat_scratch_when_neither(self):
+        position = {"trailing_stop_locked_profit": False, "early_breakeven_profit_locked": False}
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=False), "BREAKEVEN_STOP_HIT"
+        )
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=True), "SHADOW_BREAKEVEN_STOP_HIT"
+        )
+
+    def test_missing_flags_default_to_flat_scratch(self):
+        self.assertEqual(PositionManager._breakeven_stop_outcome({}, shadow=False), "BREAKEVEN_STOP_HIT")
+
+
+class EarlyBreakevenProfitLockedDerivationTests(unittest.TestCase):
+    """Real correctness fix: the flag used to be set from the CONFIG value
+    (EARLY_BREAKEVEN_LOCK_R_MULTIPLE > 0), not the actual computed price -
+    with structure-awareness on, a real profit lock can happen even when
+    the config multiple is 0 (structure alone provides it), which the old
+    logic would have silently misclassified as a flat scratch."""
+
+    def test_structure_candidate_above_breakeven_sets_the_flag_even_with_zero_config_lock(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "sl_order": {"algoId": "sl1"},
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register(_plan(), execution_result)
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
+             patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.0},
+             ), \
+             patch.object(exchange, "get_mark_price", return_value=102.0), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl2"}):
+            manager.poll_live("BTCUSDT", candles=["candle"])
+
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["early_breakeven_profit_locked"])
+        self.assertEqual(position["sl_price"], 101.0)
+
+
 class PollShadowTests(unittest.TestCase):
     def setUp(self):
         # EARLY_BREAKEVEN_ENABLED now defaults True and is no longer
@@ -982,6 +1429,79 @@ class PollShadowTests(unittest.TestCase):
         _, kwargs = append_outcome.call_args
         self.assertAlmostEqual(kwargs["mae_r_multiple"], 1.5)  # (100-97)/2
         self.assertAlmostEqual(kwargs["mfe_r_multiple"], 0.5)  # (101-100)/2
+
+    def test_trailing_applies_a_tighter_sl_mid_breakeven_active(self):
+        manager = self._manager_with_position()
+        manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to flat breakeven
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ):
+            outcome = manager.poll_shadow(
+                "BTCUSDT", _candle(high=102, low=101.6), candles=["candle"]
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["sl_price"], 101.5)
+        self.assertTrue(position["trailing_stop_locked_profit"])
+
+    def test_trailing_does_not_apply_when_disabled_even_with_candles_present(self):
+        manager = self._manager_with_position()
+        manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to flat breakeven
+        original_sl = manager.positions["BTCUSDT"]["sl_price"]
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", False), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ):
+            manager.poll_shadow("BTCUSDT", _candle(high=102, low=101.6), candles=["candle"])
+
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], original_sl)
+
+    def test_trailing_does_not_loosen_the_stop(self):
+        manager = self._manager_with_position()
+        manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to flat breakeven
+        original_sl = manager.positions["BTCUSDT"]["sl_price"]
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 90.0},  # worse than breakeven
+             ):
+            manager.poll_shadow("BTCUSDT", _candle(high=102, low=101), candles=["candle"])
+
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], original_sl)
+
+    def test_tp2_hit_short_circuits_before_trailing_is_attempted(self):
+        manager = self._manager_with_position()
+        manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to flat breakeven
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(market_structure, "structure_state") as structure_mock:
+            outcome = manager.poll_shadow(
+                "BTCUSDT", _candle(high=105, low=101), candles=["candle"]
+            )  # tp2(104) hit
+
+        self.assertEqual(outcome, "SHADOW_TP2_HIT")
+        structure_mock.assert_not_called()
+
+    def test_trailed_profit_reported_as_trailing_stop_profit_hit(self):
+        manager = self._manager_with_position()
+        manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to flat breakeven
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ):
+            manager.poll_shadow("BTCUSDT", _candle(high=102, low=101.6), candles=["candle"])
+
+        outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.6, low=101.4))  # low <= 101.5
+        self.assertEqual(outcome, "SHADOW_TRAILING_STOP_PROFIT_HIT")
 
 
 class PollLiveTests(unittest.TestCase):
@@ -1418,6 +1938,90 @@ class PollLiveTests(unittest.TestCase):
 
         mark_price_mock.assert_called_once_with("BTCUSDT")
         self.assertEqual(manager.positions["BTCUSDT"]["mfe_price"], 101.0)
+
+    def test_trailing_applies_a_tighter_sl_mid_breakeven_active(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        manager.positions["BTCUSDT"]["sl_price"] = 100.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}) as place:
+            outcome = manager.poll_live("BTCUSDT", candles=["candle"])
+
+        self.assertIsNone(outcome)
+        place.assert_called_once_with("BTCUSDT", "BUY", 101.5)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["sl_price"], 101.5)
+        self.assertTrue(position["trailing_stop_locked_profit"])
+
+    def test_trailing_does_not_apply_when_disabled_even_with_candles_present(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        manager.positions["BTCUSDT"]["sl_price"] = 100.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", False), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "place_stop_loss") as place:
+            manager.poll_live("BTCUSDT", candles=["candle"])
+
+        place.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 100.02)
+
+    def test_tp2_finished_short_circuits_before_trailing_is_attempted(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp2_1" else "NEW"
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
+             patch.object(market_structure, "structure_state") as structure_mock:
+            outcome = manager.poll_live("BTCUSDT", candles=["candle"])
+
+        self.assertEqual(outcome, "TP2_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
+        structure_mock.assert_not_called()
+
+    def test_trailed_profit_reported_as_trailing_stop_profit_hit(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        manager.positions["BTCUSDT"]["sl_price"] = 100.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 101.5},
+             ), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}):
+            manager.poll_live("BTCUSDT", candles=["candle"])  # trails sl_price -> 101.5
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "sl_trailed" else "NEW"
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "TRAILING_STOP_PROFIT_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
 
 
 def _pending_order_status(status, executed_qty=0.0, avg_price=0.0, orig_qty=1.0):

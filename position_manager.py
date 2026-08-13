@@ -14,6 +14,7 @@ import time
 
 import config
 import exchange
+import market_structure
 import risk_manager
 import signal_journal
 from logger import log_error, log_info, log_warning
@@ -44,6 +45,48 @@ def _safe_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _structure_stop_candidate(position, candles):
+    """config.STRUCTURE_STOP_MANAGEMENT_ENABLED - the most recent
+    CONFIRMED swing point in the position's favor (last_swing_low for
+    BUY, last_swing_high for SELL), clamped so it can never sit worse
+    than flat breakeven. None if candles is falsy, structure isn't
+    available yet, or no swing has formed in the favorable direction -
+    callers fall back to the fixed-distance calculation in that case.
+    Shared by the early-breakeven lock and the post-TP1 trailing stop -
+    same mechanism, two trigger points. Does NOT itself check
+    config.STRUCTURE_STOP_MANAGEMENT_ENABLED - callers gate on that so
+    this stays a pure "what would structure say" query, independent of
+    whether the feature is currently enabled."""
+    if not candles:
+        return None
+
+    structure = market_structure.structure_state(candles)
+
+    if not structure.get("available"):
+        return None
+
+    side = position["side"]
+    swing = (
+        structure.get("last_swing_low") if side == "BUY"
+        else structure.get("last_swing_high")
+    )
+
+    if swing is None:
+        return None
+
+    breakeven = risk_manager.compute_breakeven_price(position["entry_price"], side)
+    return max(swing, breakeven) if side == "BUY" else min(swing, breakeven)
+
+
+def _more_favorable(side, price, reference):
+    """True if `price` sits strictly further in the position's favor
+    than `reference` (BUY: higher is better; SELL: lower is better).
+    Used both as the trailing stop's ratchet-only gate (never loosen)
+    and to classify whether a given stop level actually locks in more
+    than flat breakeven."""
+    return price > reference if side == "BUY" else price < reference
 
 
 class PositionManager:
@@ -123,6 +166,12 @@ class PositionManager:
             # See _promote_to_breakeven and the EARLY_BREAKEVEN_PROFIT_HIT
             # outcome.
             "early_breakeven_profit_locked": False,
+            # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
+            # a post-TP1 trailing stop replacement actually locked in more
+            # than flat breakeven (see _trail_stop_if_improved and the
+            # TRAILING_STOP_PROFIT_HIT outcome) - takes precedence over
+            # early_breakeven_profit_locked in _breakeven_stop_outcome.
+            "trailing_stop_locked_profit": False,
             "mae_price": plan["entry_price"],
             "mfe_price": plan["entry_price"],
             # Fixed at entry, never touched again - see
@@ -178,6 +227,12 @@ class PositionManager:
             "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
+            # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
+            # a post-TP1 trailing stop replacement actually locked in more
+            # than flat breakeven (see _trail_stop_if_improved and the
+            # TRAILING_STOP_PROFIT_HIT outcome) - takes precedence over
+            # early_breakeven_profit_locked in _breakeven_stop_outcome.
+            "trailing_stop_locked_profit": False,
             # Tracking a not-yet-real fill's excursion is meaningless -
             # seeded with a real price only once poll_pending_entry sees
             # an actual fill (_apply_pending_fill).
@@ -358,6 +413,12 @@ class PositionManager:
             "confluence_ratio": None,
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
+            # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
+            # a post-TP1 trailing stop replacement actually locked in more
+            # than flat breakeven (see _trail_stop_if_improved and the
+            # TRAILING_STOP_PROFIT_HIT outcome) - takes precedence over
+            # early_breakeven_profit_locked in _breakeven_stop_outcome.
+            "trailing_stop_locked_profit": False,
             # MAE/MFE tracking effectively restarts here too - there's no
             # way to recover the price path from before this restart.
             "mae_price": entry_price,
@@ -513,30 +574,32 @@ class PositionManager:
         mfe_r = round(abs(entry_price - mfe_price) / risk_distance, 4)
         return mae_r, mfe_r
 
-    def _promote_to_breakeven(self, position, reason="TP1 filled", target_price=None):
-        """Runs once TP1 is detected as filled (or, via `reason`, when a
-        trade earns an early promotion before TP1 by reaching
-        EARLY_BREAKEVEN_R_MULTIPLE in profit - see
-        _is_early_breakeven_candidate). This is where a position can
-        legitimately have already closed entirely (the original SL
-        firing in the same window as TP1, or manual intervention) - so the
-        ground truth is checked on the exchange first rather than assuming
-        the remainder is still there. Returns an outcome string if the
-        position closed as part of this call, otherwise None - the retry
-        must never be silently repeated forever with no state change and
-        no escape hatch, since that can leave a position genuinely
-        unprotected between a failed cancel and a failed replace.
+    def _replace_sl_order(
+        self, position, target_price, reason,
+        close_if_not_open=True, not_open_outcome="TP1_THEN_POSITION_ALREADY_CLOSED",
+    ):
+        """Ground-truth cancel/replace of whatever SL is ACTUALLY sitting
+        on the exchange (never a possibly-stale local id - a stale/wrong
+        id cancels nothing, leaves the real order in place, and the
+        placement below then fails with -4130 "already existing" every
+        single poll forever). Shared by _promote_to_breakeven (the
+        one-time TP1/early-breakeven promotion) and _trail_stop_if_improved
+        (the repeated post-TP1 ratchet) - the atomic replace discipline
+        must not be duplicated between them.
 
-        `target_price` defaults to the flat (fee-buffer-only) breakeven
-        price for a genuine TP1 fill; the early-breakeven caller passes a
-        real locked-profit price instead (see
-        risk_manager.compute_early_breakeven_price)."""
+        Returns (outcome, replaced):
+        - outcome: a close-outcome string if the position closed as a
+          side effect of this call (only when close_if_not_open=True and
+          it's already gone, or a -2021 forced a market-close of the
+          remainder), else None.
+        - replaced: True only if cancel+place both succeeded, in which
+          case position["sl_order_id"]/["sl_price"] are already updated.
+
+        Never touches position["stage"] - that responsibility stays with
+        the caller (_promote_to_breakeven transitions to BREAKEVEN_ACTIVE
+        on success; _trail_stop_if_improved never transitions at all,
+        since it only ever runs once a position is already there)."""
         symbol = position["symbol"]
-        target_price = position["breakeven_price"] if target_price is None else target_price
-
-        if not config.MOVE_SL_TO_BREAKEVEN_AFTER_TP1:
-            position["stage"] = BREAKEVEN_ACTIVE
-            return None
 
         try:
             live_position = exchange._fetch_open_position_detail(symbol)
@@ -544,21 +607,30 @@ class PositionManager:
             # Couldn't confirm ground truth this cycle (network/backoff) -
             # do nothing rather than guess; the next poll tries again.
             log_warning(f"{symbol} position-state check failed, retrying next poll: {exc}")
-            return None
+            return None, False
 
         if live_position is None:
-            # TP1 filling coincided with the position closing entirely
-            # (e.g. the original SL also triggered) - nothing left to
-            # promote. Stop retrying a doomed replacement.
-            exchange.cancel_all_open_orders(symbol)
-            return self._close(symbol, "TP1_THEN_POSITION_ALREADY_CLOSED")
+            if close_if_not_open:
+                # TP1 filling coincided with the position closing entirely
+                # (e.g. the original SL also triggered) - nothing left to
+                # promote. Stop retrying a doomed replacement.
+                exchange.cancel_all_open_orders(symbol)
+                return self._close(symbol, not_open_outcome), False
+
+            # A trailing attempt found the position already gone - do NOT
+            # guess an outcome here (it would misclassify what's likely a
+            # protected breakeven-or-better close as TP1_THEN_POSITION_ALREADY_CLOSED,
+            # a LOSS in journal_analysis.py). The next poll's ordinary
+            # sl_status/tp2_status check resolves and journals the real
+            # outcome instead.
+            log_warning(
+                f"{symbol} position already closed by the time a SL "
+                f"replacement was attempted - leaving it for the next "
+                f"poll's own status check to resolve"
+            )
+            return None, False
 
         try:
-            # Cancel whatever SL is *actually* sitting on the exchange,
-            # not just whatever id local tracking happens to have - a
-            # stale/wrong local id cancels nothing, leaves the real order
-            # in place, and the placement below then fails with -4130
-            # ("already existing") every single poll forever.
             existing_sl = self._find_open_order(symbol, "STOP_MARKET", close_position=True)
 
             if existing_sl:
@@ -570,26 +642,56 @@ class PositionManager:
                 symbol, position["side"], target_price
             )
             position["sl_order_id"] = exchange._accepted_order_id(new_sl_order)
-            position["stage"] = BREAKEVEN_ACTIVE
             position["sl_price"] = target_price
             log_info(f"{symbol} {reason} | SL moved to {target_price}")
-            return None
+            return None, True
 
         except Exception as exc:
             if "-2021" in str(exc):
-                # The breakeven trigger price is already behind current
-                # price - Binance refuses to place a stop that would fire
-                # instantly. The remainder is effectively unprotected
-                # right now, so close it at market immediately instead of
-                # leaving it exposed and retrying the same failing order.
+                # The new level is already behind current price - Binance
+                # refuses to place a stop that would fire instantly. The
+                # remainder is effectively unprotected right now (the old
+                # SL is already cancelled above), so close it at market
+                # immediately instead of leaving it exposed and retrying
+                # the same failing order.
                 log_warning(
-                    f"{symbol} breakeven level already reached by price - "
+                    f"{symbol} new SL level already reached by price - "
                     "closing remainder at market"
                 )
-                return self._close_remainder_at_market(position)
+                return self._close_remainder_at_market(position), False
 
-            log_error(f"{symbol} breakeven SL replacement error: {exc}")
+            log_error(f"{symbol} SL replacement error: {exc}")
+            return None, False
+
+    def _promote_to_breakeven(self, position, reason="TP1 filled", target_price=None):
+        """Runs once TP1 is detected as filled (or, via `reason`, when a
+        trade earns an early promotion before TP1 by reaching
+        EARLY_BREAKEVEN_R_MULTIPLE in profit - see
+        _is_early_breakeven_candidate). Returns an outcome string if the
+        position closed as part of this call, otherwise None - the retry
+        must never be silently repeated forever with no state change and
+        no escape hatch, since that can leave a position genuinely
+        unprotected between a failed cancel and a failed replace.
+
+        `target_price` defaults to the flat (fee-buffer-only) breakeven
+        price for a genuine TP1 fill; the early-breakeven caller passes a
+        real locked-profit price instead (see
+        _early_breakeven_lock_price)."""
+        target_price = position["breakeven_price"] if target_price is None else target_price
+
+        if not config.MOVE_SL_TO_BREAKEVEN_AFTER_TP1:
+            position["stage"] = BREAKEVEN_ACTIVE
             return None
+
+        outcome, replaced = self._replace_sl_order(position, target_price, reason)
+
+        if outcome is not None:
+            return outcome
+
+        if replaced:
+            position["stage"] = BREAKEVEN_ACTIVE
+
+        return None
 
     def _close_remainder_at_market(self, position):
         symbol = position["symbol"]
@@ -611,7 +713,8 @@ class PositionManager:
             exchange.cancel_all_open_orders(symbol)
 
             outcome = (
-                "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
+                "TRAILING_STOP_PROFIT_HIT" if position.get("trailing_stop_locked_profit")
+                else "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
                 else "BREAKEVEN_TRIGGER_MARKET_CLOSE"
             )
             return self._close(symbol, outcome)
@@ -663,18 +766,35 @@ class PositionManager:
         return favorable_move >= trigger_distance
 
     @staticmethod
-    def _early_breakeven_lock_price(position):
-        """Where the stop goes on THIS early promotion - uses the fixed
-        `risk_distance` captured once at position start (same discipline as
-        _mae_mfe_r_multiples), not a re-derived value, since sl_price is
-        still the original (unmoved) stop at this point anyway."""
-        return risk_manager.compute_early_breakeven_price(
-            position["entry_price"], position["side"], position["risk_distance"]
-        )
+    def _early_breakeven_lock_price(position, candles=None):
+        """Where the stop goes on THIS early promotion. config.STRUCTURE_STOP_MANAGEMENT_ENABLED
+        tries the most recent confirmed market-structure swing first (see
+        _structure_stop_candidate); the fixed-distance calculation below
+        is both the original behavior (feature off) and the fallback when
+        no swing is available yet. Uses the fixed `risk_distance` captured
+        once at position start (same discipline as _mae_mfe_r_multiples),
+        not a re-derived value, since sl_price is still the original
+        (unmoved) stop at this point anyway."""
+        side = position["side"]
 
-    def poll_live(self, symbol):
+        if config.STRUCTURE_STOP_MANAGEMENT_ENABLED:
+            candidate = _structure_stop_candidate(position, candles)
+
+            if candidate is not None:
+                return candidate
+
+        fixed = risk_manager.compute_early_breakeven_price(
+            position["entry_price"], side, position["risk_distance"]
+        )
+        breakeven = risk_manager.compute_breakeven_price(position["entry_price"], side)
+        return max(fixed, breakeven) if side == "BUY" else min(fixed, breakeven)
+
+    def poll_live(self, symbol, candles=None):
         """Returns an outcome string if the position closed this call,
-        otherwise None."""
+        otherwise None. `candles` (LTF history for the symbol) is only
+        used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED's structure-aware
+        early-breakeven lock and post-TP1 trailing stop - both are no-ops
+        when it's not supplied."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"]:
@@ -699,14 +819,15 @@ class PositionManager:
                 early_breakeven_candidate
                 and self._early_breakeven_price_reached(position, current_price)
             ):
+                lock_price = self._early_breakeven_lock_price(position, candles)
                 position["early_breakeven_applied"] = True
-                position["early_breakeven_profit_locked"] = (
-                    float(config.EARLY_BREAKEVEN_LOCK_R_MULTIPLE) > 0
+                position["early_breakeven_profit_locked"] = _more_favorable(
+                    position["side"], lock_price, position["breakeven_price"]
                 )
                 self._promote_to_breakeven(
                     position,
                     reason="Early breakeven (profit-lock)",
-                    target_price=self._early_breakeven_lock_price(position),
+                    target_price=lock_price,
                 )
                 return None
 
@@ -734,11 +855,7 @@ class PositionManager:
 
             if sl_status == "FINISHED":
                 exchange.cancel_all_open_orders(symbol)
-                outcome = (
-                    "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
-                    else "BREAKEVEN_STOP_HIT"
-                )
-                return self._close(symbol, outcome)
+                return self._close(symbol, self._breakeven_stop_outcome(position, shadow=False))
 
             tp2_status = self._status_or_missing(symbol, position["tp2_order_id"])
 
@@ -746,7 +863,63 @@ class PositionManager:
                 exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "TP2_HIT")
 
+            return self._trail_stop_if_improved(position, candles)
+
         return None
+
+    def _trail_stop_if_improved(self, position, candles):
+        """config.STRUCTURE_STOP_MANAGEMENT_ENABLED - ratchet-only:
+        replaces the SL with the nearest confirmed structure swing only
+        when it's strictly MORE favorable than the current sl_price,
+        never loosens. Never transitions stage (stays BREAKEVEN_ACTIVE -
+        only _promote_to_breakeven owns stage transitions) and never
+        touches risk_distance (see _mae_mfe_r_multiples's invariant that
+        it's fixed once at entry). Only called after this poll's own
+        sl_status/tp2_status checks already confirmed neither fired -
+        _replace_sl_order's internal ground-truth check is a rare true-
+        race backstop, not the primary detection path. Returns a close-
+        outcome string only if the replace attempt forced a market-close
+        of the remainder (-2021), otherwise None."""
+        if not config.STRUCTURE_STOP_MANAGEMENT_ENABLED or not candles:
+            return None
+
+        candidate = _structure_stop_candidate(position, candles)
+
+        if candidate is None:
+            return None
+
+        side = position["side"]
+
+        if not _more_favorable(side, candidate, position["sl_price"]):
+            return None
+
+        outcome, replaced = self._replace_sl_order(
+            position, candidate, "Structure trailing stop", close_if_not_open=False
+        )
+
+        if replaced:
+            position["trailing_stop_locked_profit"] = _more_favorable(
+                side, candidate, position["breakeven_price"]
+            )
+
+        return outcome
+
+    @staticmethod
+    def _breakeven_stop_outcome(position, shadow):
+        """3-way precedence for a BREAKEVEN_ACTIVE SL hit: a trailed
+        profit takes priority over an early-breakeven lock, which takes
+        priority over a flat breakeven scratch - all three land at the
+        same code path (the SL order firing) and are told apart only by
+        these two flags."""
+        prefix = "SHADOW_" if shadow else ""
+
+        if position.get("trailing_stop_locked_profit"):
+            return f"{prefix}TRAILING_STOP_PROFIT_HIT"
+
+        if position.get("early_breakeven_profit_locked"):
+            return f"{prefix}EARLY_BREAKEVEN_PROFIT_HIT"
+
+        return f"{prefix}BREAKEVEN_STOP_HIT"
 
     @staticmethod
     def _status_or_missing(symbol, order_id):
@@ -858,12 +1031,15 @@ class PositionManager:
         log_info(f"{symbol} TP1 quantity closed at market (price already past TP1)")
         self._promote_to_breakeven(position)
 
-    def poll_shadow(self, symbol, latest_candle):
+    def poll_shadow(self, symbol, latest_candle, candles=None):
         """Simulates the same TP1 -> breakeven -> TP2/SL sequence against
         live price action. When both the stop and a target fall inside the
         same candle's range, the SL side is assumed to have been touched
         first - a deliberately conservative simplification so shadow stats
-        don't overstate win rate; it is not a substitute for real fills."""
+        don't overstate win rate; it is not a substitute for real fills.
+        `candles` (LTF history) is only used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED's
+        structure-aware early-breakeven lock and post-TP1 trailing - both
+        are no-ops when it's not supplied."""
         position = self.positions.get(symbol)
 
         if not position or not position["shadow"] or not latest_candle:
@@ -888,12 +1064,13 @@ class PositionManager:
             if self._is_early_breakeven_candidate(position) and self._early_breakeven_price_reached(
                 position, latest_candle["close"]
             ):
+                lock_price = self._early_breakeven_lock_price(position, candles)
                 position["early_breakeven_applied"] = True
-                position["early_breakeven_profit_locked"] = (
-                    float(config.EARLY_BREAKEVEN_LOCK_R_MULTIPLE) > 0
+                position["early_breakeven_profit_locked"] = _more_favorable(
+                    side, lock_price, position["breakeven_price"]
                 )
                 position["stage"] = BREAKEVEN_ACTIVE
-                position["sl_price"] = self._early_breakeven_lock_price(position)
+                position["sl_price"] = lock_price
                 log_info(
                     f"{symbol} [SHADOW] early breakeven (profit-lock) | "
                     f"SL -> {position['sl_price']}"
@@ -921,12 +1098,7 @@ class PositionManager:
             )
 
             if hit_sl:
-                outcome = (
-                    "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT"
-                    if position.get("early_breakeven_profit_locked")
-                    else "SHADOW_BREAKEVEN_STOP_HIT"
-                )
-                return self._close(symbol, outcome)
+                return self._close(symbol, self._breakeven_stop_outcome(position, shadow=True))
 
             hit_tp2 = (
                 high >= position["tp2_price"]
@@ -936,6 +1108,16 @@ class PositionManager:
 
             if hit_tp2:
                 return self._close(symbol, "SHADOW_TP2_HIT")
+
+            if config.STRUCTURE_STOP_MANAGEMENT_ENABLED and candles:
+                candidate = _structure_stop_candidate(position, candles)
+
+                if candidate is not None and _more_favorable(side, candidate, position["sl_price"]):
+                    position["sl_price"] = candidate
+                    position["trailing_stop_locked_profit"] = _more_favorable(
+                        side, candidate, position["breakeven_price"]
+                    )
+                    log_info(f"{symbol} [SHADOW] structure trailing stop | SL -> {candidate}")
 
         return None
 

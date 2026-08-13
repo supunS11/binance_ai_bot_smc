@@ -370,6 +370,28 @@ EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 1.0)
 # early_breakeven_applied=True trades after this ships - see the
 # EARLY_BREAKEVEN_PROFIT_HIT outcome in journal_analysis.py.
 EARLY_BREAKEVEN_LOCK_R_MULTIPLE = env_float("EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3)
+# Replaces the fixed EARLY_BREAKEVEN_LOCK_R_MULTIPLE distance with the
+# most recent CONFIRMED swing point in the trade's favor
+# (market_structure.structure_state's last_swing_low/last_swing_high),
+# clamped so it can never sit worse than flat breakeven - and, once a
+# position is BREAKEVEN_ACTIVE (post-genuine-TP1 or post-early-lock),
+# additionally trails the stop to that same structure level on every
+# poll, ratchet-only (never loosens; TP2 stays a fixed target, only SL
+# ever moves). Falls back to the existing fixed-distance calculation
+# whenever no confirmed swing is available yet. Real motivation
+# (2026-08-13, operator feedback): the fixed 0.3R lock was getting
+# clipped by ordinary pullback noise on trades that then continued on to
+# a real TP1/TP2 win. Trade-off, explicitly accepted: this REPLACES the
+# old guarantee ("at least EARLY_BREAKEVEN_LOCK_R_MULTIPLE locked") with
+# a weaker one ("never worse than breakeven scratch") - NOT proven more
+# profitable yet, ship-and-measure same as every other feature here (see
+# journal_analysis.py's TRAILING_STOP_PROFIT_HIT outcome). Real caveat:
+# SWING_LEFT/SWING_RIGHT=4 on the 1h LTF means a swing needs ~4
+# confirming candles after it forms - many trades resolve before any NEW
+# swing has formed since entry, so in practice this often just falls
+# back to plain MOVE_SL_TO_BREAKEVEN_AFTER_TP1 behavior; the real
+# improvement mainly shows up on longer-running trades. Default OFF.
+STRUCTURE_STOP_MANAGEMENT_ENABLED = env_bool("STRUCTURE_STOP_MANAGEMENT_ENABLED", "False")
 # MAE/MFE (max adverse/favorable excursion) tracking - the diagnostic
 # that's actually missing right now. A plain WIN/LOSS outcome can't tell
 # apart a trade that was wrong from the first tick (near-zero MFE, went
