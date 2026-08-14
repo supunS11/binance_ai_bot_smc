@@ -179,6 +179,37 @@ def compute_early_breakeven_price(entry_price, side, risk_distance):
     return entry_price - lock_distance
 
 
+def compute_profit_protection_lock_price(entry_price, side, tp1_price):
+    """config.PROFIT_PROTECTION_ENABLED - the price at which unrealized
+    ROI reaches PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1% of what TP1
+    itself would pay out in ROI (at LEVERAGE). Used as BOTH the
+    activation trigger (position_manager checks "has price reached this
+    yet") and the lock target (move SL exactly here) - per explicit
+    operator choice, protection locks in the full ROI that triggered it,
+    not a smaller cushion below it (contrast EARLY_BREAKEVEN_R_MULTIPLE/
+    EARLY_BREAKEVEN_LOCK_R_MULTIPLE, which deliberately are two different
+    values). None if TP1's own ROI can't be computed (missing/degenerate
+    tp1_price, zero entry_price, or LEVERAGE<=0) - callers must treat
+    None as "not available yet", not "reached"."""
+    if entry_price <= 0 or tp1_price is None:
+        return None
+
+    tp1_roi_pct = _roi_pct(entry_price, abs(tp1_price - entry_price))
+
+    if tp1_roi_pct <= 0:
+        return None
+
+    leverage = max(float(config.LEVERAGE), 0)
+
+    if leverage <= 0:
+        return None
+
+    activation_pct = max(float(config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1), 0) / 100
+    target_roi_pct = tp1_roi_pct * activation_pct
+    lock_distance = (target_roi_pct / 100) / leverage * entry_price
+    return entry_price + lock_distance if side == "BUY" else entry_price - lock_distance
+
+
 def _entry_extension_r(signal, entry_price, side, risk_distance):
     """How far entry_price has already run beyond the structure level that
     triggered the setup, expressed in R (risk_distance-relative) - None
@@ -214,24 +245,34 @@ def _entry_too_extended(extension_r):
     return extension_r > max_extension_r
 
 
+def _roi_pct(entry_price, price_distance):
+    """ROI% (of margin, at config.LEVERAGE) for a given absolute price
+    distance from entry - quantity cancels out of the ratio (loss-at-SL/
+    profit-at-price and margin-used both scale with it identically), so
+    this only ever needs the distance and entry price. Shared by
+    _stop_roi_too_high (the loss side, MAX_SL_ROI_PCT) and
+    compute_profit_protection_lock_price (the profit side,
+    PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1) - same relationship, either
+    direction."""
+    if entry_price <= 0:
+        return 0.0
+
+    return (price_distance / entry_price) * max(float(config.LEVERAGE), 0) * 100
+
+
 def _stop_roi_too_high(risk_distance, entry_price):
     """See config.MAX_SL_ROI_PCT - rejects an entry whose stop, once
     LEVERAGE is applied, would lose more than this % of the margin
-    actually at risk if hit. Independent of position sizing mode (risk-
-    based or margin-based): ROI_at_SL = (risk_distance / entry_price) *
-    LEVERAGE, since quantity cancels out of the ratio (both loss-at-SL and
-    margin-used scale with it identically) - so this doesn't need
-    quantity/balance at all, only the stop distance itself. Rejects
-    outright rather than shrinking the position, per explicit operator
-    choice: a stop this wide relative to leverage is treated as not worth
-    taking at any size, not just a smaller one."""
+    actually at risk if hit. Rejects outright rather than shrinking the
+    position, per explicit operator choice: a stop this wide relative to
+    leverage is treated as not worth taking at any size, not just a
+    smaller one."""
     max_roi_pct = max(float(config.MAX_SL_ROI_PCT), 0)
 
     if max_roi_pct <= 0 or entry_price <= 0:
         return False
 
-    roi_pct = (risk_distance / entry_price) * max(float(config.LEVERAGE), 0) * 100
-    return roi_pct > max_roi_pct
+    return _roi_pct(entry_price, risk_distance) > max_roi_pct
 
 
 def _confluence_size_multiplier(signal):

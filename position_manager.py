@@ -166,6 +166,12 @@ class PositionManager:
             # See _promote_to_breakeven and the EARLY_BREAKEVEN_PROFIT_HIT
             # outcome.
             "early_breakeven_profit_locked": False,
+            # config.PROFIT_PROTECTION_ENABLED - mirrors the two keys
+            # above but for the ROI-of-TP1 promotion path (mutually
+            # exclusive with early_breakeven_applied/profit_locked at the
+            # promotion moment - see _is_profit_protection_candidate).
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
             # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
             # a post-TP1 trailing stop replacement actually locked in more
             # than flat breakeven (see _trail_stop_if_improved and the
@@ -227,6 +233,12 @@ class PositionManager:
             "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
+            # config.PROFIT_PROTECTION_ENABLED - mirrors the two keys
+            # above but for the ROI-of-TP1 promotion path (mutually
+            # exclusive with early_breakeven_applied/profit_locked at the
+            # promotion moment - see _is_profit_protection_candidate).
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
             # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
             # a post-TP1 trailing stop replacement actually locked in more
             # than flat breakeven (see _trail_stop_if_improved and the
@@ -413,6 +425,12 @@ class PositionManager:
             "confluence_ratio": None,
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
+            # config.PROFIT_PROTECTION_ENABLED - mirrors the two keys
+            # above but for the ROI-of-TP1 promotion path (mutually
+            # exclusive with early_breakeven_applied/profit_locked at the
+            # promotion moment - see _is_profit_protection_candidate).
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
             # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
             # a post-TP1 trailing stop replacement actually locked in more
             # than flat breakeven (see _trail_stop_if_improved and the
@@ -714,6 +732,7 @@ class PositionManager:
 
             outcome = (
                 "TRAILING_STOP_PROFIT_HIT" if position.get("trailing_stop_locked_profit")
+                else "PROFIT_PROTECTION_HIT" if position.get("profit_protection_profit_locked")
                 else "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
                 else "BREAKEVEN_TRIGGER_MARKET_CLOSE"
             )
@@ -789,6 +808,48 @@ class PositionManager:
         breakeven = risk_manager.compute_breakeven_price(position["entry_price"], side)
         return max(fixed, breakeven) if side == "BUY" else min(fixed, breakeven)
 
+    def _is_profit_protection_candidate(self, position):
+        """Cheap, no-network pre-check for config.PROFIT_PROTECTION_ENABLED -
+        same shape as _is_early_breakeven_candidate, a different metric
+        (% of TP1's own ROI instead of an R-multiple of risk_distance).
+        See config.py's comment on PROFIT_PROTECTION_ENABLED for the real
+        motivation (TP1/TP2 can take a long time, and EARLY_BREAKEVEN's
+        flat 0.5R/0.3R lock doesn't scale with how much TP1 itself would
+        actually pay out on a given trade)."""
+        if not config.PROFIT_PROTECTION_ENABLED or position.get("profit_protection_applied"):
+            return False
+
+        if position["stage"] != TP1_PENDING:
+            return False
+
+        return position.get("tp1_price") is not None
+
+    @staticmethod
+    def _profit_protection_lock_price(position):
+        """Where the stop goes on profit-protection activation, and also
+        the trigger price itself - see risk_manager.
+        compute_profit_protection_lock_price: per explicit operator
+        choice, the same ROI% that triggers activation is what gets
+        locked, so one price serves both purposes."""
+        return risk_manager.compute_profit_protection_lock_price(
+            position["entry_price"], position["side"], position["tp1_price"]
+        )
+
+    def _profit_protection_price_reached(self, position, current_price):
+        """Has price reached the profit-protection lock price yet? Shared
+        by poll_live (real mark price) and poll_shadow (simulated candle
+        close) - same pattern as _early_breakeven_price_reached."""
+        if current_price is None or current_price <= 0:
+            return False
+
+        lock_price = self._profit_protection_lock_price(position)
+
+        if lock_price is None:
+            return False
+
+        side = position["side"]
+        return current_price >= lock_price if side == "BUY" else current_price <= lock_price
+
     def poll_live(self, symbol, candles=None):
         """Returns an outcome string if the position closed this call,
         otherwise None. `candles` (LTF history for the symbol) is only
@@ -802,19 +863,43 @@ class PositionManager:
 
         self._ensure_protection_orders(position)
 
-        # One shared mark-price fetch, reused for both MAE/MFE tracking
-        # and the early-breakeven check below - no reason to pay for two
-        # REST calls when either (or both) need the same current price.
+        # One shared mark-price fetch, reused for MAE/MFE tracking and
+        # both early-promotion checks below - no reason to pay for extra
+        # REST calls when any of them need the same current price.
         early_breakeven_candidate = (
             position["stage"] == TP1_PENDING and self._is_early_breakeven_candidate(position)
         )
+        profit_protection_candidate = (
+            position["stage"] == TP1_PENDING and self._is_profit_protection_candidate(position)
+        )
         current_price = None
 
-        if config.MAE_TRACKING_ENABLED or early_breakeven_candidate:
+        if config.MAE_TRACKING_ENABLED or early_breakeven_candidate or profit_protection_candidate:
             current_price = exchange.get_mark_price(symbol)
             self._update_mae_mfe(position, current_price)
 
         if position["stage"] == TP1_PENDING:
+            # Checked before EARLY_BREAKEVEN: mutually exclusive at the
+            # promotion moment (both check stage==TP1_PENDING and stop
+            # applying once promoted), so whichever fires here is simply
+            # whichever threshold was reached first in time - order only
+            # matters on the rare tick where both would qualify at once.
+            if (
+                profit_protection_candidate
+                and self._profit_protection_price_reached(position, current_price)
+            ):
+                lock_price = self._profit_protection_lock_price(position)
+
+                if lock_price is not None:
+                    position["profit_protection_applied"] = True
+                    position["profit_protection_profit_locked"] = True
+                    self._promote_to_breakeven(
+                        position,
+                        reason="Profit protection (ROI-of-TP1 lock)",
+                        target_price=lock_price,
+                    )
+                    return None
+
             if (
                 early_breakeven_candidate
                 and self._early_breakeven_price_reached(position, current_price)
@@ -906,15 +991,22 @@ class PositionManager:
 
     @staticmethod
     def _breakeven_stop_outcome(position, shadow):
-        """3-way precedence for a BREAKEVEN_ACTIVE SL hit: a trailed
-        profit takes priority over an early-breakeven lock, which takes
-        priority over a flat breakeven scratch - all three land at the
-        same code path (the SL order firing) and are told apart only by
-        these two flags."""
+        """4-way precedence for a BREAKEVEN_ACTIVE SL hit: a trailed
+        profit takes priority over either early-promotion lock (profit_
+        protection and early_breakeven are mutually exclusive with each
+        other - only one of those two flags can ever be true, since only
+        one promotion path can have actually fired for a given position -
+        so their relative order below doesn't matter), which both take
+        priority over a flat breakeven scratch - all land at the same
+        code path (the SL order firing) and are told apart only by these
+        flags."""
         prefix = "SHADOW_" if shadow else ""
 
         if position.get("trailing_stop_locked_profit"):
             return f"{prefix}TRAILING_STOP_PROFIT_HIT"
+
+        if position.get("profit_protection_profit_locked"):
+            return f"{prefix}PROFIT_PROTECTION_HIT"
 
         if position.get("early_breakeven_profit_locked"):
             return f"{prefix}EARLY_BREAKEVEN_PROFIT_HIT"
@@ -1060,6 +1152,24 @@ class PositionManager:
 
             if hit_sl:
                 return self._close(symbol, "SHADOW_SL_HIT")
+
+            # Checked before EARLY_BREAKEVEN - see the identical note in
+            # poll_live.
+            if self._is_profit_protection_candidate(position) and self._profit_protection_price_reached(
+                position, latest_candle["close"]
+            ):
+                lock_price = self._profit_protection_lock_price(position)
+
+                if lock_price is not None:
+                    position["profit_protection_applied"] = True
+                    position["profit_protection_profit_locked"] = True
+                    position["stage"] = BREAKEVEN_ACTIVE
+                    position["sl_price"] = lock_price
+                    log_info(
+                        f"{symbol} [SHADOW] profit protection (ROI-of-TP1 lock) | "
+                        f"SL -> {position['sl_price']}"
+                    )
+                    return None
 
             if self._is_early_breakeven_candidate(position) and self._early_breakeven_price_reached(
                 position, latest_candle["close"]

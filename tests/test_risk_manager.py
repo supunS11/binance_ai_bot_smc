@@ -294,6 +294,62 @@ class ComputeEarlyBreakevenPriceTests(unittest.TestCase):
         self.assertAlmostEqual(price, 100.02)
 
 
+class ComputeProfitProtectionLockPriceTests(unittest.TestCase):
+    """config.PROFIT_PROTECTION_ENABLED - locks in
+    PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1% of TP1's own ROI (at
+    LEVERAGE), used as both the activation trigger and the lock target
+    (position_manager._profit_protection_lock_price)."""
+
+    def test_buy_locks_the_configured_pct_of_tp1s_roi(self):
+        # entry=100, tp1=110 -> tp1 move=10 -> tp1 ROI = 10/100*10*100=100%
+        # -> 60% of that = 60% ROI -> price move = 60/100/10*100 = 6
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
+
+        self.assertAlmostEqual(price, 106)
+
+    def test_sell_locks_the_configured_pct_of_tp1s_roi(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            price = risk_manager.compute_profit_protection_lock_price(100, "SELL", 90)
+
+        self.assertAlmostEqual(price, 94)
+
+    def test_zero_activation_pct_locks_exactly_at_entry(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 0):
+            price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
+
+        self.assertAlmostEqual(price, 100)
+
+    def test_negative_activation_pct_is_clamped_to_zero(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", -10):
+            price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
+
+        self.assertAlmostEqual(price, 100)
+
+    def test_none_tp1_price_returns_none(self):
+        price = risk_manager.compute_profit_protection_lock_price(100, "BUY", None)
+        self.assertIsNone(price)
+
+    def test_zero_entry_price_returns_none(self):
+        price = risk_manager.compute_profit_protection_lock_price(0, "BUY", 110)
+        self.assertIsNone(price)
+
+    def test_tp1_equal_to_entry_returns_none(self):
+        # Zero TP1 ROI - nothing meaningful to protect a fraction of.
+        price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 100)
+        self.assertIsNone(price)
+
+    def test_zero_leverage_returns_none(self):
+        with patch.object(config, "LEVERAGE", 0):
+            price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
+
+        self.assertIsNone(price)
+
+
 class BuildTradePlanTests(unittest.TestCase):
     def setUp(self):
         # MAX_ENTRY_EXTENSION_R defaults to 0.5 in config, but this

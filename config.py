@@ -680,6 +680,35 @@ EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 0.5)
 # early_breakeven_applied=True trades after this ships - see the
 # EARLY_BREAKEVEN_PROFIT_HIT outcome in journal_analysis.py.
 EARLY_BREAKEVEN_LOCK_R_MULTIPLE = env_float("EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0.3)
+# Profit protection - a SECOND, independent early-promotion mechanism
+# alongside EARLY_BREAKEVEN above, measured differently: instead of an
+# R-multiple of risk_distance, this is a % of what TP1 itself would pay
+# out in ROI (at LEVERAGE) - see risk_manager.compute_profit_protection_
+# lock_price. Real motivation (2026-08-14, operator feedback): TP1/TP2
+# can take a long time to actually fill, and EARLY_BREAKEVEN's fixed
+# 0.5R/0.3R trigger/lock is a small, flat amount regardless of how big
+# TP1's actual target is on a given trade - a trade already sitting on
+# real, meaningful profit (a real fraction of TP1's own payout) has
+# earned more protection than a flat 0.3R lock gives it, and this bot's
+# only other profit-protection mechanism between entry and TP1
+# (STRUCTURE_STOP_MANAGEMENT_ENABLED's trailing stop) only moves when a
+# NEW confirmed swing forms - on this 1h LTF with SWING_LEFT/RIGHT=4 that
+# can lag many hours behind real, growing unrealized profit. Mutually
+# exclusive with EARLY_BREAKEVEN at the promotion moment (whichever
+# threshold is reached first wins, both check position stage==TP1_PENDING
+# and stop applying once promoted) but STRUCTURE_STOP_MANAGEMENT_ENABLED's
+# trailing stop still runs on TOP of either afterward, same as today.
+# Locks in the SAME ROI% that triggered activation (not a smaller
+# cushion, not continued trailing past it) - explicit operator choice.
+# Brand new, unvalidated mechanism - default OFF.
+PROFIT_PROTECTION_ENABLED = env_bool("PROFIT_PROTECTION_ENABLED", "False")
+# What % of TP1's own ROI counts as "enough profit to protect". E.g. at
+# 60: if TP1 would pay out 50% ROI, protection activates once unrealized
+# ROI reaches 30% (60% of 50) and locks the stop at that same 30% ROI
+# level. Starting value, not yet calibrated against real trade data.
+PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 = env_float(
+    "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60
+)
 # Replaces the fixed EARLY_BREAKEVEN_LOCK_R_MULTIPLE distance with the
 # most recent CONFIRMED swing point in the trade's favor
 # (market_structure.structure_state's last_swing_low/last_swing_high),

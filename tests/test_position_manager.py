@@ -533,6 +533,99 @@ class EarlyBreakevenEligibilityTests(unittest.TestCase):
             ))
 
 
+class ProfitProtectionEligibilityTests(unittest.TestCase):
+    """config.PROFIT_PROTECTION_ENABLED - same shape as
+    EarlyBreakevenEligibilityTests above, a different metric (% of TP1's
+    own ROI instead of an R-multiple of risk_distance)."""
+
+    def _position(self, **overrides):
+        position = {
+            "side": "BUY",
+            "entry_price": 100,
+            "tp1_price": 110,
+            "stage": TP1_PENDING,
+            "profit_protection_applied": False,
+        }
+        position.update(overrides)
+        return position
+
+    def test_disabled_config_is_never_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", False):
+            self.assertFalse(manager._is_profit_protection_candidate(self._position()))
+
+    def test_already_applied_is_never_a_candidate_again(self):
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+            self.assertFalse(manager._is_profit_protection_candidate(
+                self._position(profit_protection_applied=True)
+            ))
+
+    def test_wrong_stage_is_not_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+            self.assertFalse(manager._is_profit_protection_candidate(
+                self._position(stage=BREAKEVEN_ACTIVE)
+            ))
+
+    def test_missing_tp1_price_is_not_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+            self.assertFalse(manager._is_profit_protection_candidate(
+                self._position(tp1_price=None)
+            ))
+
+    def test_otherwise_eligible_position_is_a_candidate(self):
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+            self.assertTrue(manager._is_profit_protection_candidate(self._position()))
+
+
+class ProfitProtectionPriceReachedTests(unittest.TestCase):
+    def _position(self, side="BUY", entry_price=100, tp1_price=110):
+        return {"side": side, "entry_price": entry_price, "tp1_price": tp1_price}
+
+    def test_none_price_is_not_reached(self):
+        manager = PositionManager()
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            self.assertFalse(
+                manager._profit_protection_price_reached(self._position(), None)
+            )
+
+    def test_buy_reaches_trigger_at_the_lock_price(self):
+        # lock price = 106 (see ComputeProfitProtectionLockPriceTests)
+        manager = PositionManager()
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            self.assertTrue(manager._profit_protection_price_reached(self._position(), 106))
+            self.assertFalse(manager._profit_protection_price_reached(self._position(), 105.9))
+
+    def test_sell_reaches_trigger_at_the_lock_price(self):
+        manager = PositionManager()
+        position = self._position(side="SELL", entry_price=100, tp1_price=90)
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            self.assertTrue(manager._profit_protection_price_reached(position, 94))
+            self.assertFalse(manager._profit_protection_price_reached(position, 94.1))
+
+    def test_lock_price_unavailable_is_never_reached(self):
+        manager = PositionManager()
+
+        with patch.object(config, "LEVERAGE", 10):
+            self.assertFalse(manager._profit_protection_price_reached(
+                self._position(tp1_price=None), 106
+            ))
+
+
 class EarlyBreakevenPriceReachedTests(unittest.TestCase):
     def _position(self, side="BUY", entry_price=100, sl_price=98):
         return {"side": side, "entry_price": entry_price, "sl_price": sl_price}
@@ -1197,6 +1290,25 @@ class BreakevenStopOutcomeTests(unittest.TestCase):
             PositionManager._breakeven_stop_outcome(position, shadow=True), "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT"
         )
 
+    def test_profit_protection_takes_precedence_over_early_lock(self):
+        position = {
+            "trailing_stop_locked_profit": False,
+            "profit_protection_profit_locked": True,
+            "early_breakeven_profit_locked": True,
+        }
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=False), "PROFIT_PROTECTION_HIT"
+        )
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=True), "SHADOW_PROFIT_PROTECTION_HIT"
+        )
+
+    def test_trailing_takes_precedence_over_profit_protection(self):
+        position = {"trailing_stop_locked_profit": True, "profit_protection_profit_locked": True}
+        self.assertEqual(
+            PositionManager._breakeven_stop_outcome(position, shadow=False), "TRAILING_STOP_PROFIT_HIT"
+        )
+
     def test_flat_scratch_when_neither(self):
         position = {"trailing_stop_locked_profit": False, "early_breakeven_profit_locked": False}
         self.assertEqual(
@@ -1517,12 +1629,19 @@ class PollLiveTests(unittest.TestCase):
         # feature turn the relevant one back on locally.
         self.early_breakeven_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
         self.mae_tracking_patcher = patch.object(config, "MAE_TRACKING_ENABLED", False)
+        # Same reasoning as early_breakeven_patcher above - off by default
+        # so tests not about this feature aren't hijacked by an unmocked
+        # exchange.get_mark_price(); ProfitProtectionPollLiveTests turns
+        # it back on locally.
+        self.profit_protection_patcher = patch.object(config, "PROFIT_PROTECTION_ENABLED", False)
         self.early_breakeven_patcher.start()
         self.mae_tracking_patcher.start()
+        self.profit_protection_patcher.start()
 
     def tearDown(self):
         self.early_breakeven_patcher.stop()
         self.mae_tracking_patcher.stop()
+        self.profit_protection_patcher.stop()
 
     def _manager_with_position(self, confluence_ratio=None):
         manager = PositionManager()
@@ -2022,6 +2141,73 @@ class PollLiveTests(unittest.TestCase):
 
         self.assertEqual(outcome, "TRAILING_STOP_PROFIT_HIT")
         cancel_all.assert_called_once_with("BTCUSDT")
+
+
+class ProfitProtectionPollLiveTests(PollLiveTests):
+    """Integration coverage for config.PROFIT_PROTECTION_ENABLED through
+    the real poll_live() dispatch, on top of PollLiveTests' setUp (which
+    keeps EARLY_BREAKEVEN_ENABLED/MAE_TRACKING_ENABLED/
+    PROFIT_PROTECTION_ENABLED off by default so an unmocked
+    exchange.get_mark_price() can't hijack unrelated tests)."""
+
+    def test_profit_protection_promotes_before_tp1_and_locks_the_configured_roi(self):
+        # _plan() BUY: entry=100, tp1=102 -> tp1 move=2, tp1 ROI=(2/100)*
+        # 10*100=20%, 60% of that=12% -> lock distance=(12/100)/10*100=1.2
+        # -> lock price=101.2 (see ComputeProfitProtectionLockPriceTests).
+        manager = self._manager_with_position()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(exchange, "get_mark_price", return_value=101.2), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_locked"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["profit_protection_applied"])
+        self.assertTrue(position["profit_protection_profit_locked"])
+        self.assertAlmostEqual(position["sl_price"], 101.2)
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 101.2)
+
+    def test_below_the_lock_price_does_not_promote(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(exchange, "get_mark_price", return_value=101.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertFalse(position["profit_protection_applied"])
+
+    def test_profit_protection_is_checked_before_early_breakeven_when_both_would_fire(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.1), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", False), \
+             patch.object(exchange, "get_mark_price", return_value=101.2), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_locked"}):
+            manager.poll_live("BTCUSDT")
+
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["profit_protection_profit_locked"])
+        self.assertFalse(position["early_breakeven_applied"])
 
 
 def _pending_order_status(status, executed_qty=0.0, avg_price=0.0, orig_qty=1.0):
