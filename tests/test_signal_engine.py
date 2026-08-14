@@ -79,6 +79,9 @@ class SignalEngineTests(unittest.TestCase):
         liquidation_confirmed_sweep_direction=None,
         liquidation_confirmed_sweep_level=None,
         liquidation_confirmed_sweep_open_time=666,
+        ema_pullback_direction=None,
+        ema_pullback_level=None,
+        ema_pullback_open_time=555,
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -133,6 +136,13 @@ class SignalEngineTests(unittest.TestCase):
             }
             if liquidation_confirmed_sweep_direction else None
         )
+        ema_pullback = (
+            {
+                "direction": ema_pullback_direction, "level": ema_pullback_level,
+                "open_time": ema_pullback_open_time,
+            }
+            if ema_pullback_direction else None
+        )
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
         liquidation_snapshot = (
             LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
@@ -147,6 +157,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_swing_points", return_value=[]), \
              patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest), \
              patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest), \
+             patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback), \
              patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
              patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
              patch.object(market_structure, "price_return", return_value=btc_return), \
@@ -1496,6 +1507,110 @@ class SignalEngineTests(unittest.TestCase):
                 sweep_direction=None, ema_value=115.0,
                 liquidation_confirmed_sweep_direction="BEARISH",
                 liquidation_confirmed_sweep_level=112,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    # config.EMA_PULLBACK_TRIGGER_ENABLED - a pullback to the EMA
+    # followed by a same-candle reclaim. Ranked last of all 9 triggers.
+    # market_structure.detect_ema_pullback itself is mocked (see _run()'s
+    # ema_pullback_* params) - its own logic is covered in
+    # test_market_structure.py.
+
+    def test_ema_pullback_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                ema_pullback_direction="BULLISH", ema_pullback_level=88,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_ema_pullback_triggered_signal_when_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                ema_pullback_direction="BULLISH", ema_pullback_level=88,
+                ema_pullback_open_time=321,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "EMA_PULLBACK")
+        self.assertEqual(result["structure_level"], 88)
+        self.assertEqual(result["trigger_candle_open_time"], 321)
+
+    def test_liquidation_sweep_confirmed_takes_priority_over_ema_pullback(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True):
+            # Same level on both candidates - a tied _score() always
+            # favors the fixed-priority default regardless of whether
+            # TRIGGER_QUALITY_RANKING_ENABLED happens to be True in the
+            # loaded .env (min() keeps the first equal-scored candidate).
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                liquidation_confirmed_sweep_direction="BULLISH",
+                liquidation_confirmed_sweep_level=88,
+                ema_pullback_direction="BULLISH", ema_pullback_level=88,
+            )
+
+        self.assertEqual(result["signal_trigger"], "LIQUIDATION_SWEEP_CONFIRMED")
+
+    def test_ema_pullback_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                ema_pullback_direction="BULLISH", ema_pullback_level=88,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_ema_pullback_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                ema_pullback_direction="BULLISH", ema_pullback_level=88,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_ema_pullback_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                ema_pullback_direction="BEARISH", ema_pullback_level=112,
             )
 
             plan, status = risk_manager.build_trade_plan(result, balance=1000)

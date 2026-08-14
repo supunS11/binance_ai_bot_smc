@@ -335,6 +335,63 @@ def find_order_block_retest(candles, blocks=None, max_age_candles=None, require_
     return None
 
 
+def detect_ema_pullback(candles, ema_value, require_closed_candle=None):
+    """A pullback to the EMA within an established trend, followed by a
+    same-candle reclaim - the classic trend-continuation entry, well
+    suited to smooth, high-liquidity trending symbols (majors) that
+    rarely produce the deep OTE retracement or CVD/depth imbalance every
+    other trigger's downstream gate was tuned around (see config.
+    EMA_PULLBACK_TRIGGER_ENABLED for the real evidence: BTC/ETH/BNB/SOL
+    produced ZERO signal-related log activity across a full session with
+    all 8 other triggers live).
+
+    Bullish: the tested candle's LOW touches or pierces ema_value (a
+    real pullback TO it, not just proximity) but its CLOSE reclaims back
+    above - the dip held, the trend likely continues up.
+    Bearish: the mirror - HIGH touches/pierces, CLOSE stays below.
+
+    ema_value is the CURRENT ema (market_structure.
+    exponential_moving_average) - a slow-moving rolling average, so
+    using "now"'s value as a stand-in for "the EMA at the tested
+    candle's close" is a reasonable approximation, the same cost/
+    precision tradeoff every other trigger's shared-computation hoisting
+    in signal_engine.py already makes.
+
+    By default (require_closed_candle=False) tests the current, possibly
+    still-forming candle. When True (config.REQUIRE_CLOSE_CONFIRMED_BREAK,
+    reused here - the same principle applied uniformly across every
+    trigger), scans back to the most recently CLOSED candle instead -
+    same real motivation as every other close-confirmed trigger this
+    session (a wick-and-reclaim read on a still-forming candle can flip
+    before the candle actually finishes). Returns {"direction", "level",
+    "open_time"} or None."""
+    if not candles or ema_value is None:
+        return None
+
+    if require_closed_candle is None:
+        require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if require_closed_candle:
+        closed_candles = [c for c in candles if c.get("closed")]
+
+        if not closed_candles:
+            return None
+
+        latest = closed_candles[-1]
+    else:
+        latest = candles[-1]
+
+    high, low, close = latest["high"], latest["low"], latest["close"]
+
+    if low <= ema_value and close > ema_value:
+        return {"direction": "BULLISH", "level": ema_value, "open_time": latest["open_time"]}
+
+    if high >= ema_value and close < ema_value:
+        return {"direction": "BEARISH", "level": ema_value, "open_time": latest["open_time"]}
+
+    return None
+
+
 def find_fair_value_gaps(candles, lookback=None):
     lookback = int(config.FVG_LOOKBACK_CANDLES if lookback is None else lookback)
     gaps = []

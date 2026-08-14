@@ -623,6 +623,94 @@ class FindOrderBlockRetestRequireClosedCandleTests(unittest.TestCase):
         self.assertIsNotNone(result)
 
 
+class DetectEmaPullbackTests(unittest.TestCase):
+    def test_bullish_pullback_wicks_to_ema_then_reclaims(self):
+        candles = [_candle(0, high=103, low=99, open_=99.5, close=101)]
+
+        result = ms.detect_ema_pullback(candles, ema_value=100)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["level"], 100)
+
+    def test_bearish_pullback_wicks_to_ema_then_reclaims(self):
+        candles = [_candle(0, high=101, low=97, open_=100.5, close=99)]
+
+        result = ms.detect_ema_pullback(candles, ema_value=100)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertEqual(result["level"], 100)
+
+    def test_no_touch_of_the_ema_is_not_a_pullback(self):
+        candles = [_candle(0, high=110, low=105, open_=106, close=108)]
+
+        self.assertIsNone(ms.detect_ema_pullback(candles, ema_value=100))
+
+    def test_touch_without_a_reclaim_is_a_breakdown_not_a_pullback(self):
+        # Wicks below the EMA but closes below it too - a real break, not
+        # a held pullback.
+        candles = [_candle(0, high=99, low=95, open_=98.5, close=97)]
+
+        self.assertIsNone(ms.detect_ema_pullback(candles, ema_value=100))
+
+    def test_none_ema_value_is_none(self):
+        candles = [_candle(0, high=103, low=99, close=101)]
+        self.assertIsNone(ms.detect_ema_pullback(candles, ema_value=None))
+
+    def test_empty_candles_is_none(self):
+        self.assertIsNone(ms.detect_ema_pullback([], ema_value=100))
+
+    def test_result_includes_the_tested_candles_open_time(self):
+        candles = [_candle(5, high=103, low=99, open_=99.5, close=101)]
+
+        result = ms.detect_ema_pullback(candles, ema_value=100)
+
+        self.assertEqual(result["open_time"], 5)
+
+
+class DetectEmaPullbackRequireClosedCandleTests(unittest.TestCase):
+    """config.REQUIRE_CLOSE_CONFIRMED_BREAK - same real motivation as
+    every other close-confirmed trigger: a wick-and-reclaim read on a
+    still-forming candle can flip before the candle actually finishes."""
+
+    def _candles(self, tested_closed):
+        return [
+            _candle(0, high=106, low=104, close=105),  # well above the EMA - not a pullback
+            _candle(1, high=103, low=99, open_=99.5, close=101, closed=tested_closed),
+        ]
+
+    def test_forming_tested_candle_is_ignored_when_required(self):
+        result = ms.detect_ema_pullback(
+            self._candles(tested_closed=False), ema_value=100, require_closed_candle=True
+        )
+        self.assertIsNone(result)
+
+    def test_fires_once_the_tested_candle_closes(self):
+        result = ms.detect_ema_pullback(
+            self._candles(tested_closed=True), ema_value=100, require_closed_candle=True
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["open_time"], 1)
+
+    def test_no_closed_candle_at_all_returns_none(self):
+        candles = [_candle(0, high=103, low=99, close=101, closed=False)]
+        result = ms.detect_ema_pullback(candles, ema_value=100, require_closed_candle=True)
+        self.assertIsNone(result)
+
+    def test_defaults_from_config(self):
+        with patch.object(config, "REQUIRE_CLOSE_CONFIRMED_BREAK", True):
+            result = ms.detect_ema_pullback(self._candles(tested_closed=False), ema_value=100)
+
+        self.assertIsNone(result)
+
+    def test_require_closed_candle_false_checks_the_forming_candle(self):
+        result = ms.detect_ema_pullback(
+            self._candles(tested_closed=False), ema_value=100, require_closed_candle=False
+        )
+        self.assertIsNotNone(result)
+
+
 class LiquidityPoolTests(unittest.TestCase):
     def test_two_equal_highs_form_a_buy_side_pool(self):
         swings = [

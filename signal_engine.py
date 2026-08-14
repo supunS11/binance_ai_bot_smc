@@ -168,6 +168,16 @@ def evaluate(
     if config.EMA_CONFIRMATION_ENABLED:
         ema_value = market_structure.exponential_moving_average(ltf_candles)
 
+    # config.EMA_PULLBACK_TRIGGER_ENABLED - a ninth, alternative entry
+    # trigger: a pullback to the EMA followed by a same-candle reclaim
+    # (see market_structure.detect_ema_pullback). Reuses ema_value,
+    # already computed just above whenever EMA_CONFIRMATION_ENABLED is
+    # on - zero extra cost, no second EMA calculation.
+    ema_pullback = None
+
+    if config.EMA_PULLBACK_TRIGGER_ENABLED:
+        ema_pullback = market_structure.detect_ema_pullback(ltf_candles, ema_value)
+
     btc_correlation = None
     btc_return = None
 
@@ -182,8 +192,8 @@ def evaluate(
     # Candidate list - same detection conditions and same priority order
     # as before (STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
     # CHOCH_RETEST > CVD_DIVERGENCE > ORDER_BLOCK_RETEST > OI_DIVERGENCE >
-    # LIQUIDATION_SWEEP_CONFIRMED), but no longer short-circuited into
-    # if/elif: every
+    # LIQUIDATION_SWEEP_CONFIRMED > EMA_PULLBACK), but no longer short-
+    # circuited into if/elif: every
     # currently-qualifying trigger becomes a candidate, and the selection
     # logic below decides which one actually wins (see
     # config.TRIGGER_QUALITY_RANKING_ENABLED). Building the full list
@@ -311,6 +321,17 @@ def evaluate(
             # sweep is a copy of the same close-confirmed sweep dict, just
             # additionally gated on real liquidation flow.
             "trigger_candle_open_time": liquidation_confirmed_sweep.get("open_time"),
+        })
+
+    if config.EMA_PULLBACK_TRIGGER_ENABLED and ema_pullback is not None:
+        candidates.append({
+            "signal_trigger": "EMA_PULLBACK",
+            "direction": ema_pullback["direction"],
+            "structure_level": ema_pullback.get("level"),
+            # The candle detect_ema_pullback actually tested (see its
+            # require_closed_candle behavior) - same shape as
+            # LIQUIDITY_SWEEP/OB_FVG_RETEST/ORDER_BLOCK_RETEST above.
+            "trigger_candle_open_time": ema_pullback.get("open_time"),
         })
 
     if not candidates:

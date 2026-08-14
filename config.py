@@ -491,6 +491,32 @@ OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES = env_int("OI_DIVERGENCE_TRIGGER_MAX_AGE_C
 LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED = env_bool(
     "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", "False"
 )
+# Ninth entry trigger: a pullback to the EMA within an established trend,
+# followed by a same-candle reclaim (see market_structure.
+# detect_ema_pullback) - the classic trend-continuation entry. Real
+# motivation (2026-08-14, direct evidence): with all 8 other triggers
+# live for a full session, a live bot.log check showed BTCUSDT/ETHUSDT/
+# BNBUSDT/SOLUSDT produced ZERO signal-related log activity (no SIGNAL,
+# no plan-rejected, no position-closed - not even a rejection at the
+# final gate the way alts get, filtered out before any per-symbol event
+# ever fires). Majors trend smoothly with shallow pullbacks and
+# naturally balanced, deep order flow, so the deep OTE retracement
+# (OTE_RETRACEMENT_MIN=0.705) and CVD/depth imbalance thresholds every
+# other trigger's downstream gate requires almost never get satisfied on
+# them, no matter how many detector TYPES exist upstream feeding that
+# same gate. This one is structurally different: it only needs a
+# shallow touch-and-reclaim of the trend's own moving average, not a
+# deep retracement or an order-flow imbalance - closer to how majors are
+# actually traded. Needs config.EMA_CONFIRMATION_ENABLED=True (already
+# on) - reuses the same ema_value already computed for the informational
+# ema_aligned field in signal_engine.py, zero extra cost, rather than a
+# second EMA calculation. Still subject to every other shared downstream
+# gate (HTF bias, zone, OTE, REQUIRE_ORDER_BLOCK_OR_FVG, CVD, depth) like
+# every other trigger - this doesn't bypass those, it just adds one more
+# way to produce a candidate before they're checked. Brand new,
+# unvalidated mechanism - default OFF, same convention as every other
+# trigger.
+EMA_PULLBACK_TRIGGER_ENABLED = env_bool("EMA_PULLBACK_TRIGGER_ENABLED", "False")
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

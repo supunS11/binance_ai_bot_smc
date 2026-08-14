@@ -1342,6 +1342,7 @@ class EarlyBreakevenProfitLockedDerivationTests(unittest.TestCase):
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
              patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
+             patch.object(config, "PROFIT_PROTECTION_ENABLED", False), \
              patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
              patch.object(
                  market_structure, "structure_state",
@@ -1370,10 +1371,19 @@ class PollShadowTests(unittest.TestCase):
         # path actually verified). Off by default here; the tests that
         # actually exercise early breakeven turn it back on locally.
         self.early_breakeven_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
+        # Same reasoning as early_breakeven_patcher above -
+        # PROFIT_PROTECTION_ENABLED now defaults True in the loaded .env,
+        # and is checked even before early breakeven - without this, a
+        # candle favorable enough to hit TP1 can also satisfy the
+        # profit-protection lock price and silently hijack tests meant to
+        # exercise the plain TP1/trailing/breakeven paths.
+        self.profit_protection_patcher = patch.object(config, "PROFIT_PROTECTION_ENABLED", False)
         self.early_breakeven_patcher.start()
+        self.profit_protection_patcher.start()
 
     def tearDown(self):
         self.early_breakeven_patcher.stop()
+        self.profit_protection_patcher.stop()
 
     def _manager_with_position(self, side="BUY", confluence_ratio=None):
         manager = PositionManager()
