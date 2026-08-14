@@ -95,7 +95,22 @@ VOLUME_POLL_INTERVAL_SECONDS = env_int("VOLUME_POLL_INTERVAL_SECONDS", 300)
 # real quality cutoff sits. A symbol with no volume data yet (poll hasn't
 # completed, or the ticker endpoint has nothing for it) is let through
 # rather than blocked - never gate on data we don't actually have.
-MIN_24H_QUOTE_VOLUME_USDT = env_float("MIN_24H_QUOTE_VOLUME_USDT", 3000000)
+# Lowered from 3,000,000 -> 1,500,000 (2026-08-14, operator request after
+# real evidence): this single reason alone accounted for ~49% of every
+# rejection tallied in the live bot.log - and a direct symbol-count check
+# (exchange.get_24h_quote_volumes() against the real WATCHLIST_SIZE=400
+# top-by-volume selection) showed why: only 209 of those 400 watchlisted
+# symbols actually cleared the old 3M floor, with another 115 sitting in
+# the 1.5M-3M band that this change now admits (76 remain below 1.5M,
+# still blocked). Free in infra terms - every watchlisted symbol already
+# gets full websocket data collection regardless of this check, so this
+# only stops discarding data already being paid for, it doesn't add any
+# load. Real open question, not yet resolved: whether this newly-admitted
+# 1.5M-3M cohort converts to trades at a similar rate to the 3M+ cohort,
+# or worse given the wider spreads/thinner books smaller-cap symbols
+# carry - watch journal_analysis.py for that specific band once trades
+# accumulate.
+MIN_24H_QUOTE_VOLUME_USDT = env_float("MIN_24H_QUOTE_VOLUME_USDT", 1500000)
 
 # =========================
 # WEBSOCKET DATA LAYER
