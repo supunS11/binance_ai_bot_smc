@@ -203,7 +203,17 @@ EMA_CONFIRMATION_PERIOD = env_int("EMA_CONFIRMATION_PERIOD", 20)
 OI_CONFIRMATION_ENABLED = env_bool("OI_CONFIRMATION_ENABLED", "True")
 OI_POLL_INTERVAL_SECONDS = env_int("OI_POLL_INTERVAL_SECONDS", 60)
 OI_LOOKBACK_SECONDS = env_int("OI_LOOKBACK_SECONDS", 900)
-OI_HISTORY_MAX_SAMPLES = env_int("OI_HISTORY_MAX_SAMPLES", 60)
+# Raised from 60 -> 1440 (2026-08-14): the old default only retained
+# ~1 hour of history (60 samples x OI_POLL_INTERVAL_SECONDS=60s), enough
+# for snapshot()'s own OI_LOOKBACK_SECONDS (900s) change-pct read, but
+# nowhere near enough for OI_DIVERGENCE_TRIGGER_ENABLED below, which
+# needs OI's value AT two swing points that can easily be many hours
+# apart on this bot's 1h LTF (WS_KLINE_INTERVAL) with SWING_LEFT/RIGHT=4
+# requiring several confirmed candles just to form one swing. 1440
+# samples = ~24h at the default poll interval - cheap (one float per
+# sample) and a reasoned starting point, not calibrated against how far
+# apart real swing pairs actually land.
+OI_HISTORY_MAX_SAMPLES = env_int("OI_HISTORY_MAX_SAMPLES", 1440)
 # Evidence (2026-08-08, live, WATCHING=519): a large watchlist includes
 # symbols the OI endpoint will never answer for - delisted/settling/
 # pre-trading (-4108) or simply no longer valid (-1121, e.g. stale
@@ -394,6 +404,66 @@ CVD_DIVERGENCE_TRIGGER_ENABLED = env_bool("CVD_DIVERGENCE_TRIGGER_ENABLED", "Fal
 # CVD reading at all). Starting value, not yet calibrated against real
 # trade data.
 CVD_DIVERGENCE_MIN_DELTA_USDT = env_float("CVD_DIVERGENCE_MIN_DELTA_USDT", 5000)
+# Sixth entry trigger: a fresh rejection wick back into a previously-
+# formed, UNMITIGATED order block (market_structure.find_order_block_
+# retest) - the order-block counterpart to OB_FVG_RETEST_TRIGGER_ENABLED
+# above, deliberately deferred when that one was built (see its own
+# comment: needed a new forward-scanning variant of find_order_block,
+# more engineering than the flat FVG list needed at the time). Now built
+# via find_structure_events/find_order_blocks - every historical BOS/
+# CHoCH's origin block, not just the single most-recent one
+# REQUIRE_ORDER_BLOCK_OR_FVG already reads. Brand new, unvalidated
+# mechanism - default OFF, same convention as every other trigger.
+ORDER_BLOCK_RETEST_TRIGGER_ENABLED = env_bool("ORDER_BLOCK_RETEST_TRIGGER_ENABLED", "False")
+ORDER_BLOCK_RETEST_MAX_AGE_CANDLES = env_int("ORDER_BLOCK_RETEST_MAX_AGE_CANDLES", 20)
+# How many of the most recent confirmed BOS/CHoCH events to derive order
+# blocks from - bounds both compute cost and staleness (an origin block
+# from 30 structure breaks ago is no longer a meaningful retest target).
+ORDER_BLOCK_RETEST_LOOKBACK_EVENTS = env_int("ORDER_BLOCK_RETEST_LOOKBACK_EVENTS", 5)
+# Seventh entry trigger: price's swing structure vs OPEN INTEREST's value
+# at those same swing points (oi_divergence.py) - a new price extreme not
+# backed by expanding OI is weaker evidence than one where OI genuinely
+# built up alongside it. Same divergence concept as CVD_DIVERGENCE above,
+# different metric - reuses open_interest.OpenInterestEngine's existing
+# per-symbol history (OpenInterestEngine.history(), see OI_HISTORY_
+# MAX_SAMPLES above for why that retention window was widened
+# specifically to support this). Needs OI_CONFIRMATION_ENABLED=True (the
+# OI poll only runs when that's on - see ws_client._start_oi_poll) or
+# this trigger will simply never have data to work with. Brand new,
+# unvalidated mechanism - default OFF, same convention as every other
+# trigger.
+OI_DIVERGENCE_TRIGGER_ENABLED = env_bool("OI_DIVERGENCE_TRIGGER_ENABLED", "False")
+# Minimum OI decline (%, across the two compared swing points) that
+# counts as real divergence rather than noise. Starting value, not yet
+# calibrated against real trade data.
+OI_DIVERGENCE_MIN_DELTA_PCT = env_float("OI_DIVERGENCE_MIN_DELTA_PCT", 5.0)
+# Same shape as CHOCH_TRIGGER_MAX_AGE_CANDLES/ORDER_FLOW_DIVERGENCE_
+# LOOKBACK - how stale the qualifying swing point is allowed to be before
+# this trigger stops firing on it. Kept as its own knob (not reusing
+# ORDER_FLOW_DIVERGENCE_LOOKBACK) since OI_DIVERGENCE is a genuinely
+# distinct trigger from CVD_DIVERGENCE and may need a different staleness
+# tolerance once real data exists for both.
+OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES = env_int("OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES", 20)
+# Eighth entry trigger: promotes a plain LIQUIDITY_SWEEP into a stricter,
+# distinct trigger by additionally requiring a REAL clustered forced-
+# liquidation event backing it (liquidity_sweep.detect_liquidation_
+# confirmed_sweep) - not just the informational-only liquidation_aligned/
+# liquidation_cluster fields every trigger already journals, but a
+# genuine gating condition: the swept level actually forced real
+# positions closed in the sweep's direction. Reuses
+# LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT (no new notional threshold - the
+# existing "is this liquidation flow big enough to matter at all"
+# question is the same question here) and the exact same alignment
+# formula signal_engine.py already uses for the informational field, not
+# a new definition. Can only ever be MORE selective than LIQUIDITY_SWEEP
+# alone, never a relaxation of it. Needs LIQUIDATION_CONFIRMATION_ENABLED=
+# True (gates the liquidation websocket stream itself - see ws_client.
+# _start_liquidation_stream) or this trigger will never have data. Brand
+# new, unvalidated mechanism - default OFF, same convention as every
+# other trigger.
+LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED = env_bool(
+    "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", "False"
+)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

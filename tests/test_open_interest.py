@@ -77,5 +77,44 @@ class OpenInterestEngineTests(unittest.TestCase):
         self.assertTrue(engine.snapshot("ETHUSDT")["available"])
 
 
+class HistoryTests(unittest.TestCase):
+    """Backs OI_DIVERGENCE_TRIGGER_ENABLED (oi_divergence.py), which needs
+    OI's value AT specific past timestamps - not just snapshot()'s own
+    recent-window change-pct read."""
+
+    def test_history_returns_raw_samples_in_order(self):
+        engine = OpenInterestEngine()
+        engine.record("BTCUSDT", 1000, timestamp=100)
+        engine.record("BTCUSDT", 1100, timestamp=200)
+
+        self.assertEqual(engine.history("BTCUSDT"), [(100, 1000.0), (200, 1100.0)])
+
+    def test_history_for_unknown_symbol_is_empty(self):
+        engine = OpenInterestEngine()
+        self.assertEqual(engine.history("NOPE"), [])
+
+    def test_history_is_bounded_by_oi_history_max_samples(self):
+        engine = OpenInterestEngine()
+
+        with patch.object(config, "OI_HISTORY_MAX_SAMPLES", 3):
+            for i in range(5):
+                engine.record("BTCUSDT", 1000 + i, timestamp=i)
+
+        self.assertEqual(len(engine.history("BTCUSDT")), 3)
+        self.assertEqual([ts for ts, _ in engine.history("BTCUSDT")], [2, 3, 4])
+
+    def test_snapshot_includes_history(self):
+        engine = OpenInterestEngine()
+        engine.record("BTCUSDT", 1000, timestamp=100)
+
+        snapshot = engine.snapshot("BTCUSDT", now=101)
+
+        self.assertEqual(snapshot["history"], [(100, 1000.0)])
+
+    def test_snapshot_includes_empty_history_when_unavailable(self):
+        engine = OpenInterestEngine()
+        self.assertEqual(engine.snapshot("DOESNOTEXIST")["history"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

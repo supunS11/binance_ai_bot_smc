@@ -16,6 +16,7 @@ import config
 import cvd_divergence
 import liquidity_sweep
 import market_structure
+import oi_divergence
 
 
 _BULLISH_TO_SIDE = {"BULLISH": "BUY", "BEARISH": "SELL"}
@@ -80,16 +81,19 @@ def evaluate(
     # trigger for symbols whose price rarely produces a clean structure
     # break but does sweep organized liquidity (see liquidity_sweep.py).
     # Hoisted here (instead of computed later, its original position -
-    # see the guarded recompute inside _evaluate_direction below) ONLY
-    # when the flag is on, so there is zero added cost across the
-    # watchlist every eval tick when it's off (the default) - pools/sweep
-    # are computed exactly once either way, never twice, regardless of
-    # how many candidates/directions end up being evaluated (see the
+    # see the guarded recompute inside _evaluate_direction below) when
+    # EITHER that flag OR config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_
+    # ENABLED is on (the latter needs a real `sweep` to additionally
+    # confirm against real liquidation flow - see liquidity_sweep.
+    # detect_liquidation_confirmed_sweep) - zero added cost across the
+    # watchlist every eval tick when BOTH are off (the default) - pools/
+    # sweep are computed exactly once either way, never twice, regardless
+    # of how many candidates/directions end up being evaluated (see the
     # `nonlocal` note below).
     pools = None
     sweep = None
 
-    if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED:
+    if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED or config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED:
         pools = market_structure.find_liquidity_pools(
             market_structure.find_swing_points(ltf_candles)
         )
@@ -120,6 +124,39 @@ def evaluate(
             divergence_swings, cvd_snapshot.get("history") or []
         )
 
+    # config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED - a sixth, alternative
+    # entry trigger: a fresh rejection wick back into a previously-formed,
+    # unmitigated order block (see market_structure.find_order_block_retest).
+    order_block_retest = None
+
+    if config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED:
+        order_block_retest = market_structure.find_order_block_retest(ltf_candles)
+
+    # config.OI_DIVERGENCE_TRIGGER_ENABLED - a seventh, alternative entry
+    # trigger: price's swing structure vs open interest's value at those
+    # same swing points (see oi_divergence.py). Reuses the OI history
+    # oi_snapshot already carries (OpenInterestEngine.snapshot()'s
+    # "history" key) rather than a separate fetch.
+    oi_divergence_result = None
+
+    if config.OI_DIVERGENCE_TRIGGER_ENABLED:
+        oi_divergence_swings = market_structure.find_swing_points(ltf_candles)
+        oi_divergence_result = oi_divergence.detect_divergence(
+            oi_divergence_swings, (oi_snapshot or {}).get("history") or []
+        )
+
+    # config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED - an eighth,
+    # alternative entry trigger: a plain LIQUIDITY_SWEEP additionally
+    # confirmed by a real clustered forced-liquidation event (see
+    # liquidity_sweep.detect_liquidation_confirmed_sweep). `sweep` is
+    # already hoisted above whenever this flag is on.
+    liquidation_confirmed_sweep = None
+
+    if config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED:
+        liquidation_confirmed_sweep = liquidity_sweep.detect_liquidation_confirmed_sweep(
+            sweep, liquidation_snapshot
+        )
+
     # ema_value/btc_correlation/btc_return hoisted here (same gating as
     # before) because neither depends on direction - only the derived
     # ema_aligned/btc_aligned booleans do, computed per-direction inside
@@ -144,7 +181,8 @@ def evaluate(
 
     # Candidate list - same detection conditions and same priority order
     # as before (STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
-    # CHOCH_RETEST > CVD_DIVERGENCE), but no longer short-circuited into
+    # CHOCH_RETEST > CVD_DIVERGENCE > ORDER_BLOCK_RETEST > OI_DIVERGENCE >
+    # LIQUIDATION_SWEEP_CONFIRMED), but no longer short-circuited into
     # if/elif: every
     # currently-qualifying trigger becomes a candidate, and the selection
     # logic below decides which one actually wins (see
@@ -230,6 +268,49 @@ def evaluate(
             # swing price (its own low/high) - trivially true almost
             # every time, a meaningless "confirmation".
             "trigger_candle_open_time": None,
+        })
+
+    if config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED and order_block_retest is not None:
+        candidates.append({
+            "signal_trigger": "ORDER_BLOCK_RETEST",
+            "direction": order_block_retest["direction"],
+            "structure_level": order_block_retest.get("level"),
+            # The candle find_order_block_retest actually tested (see its
+            # require_closed_candle behavior) - same shape as OB_FVG_RETEST
+            # above. Max-age gating already happened inside
+            # find_order_block_retest itself (ORDER_BLOCK_RETEST_MAX_AGE_
+            # CANDLES), not repeated here.
+            "trigger_candle_open_time": order_block_retest.get("open_time"),
+        })
+
+    if (
+        config.OI_DIVERGENCE_TRIGGER_ENABLED
+        and oi_divergence_result is not None
+        and (len(ltf_candles) - 1 - oi_divergence_result["index"])
+            <= max(int(config.OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES), 0)
+    ):
+        candidates.append({
+            "signal_trigger": "OI_DIVERGENCE",
+            "direction": oi_divergence_result["direction"],
+            "structure_level": oi_divergence_result.get("level"),
+            # Deliberately None, same reasoning as CVD_DIVERGENCE above -
+            # this is the OLD swing candle's open_time, not a candle being
+            # entered on right now.
+            "trigger_candle_open_time": None,
+        })
+
+    if (
+        config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED
+        and liquidation_confirmed_sweep is not None
+    ):
+        candidates.append({
+            "signal_trigger": "LIQUIDATION_SWEEP_CONFIRMED",
+            "direction": liquidation_confirmed_sweep["direction"],
+            "structure_level": liquidation_confirmed_sweep.get("level"),
+            # Same shape as LIQUIDITY_SWEEP above - liquidation_confirmed_
+            # sweep is a copy of the same close-confirmed sweep dict, just
+            # additionally gated on real liquidation flow.
+            "trigger_candle_open_time": liquidation_confirmed_sweep.get("open_time"),
         })
 
     if not candidates:

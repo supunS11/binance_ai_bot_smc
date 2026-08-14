@@ -5,6 +5,7 @@ import config
 import cvd_divergence
 import liquidity_sweep
 import market_structure
+import oi_divergence
 import risk_manager
 import signal_engine
 
@@ -68,6 +69,16 @@ class SignalEngineTests(unittest.TestCase):
         divergence_level=None,
         divergence_index=5,
         divergence_open_time=999,
+        order_block_retest_direction=None,
+        order_block_retest_level=None,
+        order_block_retest_open_time=777,
+        oi_divergence_direction=None,
+        oi_divergence_level=None,
+        oi_divergence_index=5,
+        oi_divergence_open_time=888,
+        liquidation_confirmed_sweep_direction=None,
+        liquidation_confirmed_sweep_level=None,
+        liquidation_confirmed_sweep_open_time=666,
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -100,6 +111,28 @@ class SignalEngineTests(unittest.TestCase):
             }
             if divergence_direction else None
         )
+        order_block_retest = (
+            {
+                "direction": order_block_retest_direction, "level": order_block_retest_level,
+                "open_time": order_block_retest_open_time,
+            }
+            if order_block_retest_direction else None
+        )
+        oi_divergence_result = (
+            {
+                "direction": oi_divergence_direction, "level": oi_divergence_level,
+                "index": oi_divergence_index, "open_time": oi_divergence_open_time,
+            }
+            if oi_divergence_direction else None
+        )
+        liquidation_confirmed_sweep = (
+            {
+                "direction": liquidation_confirmed_sweep_direction,
+                "level": liquidation_confirmed_sweep_level,
+                "open_time": liquidation_confirmed_sweep_open_time,
+            }
+            if liquidation_confirmed_sweep_direction else None
+        )
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
         liquidation_snapshot = (
             LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
@@ -113,11 +146,17 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
              patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest), \
+             patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest), \
              patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
              patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
              patch.object(market_structure, "price_return", return_value=btc_return), \
              patch.object(liquidity_sweep, "detect_sweep", return_value=sweep), \
-             patch.object(cvd_divergence, "detect_divergence", return_value=divergence):
+             patch.object(
+                 liquidity_sweep, "detect_liquidation_confirmed_sweep",
+                 return_value=liquidation_confirmed_sweep,
+             ), \
+             patch.object(cvd_divergence, "detect_divergence", return_value=divergence), \
+             patch.object(oi_divergence, "detect_divergence", return_value=oi_divergence_result):
             return signal_engine.evaluate(
                 symbol, ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
@@ -1129,6 +1168,334 @@ class SignalEngineTests(unittest.TestCase):
                 htf_structure=HTF_BEARISH, ltf_analysis=analysis,
                 sweep_direction=None, ema_value=115.0,
                 divergence_direction="BEARISH", divergence_level=112,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    # config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED - a fresh rejection wick
+    # back into a previously-formed, unmitigated order block. Ranked
+    # after CVD_DIVERGENCE: STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_
+    # SWEEP > CHOCH_RETEST > CVD_DIVERGENCE > ORDER_BLOCK_RETEST >
+    # OI_DIVERGENCE > LIQUIDATION_SWEEP_CONFIRMED. find_order_block_retest
+    # itself is mocked (see _run()'s order_block_retest_* params) - its
+    # own logic is covered in test_market_structure.py.
+
+    def test_order_block_retest_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_order_block_retest_triggered_signal_when_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+                order_block_retest_open_time=321,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+        self.assertEqual(result["structure_level"], 88)
+        self.assertEqual(result["trigger_candle_open_time"], 321)
+
+    def test_cvd_divergence_takes_priority_over_order_block_retest(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            # Same level on both candidates - a tied _score() always
+            # favors the fixed-priority default regardless of whether
+            # TRIGGER_QUALITY_RANKING_ENABLED happens to be True in the
+            # loaded .env (min() keeps the first equal-scored candidate).
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+            )
+
+        self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
+
+    def test_order_block_retest_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_order_block_retest_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_order_block_retest_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                order_block_retest_direction="BEARISH", order_block_retest_level=112,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    # config.OI_DIVERGENCE_TRIGGER_ENABLED - price's swing structure vs
+    # open interest at those same swing points. Ranked after
+    # ORDER_BLOCK_RETEST. oi_divergence.detect_divergence itself is
+    # mocked (see _run()'s oi_divergence_* params) - its own logic is
+    # covered in test_oi_divergence.py.
+
+    def test_oi_divergence_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_oi_divergence_triggered_signal_when_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "OI_DIVERGENCE")
+        self.assertEqual(result["structure_level"], 88)
+        self.assertIsNone(result["trigger_candle_open_time"])
+
+    def test_oi_divergence_ignored_when_too_old(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES", 5):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+                oi_divergence_index=-10,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_order_block_retest_takes_priority_over_oi_divergence(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True):
+            # Same level on both candidates - see the identical note on
+            # test_cvd_divergence_takes_priority_over_order_block_retest.
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+            )
+
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+
+    def test_oi_divergence_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_oi_divergence_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_oi_divergence_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                oi_divergence_direction="BEARISH", oi_divergence_level=112,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    # config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED - a plain
+    # LIQUIDITY_SWEEP additionally confirmed by a real clustered forced-
+    # liquidation event. Ranked last of all 8 triggers.
+    # liquidity_sweep.detect_liquidation_confirmed_sweep itself is mocked
+    # (see _run()'s liquidation_confirmed_sweep_* params) - its own logic
+    # is covered in test_liquidity_sweep.py.
+
+    def test_liquidation_sweep_confirmed_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                liquidation_confirmed_sweep_direction="BULLISH",
+                liquidation_confirmed_sweep_level=88,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_liquidation_sweep_confirmed_triggered_signal_when_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                liquidation_confirmed_sweep_direction="BULLISH",
+                liquidation_confirmed_sweep_level=88,
+                liquidation_confirmed_sweep_open_time=654,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "LIQUIDATION_SWEEP_CONFIRMED")
+        self.assertEqual(result["structure_level"], 88)
+        self.assertEqual(result["trigger_candle_open_time"], 654)
+
+    def test_oi_divergence_takes_priority_over_liquidation_sweep_confirmed(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True):
+            # Same level on both candidates - see the identical note on
+            # test_cvd_divergence_takes_priority_over_order_block_retest.
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                oi_divergence_direction="BULLISH", oi_divergence_level=88,
+                liquidation_confirmed_sweep_direction="BULLISH",
+                liquidation_confirmed_sweep_level=88,
+            )
+
+        self.assertEqual(result["signal_trigger"], "OI_DIVERGENCE")
+
+    def test_liquidation_sweep_confirmed_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                liquidation_confirmed_sweep_direction="BULLISH",
+                liquidation_confirmed_sweep_level=88,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_liquidation_sweep_confirmed_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                liquidation_confirmed_sweep_direction="BULLISH",
+                liquidation_confirmed_sweep_level=88,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_liquidation_sweep_confirmed_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                liquidation_confirmed_sweep_direction="BEARISH",
+                liquidation_confirmed_sweep_level=112,
             )
 
             plan, status = risk_manager.build_trade_plan(result, balance=1000)

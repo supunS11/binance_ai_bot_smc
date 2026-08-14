@@ -83,6 +83,13 @@ class ClassifySwingsTests(unittest.TestCase):
         self.assertEqual(result["last_event"]["type"], "BOS")
         self.assertEqual(result["last_swing_high"], 14)
         self.assertEqual(result["last_swing_low"], 9)
+        # events: every BOS/CHoCH found, not just last_event - backs
+        # find_structure_events/find_order_blocks (ORDER_BLOCK_RETEST_
+        # TRIGGER_ENABLED). Only 1 here: the first HIGH/LOW never produce
+        # an event (nothing prior to compare against), only the final
+        # HIGH(14) exceeding HIGH(12) does.
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["events"][-1], result["last_event"])
 
     def test_lower_low_after_bullish_trend_is_choch(self):
         swings = [
@@ -399,6 +406,219 @@ class FindFvgRetestRequireClosedCandleTests(unittest.TestCase):
         candles = self._gapped_candles(retest_closed=False)
 
         result = ms.find_fvg_retest(candles, require_closed_candle=False)
+
+        self.assertIsNotNone(result)
+
+
+class FindStructureEventsTests(unittest.TestCase):
+    """Backs ORDER_BLOCK_RETEST_TRIGGER_ENABLED's find_order_blocks below -
+    structure_state/_classify_swings only expose the single most recent
+    event (last_event); this needs every one across the full sequence."""
+
+    def test_returns_every_bos_choch_not_just_the_last(self):
+        with patch.object(ms, "find_swing_points", return_value=[
+            ms.SwingPoint(1, 100, 8, "LOW"),
+            ms.SwingPoint(3, 300, 12, "HIGH"),   # first high: recorded, no event yet
+            ms.SwingPoint(5, 500, 9, "LOW"),     # higher low, no event
+            ms.SwingPoint(7, 700, 14, "HIGH"),   # higher high -> BOS #1, trend BULLISH
+            ms.SwingPoint(9, 900, 6, "LOW"),     # lower low -> CHoCH #2, trend BEARISH
+            ms.SwingPoint(11, 1100, 10, "HIGH"), # not a new high (10 < 14), no event
+            ms.SwingPoint(13, 1300, 4, "LOW"),   # lower low -> continuation BOS #3
+        ]):
+            events = ms.find_structure_events([])
+
+        self.assertEqual([e["type"] for e in events], ["BOS", "CHoCH", "BOS"])
+        self.assertEqual([e["index"] for e in events], [7, 9, 13])
+        self.assertEqual(events[-1]["direction"], "BEARISH")
+
+    def test_fewer_than_two_swings_returns_empty_list(self):
+        with patch.object(ms, "find_swing_points", return_value=[ms.SwingPoint(1, 100, 8, "LOW")]):
+            self.assertEqual(ms.find_structure_events([]), [])
+
+
+class FindOrderBlocksTests(unittest.TestCase):
+    def test_builds_a_block_for_each_recent_event(self):
+        candles = [
+            _candle(0, high=5, low=4, open_=5, close=4),    # bearish - origin of event @1
+            _candle(1, high=8, low=6, open_=6, close=8),     # bullish impulsive move
+            _candle(2, high=6, low=5, open_=6, close=5),     # bearish - origin of event @3
+            _candle(3, high=10, low=7, open_=7, close=10),   # bullish impulsive move
+        ]
+        events = [
+            {"type": "BOS", "direction": "BULLISH", "index": 1, "price": 8},
+            {"type": "BOS", "direction": "BULLISH", "index": 3, "price": 10},
+        ]
+
+        with patch.object(ms, "find_structure_events", return_value=events):
+            blocks = ms.find_order_blocks(candles, max_events=5)
+
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["direction"], "BULLISH")
+        self.assertEqual(blocks[0]["index"], 0)
+        self.assertEqual(blocks[1]["index"], 2)
+
+    def test_max_events_limits_how_many_recent_breaks_are_considered(self):
+        candles = [
+            _candle(0, high=5, low=4, open_=5, close=4),
+            _candle(1, high=8, low=6, open_=6, close=8),
+            _candle(2, high=6, low=5, open_=6, close=5),
+            _candle(3, high=10, low=7, open_=7, close=10),
+        ]
+        events = [
+            {"type": "BOS", "direction": "BULLISH", "index": 1, "price": 8},
+            {"type": "BOS", "direction": "BULLISH", "index": 3, "price": 10},
+        ]
+
+        with patch.object(ms, "find_structure_events", return_value=events):
+            blocks = ms.find_order_blocks(candles, max_events=1)
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["index"], 2)
+
+    def test_event_with_no_qualifying_order_block_is_skipped(self):
+        candles = [_candle(0, high=5, low=4, open_=4, close=5)]  # only a bullish candle exists
+        events = [{"type": "BOS", "direction": "BULLISH", "index": 0, "price": 5}]
+
+        with patch.object(ms, "find_structure_events", return_value=events):
+            blocks = ms.find_order_blocks(candles)
+
+        self.assertEqual(blocks, [])
+
+    def test_max_events_zero_or_negative_returns_no_blocks(self):
+        with patch.object(ms, "find_structure_events", return_value=[
+            {"type": "BOS", "direction": "BULLISH", "index": 0, "price": 5},
+        ]):
+            self.assertEqual(ms.find_order_blocks([_candle(0, high=5, low=4)], max_events=0), [])
+
+
+class FindOrderBlockRetestTests(unittest.TestCase):
+    def test_wick_and_reject_into_bullish_block(self):
+        candles = [
+            _candle(0, high=5, low=4, open_=5, close=4),   # origin block: high=5, low=4
+            _candle(1, high=8, low=6, open_=6, close=8),
+            _candle(2, high=10, low=7, open_=7, close=9),
+            _candle(3, high=5.5, low=4.2, open_=5.3, close=4.8),  # wick in, close above low(4)
+        ]
+        blocks = [{"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}]
+
+        result = ms.find_order_block_retest(candles, blocks=blocks)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["level"], 4)
+
+    def test_wick_and_reject_into_bearish_block(self):
+        candles = [
+            _candle(0, high=10, low=9, open_=9, close=10),  # origin block: high=10, low=9
+            _candle(1, high=8, low=6),
+            _candle(2, high=7, low=5),
+            _candle(3, high=10.3, low=9.5, open_=9.8, close=9.6),  # wick in, close below high(10)
+        ]
+        blocks = [{"direction": "BEARISH", "high": 10, "low": 9, "index": 0, "open_time": 0}]
+
+        result = ms.find_order_block_retest(candles, blocks=blocks)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertEqual(result["level"], 10)
+
+    def test_block_mitigated_by_a_close_past_the_far_edge_is_excluded(self):
+        candles = [
+            _candle(0, high=5, low=4, open_=5, close=4),
+            _candle(1, high=6, low=3, open_=5, close=3.5),  # closes below low(4) -> mitigates
+            _candle(2, high=5.5, low=4.2, open_=5.3, close=4.8),  # would otherwise retest
+        ]
+        blocks = [{"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}]
+
+        result = ms.find_order_block_retest(candles, blocks=blocks)
+
+        self.assertIsNone(result)
+
+    def test_block_older_than_max_age_is_ignored(self):
+        candles = [
+            _candle(0, high=5, low=4, open_=5, close=4),
+            _candle(1, high=6, low=5),
+            _candle(2, high=6, low=5),
+            _candle(3, high=5.5, low=4.2, open_=5.3, close=4.8),
+        ]
+        blocks = [{"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}]
+
+        result = ms.find_order_block_retest(candles, blocks=blocks, max_age_candles=1)
+
+        self.assertIsNone(result)
+
+    def test_no_blocks_is_none(self):
+        candles = [_candle(0, high=10, low=9), _candle(1, high=10.5, low=9.5)]
+        self.assertIsNone(ms.find_order_block_retest(candles, blocks=[]))
+
+    def test_insufficient_candles_is_none(self):
+        self.assertIsNone(ms.find_order_block_retest([_candle(0, high=10, low=9)]))
+
+    def test_result_includes_the_tested_candles_open_time(self):
+        candles = [
+            _candle(0, high=5, low=4, open_=5, close=4),
+            _candle(1, high=6, low=5),
+            _candle(2, high=6, low=5),
+            _candle(3, high=5.5, low=4.2, open_=5.3, close=4.8),
+        ]
+        blocks = [{"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}]
+
+        result = ms.find_order_block_retest(candles, blocks=blocks)
+
+        self.assertEqual(result["open_time"], 3)
+
+    def test_computes_blocks_internally_when_not_provided(self):
+        candles = [_candle(0, high=5, low=4), _candle(1, high=6, low=5)]
+
+        with patch.object(ms, "find_order_blocks", return_value=[]):
+            result = ms.find_order_block_retest(candles)
+
+        self.assertIsNone(result)
+
+
+class FindOrderBlockRetestRequireClosedCandleTests(unittest.TestCase):
+    def _blocked_candles(self, retest_closed):
+        return [
+            _candle(0, high=5, low=4, open_=5, close=4),
+            _candle(1, high=9, low=8),   # well above the block - not a retest
+            _candle(2, high=9, low=8),   # well above the block - not a retest
+            _candle(3, high=5.5, low=4.2, open_=5.3, close=4.8, closed=retest_closed),
+        ]
+
+    def _blocks(self):
+        return [{"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}]
+
+    def test_forming_retest_candle_is_ignored_when_required(self):
+        result = ms.find_order_block_retest(
+            self._blocked_candles(False), blocks=self._blocks(), require_closed_candle=True
+        )
+        self.assertIsNone(result)
+
+    def test_fires_once_the_retest_candle_closes(self):
+        result = ms.find_order_block_retest(
+            self._blocked_candles(True), blocks=self._blocks(), require_closed_candle=True
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["open_time"], 3)
+
+    def test_no_closed_candle_at_all_returns_none(self):
+        candles = [
+            _candle(0, high=10, low=9, closed=False),
+            _candle(1, high=10, low=9, closed=False),
+        ]
+        result = ms.find_order_block_retest(candles, blocks=self._blocks(), require_closed_candle=True)
+        self.assertIsNone(result)
+
+    def test_defaults_from_config(self):
+        with patch.object(config, "REQUIRE_CLOSE_CONFIRMED_BREAK", True):
+            result = ms.find_order_block_retest(self._blocked_candles(False), blocks=self._blocks())
+
+        self.assertIsNone(result)
+
+    def test_require_closed_candle_false_checks_the_forming_candle(self):
+        result = ms.find_order_block_retest(
+            self._blocked_candles(False), blocks=self._blocks(), require_closed_candle=False
+        )
 
         self.assertIsNotNone(result)
 

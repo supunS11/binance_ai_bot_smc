@@ -89,7 +89,13 @@ def _classify_swings(swings):
     trend break is defined as the newest confirmed pivot exceeding the
     *previous* confirmed pivot in the same direction (a higher high, or a
     lower low). Split out from structure_state so the classification logic
-    can be unit-tested against hand-built swing sequences directly."""
+    can be unit-tested against hand-built swing sequences directly.
+
+    `events` (every BOS/CHoCH found along the way, not just the last one)
+    backs ORDER_BLOCK_RETEST_TRIGGER_ENABLED's find_order_blocks below -
+    an origin block from several swings ago is still a valid, unmitigated
+    retest target, not just the very latest event structure_state's
+    original last_event-only shape exposed."""
     if len(swings) < 2:
         return {"available": False}
 
@@ -97,6 +103,7 @@ def _classify_swings(swings):
     last_high = None
     last_low = None
     last_event = None
+    events = []
 
     for swing in swings:
         if swing.kind == "HIGH":
@@ -111,6 +118,7 @@ def _classify_swings(swings):
                     "index": swing.index,
                     "price": swing.price,
                 }
+                events.append(last_event)
             last_high = swing
         else:
             if last_low is not None and swing.price < last_low.price:
@@ -124,12 +132,14 @@ def _classify_swings(swings):
                     "index": swing.index,
                     "price": swing.price,
                 }
+                events.append(last_event)
             last_low = swing
 
     return {
         "available": True,
         "trend": trend,
         "last_event": last_event,
+        "events": events,
         "last_swing_high": last_high.price if last_high else None,
         "last_swing_low": last_low.price if last_low else None,
         "swings": swings,
@@ -214,6 +224,113 @@ def find_order_block(candles, index, direction):
                 "low": candle["low"],
                 "open_time": candle["open_time"],
             }
+
+    return None
+
+
+def find_structure_events(candles, left=None, right=None):
+    """Every BOS/CHoCH event across the full swing sequence - structure_state
+    only exposes the single most recent one (last_event). Needed to
+    enumerate historical order blocks below (ORDER_BLOCK_RETEST_TRIGGER_
+    ENABLED): an origin block from several confirmed breaks ago is still
+    a valid, unmitigated retest target, not just the latest one. Recomputes
+    the same zigzag+classify walk structure_state does rather than
+    threading a new parameter through it - same "only pay for it when the
+    flag needing it is on" convention as LIQUIDITY_SWEEP_TRIGGER_ENABLED's
+    own pools/swings recompute."""
+    return _classify_swings(_zigzag(find_swing_points(candles, left, right))).get("events", [])
+
+
+def find_order_blocks(candles, left=None, right=None, max_events=None):
+    """Every historical order block whose origin was a REAL confirmed
+    structure break (BOS/CHoCH) - not a heuristic guess at "impulsive
+    candle", the same real definition find_order_block already uses for
+    the live REQUIRE_ORDER_BLOCK_OR_FVG gate, just enumerated across the
+    most recent max_events past breaks instead of only the very latest.
+    Mirrors find_fair_value_gaps's flat-list shape (direction/high/low/
+    index/open_time) so find_order_block_retest below can scan it the
+    same way find_fvg_retest scans fair_value_gaps."""
+    max_events = int(
+        config.ORDER_BLOCK_RETEST_LOOKBACK_EVENTS if max_events is None else max_events
+    )
+    events = find_structure_events(candles, left, right)
+    blocks = []
+
+    for event in events[-max_events:] if max_events > 0 else []:
+        block = find_order_block(candles, event["index"], event["direction"])
+
+        if block is not None:
+            blocks.append({
+                "direction": event["direction"],
+                "high": block["high"],
+                "low": block["low"],
+                "index": block["index"],
+                "open_time": block["open_time"],
+            })
+
+    return blocks
+
+
+def find_order_block_retest(candles, blocks=None, max_age_candles=None, require_closed_candle=None):
+    """A fresh rejection wick back into a previously-formed, UNMITIGATED
+    order block - the retest counterpart to find_fvg_retest, but for
+    order blocks instead of fair value gaps (deliberately deferred when
+    OB_FVG_RETEST_TRIGGER_ENABLED was first built - see that setting's
+    config.py comment: it needed exactly this forward-scanning variant of
+    find_order_block, more engineering than the flat FVG list needed at
+    the time). "Unmitigated" mirrors find_fvg_retest exactly: no candle
+    strictly between the block's origin index and the tested candle has
+    already CLOSED fully through it (a wick through doesn't invalidate
+    it - only a close past the far edge does).
+
+    By default (require_closed_candle=False) this tests the current,
+    possibly still-forming candle. When True (config.
+    REQUIRE_CLOSE_CONFIRMED_BREAK, reused here as the same principle
+    applied uniformly), scans back to the most recently CLOSED candle
+    instead. Returns the most recently formed qualifying block's retest
+    (direction/level/block/open_time - the candle actually tested), or
+    None."""
+    if len(candles) < 2:
+        return None
+
+    if require_closed_candle is None:
+        require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if require_closed_candle:
+        closed_candles = [(i, c) for i, c in enumerate(candles) if c.get("closed")]
+
+        if not closed_candles:
+            return None
+
+        latest_index, latest = closed_candles[-1]
+    else:
+        latest_index = len(candles) - 1
+        latest = candles[latest_index]
+
+    blocks = find_order_blocks(candles) if blocks is None else blocks
+    max_age = int(
+        config.ORDER_BLOCK_RETEST_MAX_AGE_CANDLES if max_age_candles is None else max_age_candles
+    )
+
+    for block in sorted(blocks, key=lambda b: b["index"], reverse=True):
+        if block["index"] >= latest_index or (latest_index - block["index"]) > max_age:
+            continue
+
+        high, low = block["high"], block["low"]
+        mitigated = any(
+            (block["direction"] == "BULLISH" and candles[i]["close"] < low)
+            or (block["direction"] == "BEARISH" and candles[i]["close"] > high)
+            for i in range(block["index"] + 1, latest_index)
+        )
+
+        if mitigated:
+            continue
+
+        if block["direction"] == "BULLISH" and latest["low"] <= high and latest["close"] > low:
+            return {"direction": "BULLISH", "level": low, "block": block, "open_time": latest["open_time"]}
+
+        if block["direction"] == "BEARISH" and latest["high"] >= low and latest["close"] < high:
+            return {"direction": "BEARISH", "level": high, "block": block, "open_time": latest["open_time"]}
 
     return None
 

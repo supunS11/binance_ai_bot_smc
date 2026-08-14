@@ -122,5 +122,100 @@ class RequireClosedCandleTests(unittest.TestCase):
         self.assertIsNotNone(sweep)
 
 
+_SWEEP = {"direction": "BULLISH", "level": 97, "wick_size": 2, "pool": {}, "open_time": 1}
+
+
+def _liquidation_snapshot(long_notional=0, short_notional=0, available=True):
+    return {
+        "available": available,
+        "long_liquidation_notional": long_notional,
+        "short_liquidation_notional": short_notional,
+        "net_liquidation_notional": long_notional - short_notional,
+    }
+
+
+class DetectLiquidationConfirmedSweepTests(unittest.TestCase):
+    """config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED - promotes a
+    plain sweep into a stricter trigger by additionally requiring a real
+    clustered forced-liquidation event, aligned with the sweep's
+    direction (same alignment formula signal_engine.py's own informational
+    liquidation_aligned field already uses)."""
+
+    def test_none_sweep_returns_none(self):
+        self.assertIsNone(
+            ls.detect_liquidation_confirmed_sweep(None, _liquidation_snapshot(long_notional=100000))
+        )
+
+    def test_unavailable_liquidation_snapshot_returns_none(self):
+        result = ls.detect_liquidation_confirmed_sweep(
+            _SWEEP, _liquidation_snapshot(long_notional=100000, available=False)
+        )
+        self.assertIsNone(result)
+
+    def test_none_liquidation_snapshot_returns_none(self):
+        self.assertIsNone(ls.detect_liquidation_confirmed_sweep(_SWEEP, None))
+
+    def test_total_notional_below_min_notional_returns_none(self):
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000):
+            result = ls.detect_liquidation_confirmed_sweep(
+                _SWEEP, _liquidation_snapshot(long_notional=10000)
+            )
+        self.assertIsNone(result)
+
+    def test_bullish_sweep_requires_positive_net_long_liquidations(self):
+        # BULLISH sweep + short liquidations dominating (net < 0) -> not aligned.
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000):
+            result = ls.detect_liquidation_confirmed_sweep(
+                _SWEEP, _liquidation_snapshot(long_notional=10000, short_notional=90000)
+            )
+        self.assertIsNone(result)
+
+    def test_bullish_sweep_with_aligned_long_liquidation_cluster_passes(self):
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000):
+            result = ls.detect_liquidation_confirmed_sweep(
+                _SWEEP, _liquidation_snapshot(long_notional=90000, short_notional=10000)
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["level"], 97)
+        self.assertEqual(result["open_time"], 1)
+
+    def test_bearish_sweep_requires_negative_net_short_liquidations(self):
+        bearish_sweep = dict(_SWEEP, direction="BEARISH")
+
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000):
+            result = ls.detect_liquidation_confirmed_sweep(
+                bearish_sweep, _liquidation_snapshot(long_notional=90000, short_notional=10000)
+            )
+        self.assertIsNone(result)
+
+    def test_bearish_sweep_with_aligned_short_liquidation_cluster_passes(self):
+        bearish_sweep = dict(_SWEEP, direction="BEARISH")
+
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000):
+            result = ls.detect_liquidation_confirmed_sweep(
+                bearish_sweep, _liquidation_snapshot(long_notional=10000, short_notional=90000)
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+
+    def test_min_notional_defaults_from_config(self):
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 200000):
+            result = ls.detect_liquidation_confirmed_sweep(
+                _SWEEP, _liquidation_snapshot(long_notional=90000, short_notional=10000)
+            )
+        self.assertIsNone(result)
+
+    def test_explicit_min_notional_overrides_config(self):
+        with patch.object(config, "LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 0):
+            result = ls.detect_liquidation_confirmed_sweep(
+                _SWEEP, _liquidation_snapshot(long_notional=90000, short_notional=10000),
+                min_notional_usdt=200000,
+            )
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

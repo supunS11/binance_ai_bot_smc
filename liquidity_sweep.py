@@ -69,3 +69,51 @@ def detect_sweep(candles, pools, require_closed_candle=None):
             }
 
     return None
+
+
+def detect_liquidation_confirmed_sweep(sweep, liquidation_snapshot, min_notional_usdt=None):
+    """Promotes a plain liquidity sweep (detect_sweep above) into a
+    stricter, distinct trigger by additionally requiring a REAL clustered
+    forced-liquidation event backing it - not just the informational-only
+    liquidation_aligned/liquidation_cluster fields signal_engine already
+    journals for every trigger, but a genuine gating condition specific to
+    this one: the swept level actually forced real positions closed in
+    the sweep's direction, not just a wick that happened to tag a pool.
+    Distinct from LIQUIDITY_SWEEP - a sweep alone is sufficient there;
+    this only fires on the strict subset of sweeps that also have real
+    liquidation flow behind them, so it can only ever be MORE selective,
+    never a relaxation.
+
+    Alignment check mirrors signal_engine.py's own liquidation_aligned
+    formula exactly (net_liquidation_notional > 0 for a BULLISH sweep -
+    forced-SELL long liquidations below market, consistent with a genuine
+    stop-run flush; < 0 for BEARISH), not a new definition."""
+    if sweep is None or not liquidation_snapshot or not liquidation_snapshot.get("available"):
+        return None
+
+    min_notional = max(
+        float(
+            config.LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT
+            if min_notional_usdt is None else min_notional_usdt
+        ),
+        0,
+    )
+    total_notional = (
+        liquidation_snapshot.get("long_liquidation_notional", 0)
+        + liquidation_snapshot.get("short_liquidation_notional", 0)
+    )
+
+    if total_notional < min_notional:
+        return None
+
+    net = liquidation_snapshot.get("net_liquidation_notional")
+
+    if net is None:
+        return None
+
+    aligned = net > 0 if sweep["direction"] == "BULLISH" else net < 0
+
+    if not aligned:
+        return None
+
+    return dict(sweep)
