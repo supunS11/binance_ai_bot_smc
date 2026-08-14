@@ -562,8 +562,19 @@ MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
 # leverage is treated as not worth taking at any size. Risk-REDUCING by
 # construction (only ever rejects, never accepts more risk), so ships
 # live immediately rather than defaulting off, same as
-# MIN_STOP_DISTANCE_ATR_MULTIPLE. Starting value, not yet calibrated
-# against real trade data. 0 disables it.
+# MIN_STOP_DISTANCE_ATR_MULTIPLE. 0 disables it.
+# Real evidence this needs real room (2026-08-14): the operator had
+# tightened this to 8, then 10, live - at LEVERAGE=10 that caps any
+# accepted stop at 1%/1.2% of entry price. Since MIN_STOP_DISTANCE_
+# ATR_MULTIPLE routinely produces wider stops than that on volatile
+# symbols (by design - that's the fix it exists for), the two fought each
+# other: 147 of 155 plan rejections in one live bot.log pull were
+# SL_ROI_TOO_HIGH (94.8%), effectively blocking almost every signal that
+# had already cleared every trigger/structural gate. Restored to 30 (the
+# original starting value) to give the ATR floor room to actually work -
+# still a real cap (rejects anything wider than 3% of price at this
+# leverage), just not one that fights an already-proven mechanism by
+# default.
 MAX_SL_ROI_PCT = env_float("MAX_SL_ROI_PCT", 30)
 # Confluence-weighted position sizing - see signal_engine.py's
 # confluence_ratio (how many of sweep/EMA/OI/liquidation agree with the
