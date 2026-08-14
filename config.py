@@ -346,17 +346,29 @@ OB_FVG_RETEST_MAX_AGE_CANDLES = env_int("OB_FVG_RETEST_MAX_AGE_CANDLES", 20)
 # from here and from each trigger's own detection strictness - NOT from
 # raising SIGNAL_MIN_CVD_SCORE/SIGNAL_MIN_DEPTH_IMBALANCE further, which
 # isn't evidence-backed.
-EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS = env_int("EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 2)
+# Lowered from 2 -> 1 (2026-08-14, operator request): this was a blanket
+# "trust newer triggers less" measure added when trigger count was
+# growing, never tied to a specific traced incident and not targeted at
+# the actual root cause later found for the "wrong direction entries"
+# complaint (OTE_RETRACEMENT_MIN/zone_retracement_pct, see above) - now
+# that the real fix is in, the operator asked to scale this back rather
+# than keep paying its cost on every non-STRUCTURE_BREAK trigger. Real
+# effect is small either way: at SIGNAL_EVAL_INTERVAL_SECONDS=3s, the
+# difference between +1 and +2 extra ticks is only 3 real seconds on top
+# of SIGNAL_CONFIRM_TICKS - negligible next to this bot's 1h LTF, so this
+# mainly reduces friction for genuinely-brief flicker, not a major lever
+# on its own (see MIN_24H_QUOTE_VOLUME_USDT/the trigger age-window
+# settings for the levers with real trade-count leverage).
+EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS = env_int("EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 1)
 # A smaller extra-ticks requirement specifically for STRUCTURE_BREAK - the
 # one trigger EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS deliberately left alone
-# above. With 4 trigger types now live, "the one proven trigger pays zero
-# stability cost" is worth revisiting, but STRUCTURE_BREAK's real advantage
-# is reacting fast to a genuine break - stacking it with the same +2 the
-# newer/unproven triggers carry would blunt that for the trigger with the
-# best track record. Kept deliberately smaller than
-# EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS, not equal to it. 0 preserves the
-# original zero-extra-cost behavior.
-STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS = env_int("STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 1)
+# above. Lowered from 1 -> 0 (2026-08-14, same request as above) - back to
+# the original zero-extra-cost behavior for the one trigger with the
+# strongest track record, now that 8 trigger types exist and the newer
+# ones already carry their own (reduced) extra-ticks cost above; no
+# reason for the proven trigger to keep paying any tax on top of that.
+# 0 preserves the original zero-extra-cost behavior.
+STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS = env_int("STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS", 0)
 # Instead of the fixed STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
 # CHOCH_RETEST priority order (first match wins, nothing else attempted),
 # gather every currently-qualifying trigger, gate each one for real (HTF
