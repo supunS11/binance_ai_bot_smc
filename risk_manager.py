@@ -214,6 +214,26 @@ def _entry_too_extended(extension_r):
     return extension_r > max_extension_r
 
 
+def _stop_roi_too_high(risk_distance, entry_price):
+    """See config.MAX_SL_ROI_PCT - rejects an entry whose stop, once
+    LEVERAGE is applied, would lose more than this % of the margin
+    actually at risk if hit. Independent of position sizing mode (risk-
+    based or margin-based): ROI_at_SL = (risk_distance / entry_price) *
+    LEVERAGE, since quantity cancels out of the ratio (both loss-at-SL and
+    margin-used scale with it identically) - so this doesn't need
+    quantity/balance at all, only the stop distance itself. Rejects
+    outright rather than shrinking the position, per explicit operator
+    choice: a stop this wide relative to leverage is treated as not worth
+    taking at any size, not just a smaller one."""
+    max_roi_pct = max(float(config.MAX_SL_ROI_PCT), 0)
+
+    if max_roi_pct <= 0 or entry_price <= 0:
+        return False
+
+    roi_pct = (risk_distance / entry_price) * max(float(config.LEVERAGE), 0) * 100
+    return roi_pct > max_roi_pct
+
+
 def _confluence_size_multiplier(signal):
     """Scales risk per trade by how much of sweep/EMA/OI/liquidation
     confluence agrees with this signal (signal_engine's confluence_ratio),
@@ -262,6 +282,9 @@ def build_trade_plan(signal, balance):
 
     if _entry_too_extended(extension_r):
         return None, "ENTRY_TOO_EXTENDED"
+
+    if _stop_roi_too_high(risk_distance, entry_price):
+        return None, "SL_ROI_TOO_HIGH"
 
     tp1_price, tp2_price = compute_targets(
         entry_price, sl_price, side, pools=signal.get("liquidity_pools")

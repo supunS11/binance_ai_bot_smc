@@ -24,6 +24,8 @@ class CVDEngine:
     def __init__(self):
         self.lock = threading.RLock()
         self._trades = {}  # symbol -> deque[(timestamp, signed_notional, notional)]
+        self._cumulative = {}  # symbol -> running cumulative signed notional (the CVD line)
+        self._cvd_history = {}  # symbol -> deque[{"open_time","cumulative_cvd"}], one per LTF candle close
 
     def _series(self, symbol):
         series = self._trades.get(symbol)
@@ -58,6 +60,39 @@ class CVDEngine:
             while series and series[0][0] < cutoff:
                 series.popleft()
 
+            self._cumulative[symbol] = self._cumulative.get(symbol, 0.0) + signed_notional
+
+    def finalize_candle(self, symbol, open_time):
+        """Snapshot the cumulative CVD line at a price-candle-aligned
+        timestamp - called once per LTF candle close (see ws_client.
+        _handle_kline's kline["x"] flag). This is what makes swing-point
+        CVD divergence possible (cvd_divergence.py): the raw trade deque
+        above is deliberately pruned to a short recent window
+        (config.ORDER_FLOW_MAX_WINDOW_SECONDS) for the ratio/cvd_score
+        snapshot below, and can't span the multiple candles/swings a real
+        divergence comparison needs - this is a separate, much cheaper
+        series (one float per candle, not per trade) retained far longer
+        (config.CVD_HISTORY_MAXLEN)."""
+        symbol = symbol.upper()
+
+        with self.lock:
+            history = self._cvd_history.get(symbol)
+
+            if history is None:
+                history = deque(maxlen=max(int(config.CVD_HISTORY_MAXLEN), 10))
+                self._cvd_history[symbol] = history
+
+            history.append({
+                "open_time": open_time,
+                "cumulative_cvd": self._cumulative.get(symbol, 0.0),
+            })
+
+    def cvd_history(self, symbol):
+        symbol = symbol.upper()
+
+        with self.lock:
+            return list(self._cvd_history.get(symbol, ()))
+
     def snapshot(self, symbol, windows=(60, 300, 900), now=None):
         symbol = symbol.upper()
         now = time.time() if now is None else now
@@ -67,7 +102,7 @@ class CVDEngine:
             series = list(self._trades.get(symbol, ()))
 
         if not series:
-            return {"available": False, "symbol": symbol}
+            return {"available": False, "symbol": symbol, "history": self.cvd_history(symbol)}
 
         ratios = {}
         notionals = {}
@@ -101,11 +136,17 @@ class CVDEngine:
             "ratio_15m": ratios.get(windows[2]) if len(windows) > 2 else None,
             "notional_1m": round(notionals.get(windows[0], 0), 2),
             "sample_count": len(series),
+            "history": self.cvd_history(symbol),
         }
 
     def reset(self, symbol=None):
         with self.lock:
             if symbol is None:
                 self._trades.clear()
+                self._cumulative.clear()
+                self._cvd_history.clear()
             else:
-                self._trades.pop(symbol.upper(), None)
+                symbol = symbol.upper()
+                self._trades.pop(symbol, None)
+                self._cumulative.pop(symbol, None)
+                self._cvd_history.pop(symbol, None)

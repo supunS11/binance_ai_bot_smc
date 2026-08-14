@@ -161,6 +161,13 @@ class NewDataSourceBucketTests(unittest.TestCase):
         )
         self.assertEqual(ja._bucket_extension_r(None), "unknown")
 
+    def test_zone_retracement_buckets(self):
+        self.assertEqual(ja._bucket_zone_retracement(0.65), "<0.705 (shallow - pre-tightening band)")
+        self.assertEqual(ja._bucket_zone_retracement(0.72), "0.705-0.75")
+        self.assertEqual(ja._bucket_zone_retracement(0.77), "0.75-0.79")
+        self.assertEqual(ja._bucket_zone_retracement(0.85), ">=0.79 (deep)")
+        self.assertEqual(ja._bucket_zone_retracement(None), "unknown")
+
 
 class LoadTradesAndSummarizeTests(unittest.TestCase):
     def setUp(self):
@@ -216,6 +223,16 @@ class LoadTradesAndSummarizeTests(unittest.TestCase):
         self.assertIn("By side (BUY/SELL):", report)
         self.assertIn("BUY: n=2", report)
         self.assertIn("SELL: n=1", report)
+
+    def test_summarize_breaks_down_by_zone_retracement_depth(self):
+        _write_trade(self.journal_path, "A", "BTCUSDT", outcome="TP2_HIT", zone_retracement_pct=0.85)
+        _write_trade(self.journal_path, "B", "ETHUSDT", outcome="SL_HIT", zone_retracement_pct=0.65)
+
+        report = ja.summarize(self.journal_path)
+
+        self.assertIn("By zone retracement depth:", report)
+        self.assertIn(">=0.79 (deep): n=1", report)
+        self.assertIn("<0.705 (shallow - pre-tightening band): n=1", report)
 
     def test_summarize_breaks_down_by_early_breakeven_applied(self):
         _write_trade(self.journal_path, "A", "BTCUSDT", outcome="SHADOW_BREAKEVEN_STOP_HIT", early_breakeven_applied=True)

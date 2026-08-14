@@ -114,12 +114,25 @@ WS_DEPTH_SPEED_MS = os.getenv("WS_DEPTH_SPEED_MS", "100ms")
 WS_STALE_SECONDS = env_float("WS_STALE_SECONDS", 45)
 WS_WATCHDOG_INTERVAL_SECONDS = env_float("WS_WATCHDOG_INTERVAL_SECONDS", 15)
 WS_RESTART_COOLDOWN_SECONDS = env_float("WS_RESTART_COOLDOWN_SECONDS", 30)
+# How many LTF candle closes of CVD history order_flow.CVDEngine retains
+# per symbol (see CVDEngine.finalize_candle/cvd_history) - backs
+# CVD_DIVERGENCE_TRIGGER_ENABLED's swing-point comparison below. Kept
+# >= WS_KLINE_HISTORY_LIMIT so CVD history always covers the same span as
+# ltf_candles - a swing point still visible in candles but already
+# evicted from CVD history would silently and permanently disqualify
+# divergence detection for it.
+CVD_HISTORY_MAXLEN = env_int("CVD_HISTORY_MAXLEN", 200)
 
 # =========================
 # ORDER FLOW (CVD)
 # =========================
 ORDER_FLOW_MAX_WINDOW_SECONDS = env_int("ORDER_FLOW_MAX_WINDOW_SECONDS", 900)
 ORDER_FLOW_MIN_NOTIONAL_USDT = env_float("ORDER_FLOW_MIN_NOTIONAL_USDT", 5000)
+# Was defined but never wired to anything (the 5th trigger - CVD/order-flow
+# divergence - was originally skipped while the other 4 were built). Now
+# backs CVD_DIVERGENCE_TRIGGER_ENABLED below: how stale the qualifying
+# swing point is allowed to be before the trigger stops firing on it, same
+# shape as CHOCH_TRIGGER_MAX_AGE_CANDLES/OB_FVG_RETEST_MAX_AGE_CANDLES.
 ORDER_FLOW_DIVERGENCE_LOOKBACK = env_int("ORDER_FLOW_DIVERGENCE_LOOKBACK", 20)
 
 # =========================
@@ -133,7 +146,20 @@ LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
 PREMIUM_DISCOUNT_LOOKBACK_CANDLES = env_int(
     "PREMIUM_DISCOUNT_LOOKBACK_CANDLES", 100
 )
-OTE_RETRACEMENT_MIN = env_float("OTE_RETRACEMENT_MIN", 0.618)
+# Raised from 0.618 -> 0.705 (2026-08-14, operator feedback): BUY signals
+# were seen firing in the discount zone while price kept falling anyway,
+# and SELL signals in premium while price kept rising - both consistent
+# with 0.618 (the shallow end of the classic Fibonacci OTE band) not
+# requiring enough of a pullback before entry to reflect a genuinely
+# exhausted move. Narrows the qualifying retracement band (0.705-0.79 vs
+# the old 0.618-0.79), requiring a deeper pullback before either the
+# zone or OTE gate can pass. signal_engine.py now also journals the real
+# retracement depth (zone_retracement_pct) for every signal regardless of
+# where it landed in the band, so journal_analysis.py can test whether
+# shallower qualifying retracements actually lose more before tightening
+# further - this value is a reasoned starting point, not yet calibrated
+# against real trade data at the new setting.
+OTE_RETRACEMENT_MIN = env_float("OTE_RETRACEMENT_MIN", 0.705)
 OTE_RETRACEMENT_MAX = env_float("OTE_RETRACEMENT_MAX", 0.79)
 ATR_PERIOD = env_int("ATR_PERIOD", 14)
 # Kaufman's Efficiency Ratio lookback - net directional movement over the
@@ -346,6 +372,28 @@ TRIGGER_QUALITY_RANKING_ENABLED = env_bool("TRIGGER_QUALITY_RANKING_ENABLED", "F
 # (always take the best-scored candidate, no margin required) - not
 # recommended given the flapping risk above.
 TRIGGER_QUALITY_EDGE_ATR_MULTIPLE = env_float("TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0.25)
+# Fifth entry trigger: price makes a new swing extreme (fractal swing
+# point, the same detector STRUCTURE_BREAK/LIQUIDITY_SWEEP already use)
+# that the CVD line does NOT confirm - classic order-flow divergence/
+# absorption (see cvd_divergence.py). Genuinely different data than the
+# existing SIGNAL_MIN_CVD_SCORE gate above: that's a recent 1m/5m/15m
+# window, blind to price's own swing history; this compares CVD's value
+# AT the last two swing points the same way price structure itself is
+# compared. Needs order_flow.CVDEngine's persistent per-candle history
+# (finalize_candle/cvd_history, see CVD_HISTORY_MAXLEN above) - the
+# existing recent-window trade deque is deliberately pruned too
+# aggressively (ORDER_FLOW_MAX_WINDOW_SECONDS) to span multiple swings.
+# No candle-close-confirmation concept applies here (same as CHOCH_RETEST)
+# - the comparison is between two already-confirmed swing points, not a
+# currently-forming candle. Brand new, unvalidated mechanism - default
+# OFF, same convention as every other trigger this session.
+CVD_DIVERGENCE_TRIGGER_ENABLED = env_bool("CVD_DIVERGENCE_TRIGGER_ENABLED", "False")
+# How large a gap (in USDT, cumulative CVD delta between the two compared
+# swing points) counts as real divergence rather than noise - mirrors
+# ORDER_FLOW_MIN_NOTIONAL_USDT's scale (the existing floor for trusting a
+# CVD reading at all). Starting value, not yet calibrated against real
+# trade data.
+CVD_DIVERGENCE_MIN_DELTA_USDT = env_float("CVD_DIVERGENCE_MIN_DELTA_USDT", 5000)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)
@@ -400,6 +448,26 @@ MIN_STOP_DISTANCE_ATR_MULTIPLE = env_float("MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0
 # with each symbol's own volatility. Starting value is a reasonable
 # floor, not yet calibrated against real trade data. 0 disables it.
 MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
+# Rejects an entry whose stop, once LEVERAGE is applied, would lose more
+# than this % of the margin actually at risk if hit - independent of
+# position sizing mode, since quantity cancels out of the ratio
+# (ROI_at_SL = stop_distance_% * LEVERAGE, see
+# risk_manager._stop_roi_too_high). Real motivation (2026-08-14, operator
+# feedback): risk-based sizing already caps the ACCOUNT-level $ loss per
+# trade (POSITION_RISK_PCT) regardless of stop width, but the POSITION-
+# level ROI% (what the exchange UI shows - PnL against margin used) is a
+# different number entirely, and wasn't capped anywhere - a wide
+# structural stop (which MIN_STOP_DISTANCE_ATR_MULTIPLE can now produce
+# more of, on purpose, to avoid noise-driven SL hits) can show a large
+# ROI% loss on that specific position even though the account-level risk
+# never changed. Rejects the trade outright rather than shrinking its
+# size, per explicit operator choice - a stop this wide relative to
+# leverage is treated as not worth taking at any size. Risk-REDUCING by
+# construction (only ever rejects, never accepts more risk), so ships
+# live immediately rather than defaulting off, same as
+# MIN_STOP_DISTANCE_ATR_MULTIPLE. Starting value, not yet calibrated
+# against real trade data. 0 disables it.
+MAX_SL_ROI_PCT = env_float("MAX_SL_ROI_PCT", 30)
 # Confluence-weighted position sizing - see signal_engine.py's
 # confluence_ratio (how many of sweep/EMA/OI/liquidation agree with the
 # signal, out of how many were actually available to check). Scales the
@@ -424,12 +492,17 @@ CONFLUENCE_SIZING_MIN_MULTIPLIER = env_float("CONFLUENCE_SIZING_MIN_MULTIPLIER",
 CONFLUENCE_SIZING_MAX_MULTIPLIER = env_float("CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25)
 MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
 # After ANY position closes (win, loss, or breakeven), that symbol is
-# skipped for this long before it can be re-entered. Evidence (same
-# 2026-08-08 review): RSRUSDT/SANDUSDT/TAIKOUSDT/SUSHIUSDT each hit SL
-# repeatedly within seconds-to-minutes of the previous close, at nearly
-# the same level - immediate re-entry into a symbol that's actively
-# chopping instead of waiting for the picture to change.
-SYMBOL_REENTRY_COOLDOWN_SECONDS = env_int("SYMBOL_REENTRY_COOLDOWN_SECONDS", 900)
+# skipped for this long before it can be re-entered. Evidence (2026-08-08
+# review): RSRUSDT/SANDUSDT/TAIKOUSDT/SUSHIUSDT each hit SL repeatedly
+# within seconds-to-minutes of the previous close, at nearly the same
+# level - immediate re-entry into a symbol that's actively chopping
+# instead of waiting for the picture to change. Raised from 900 -> 3600
+# (2026-08-14) on the same pattern recurring at the original value's own
+# timescale: MUBARAKUSDT/GRAMUSDT/AEROUSDT each re-entered 2-3 times
+# within a few hours, repeatedly losing at nearly the same level - 15
+# minutes clearly wasn't long enough to let the picture actually change on
+# a 1h LTF. Starting value, not yet calibrated against real trade data.
+SYMBOL_REENTRY_COOLDOWN_SECONDS = env_int("SYMBOL_REENTRY_COOLDOWN_SECONDS", 3600)
 
 # =========================
 # TP1 / TP2 (mirrors v7's partial-TP + full-close ladder: TP1 closes
@@ -472,7 +545,20 @@ BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.02)
 # count - same principle as the sizing feature: adapt what happens to a
 # trade that's already happening, not whether it happens.
 EARLY_BREAKEVEN_ENABLED = env_bool("EARLY_BREAKEVEN_ENABLED", "True")
-EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 1.0)
+# Lowered from 1.0 -> 0.5 (2026-08-14) on real evidence: a 20-trade
+# journal_analysis.py pull showed a stark, clean split - trades that
+# reached early_breakeven_applied=True had a 0% loss rate (0 of 5 - 3 WIN,
+# 2 BREAKEVEN), while trades that never reached it had a 77% loss rate (10
+# of 13). Once a trade gets ANY real room, this mechanism protects it
+# almost perfectly - the entire loss problem is concentrated in trades
+# that never reach the trigger point at all. Lowering the bar gets more
+# trades protected sooner, before they've had a chance to fully reverse.
+# Known tradeoff, same shape as the original 2026-08-10 rationale below: a
+# genuine winner that dips back through a NOW-CLOSER breakeven level on
+# its way to TP1/TP2 closes early instead of running - a real cost that
+# grows as this value shrinks, not yet measured against the loss
+# reduction. Not yet calibrated against real trade data at this new value.
+EARLY_BREAKEVEN_R_MULTIPLE = env_float("EARLY_BREAKEVEN_R_MULTIPLE", 0.5)
 # How much profit (as an R-multiple) to lock in when early breakeven
 # promotes a trade, instead of moving the stop to flat entry (a scratch).
 # 0 preserves the original flat-breakeven behavior (see

@@ -300,12 +300,16 @@ class BuildTradePlanTests(unittest.TestCase):
         # fixture's default entry_price/structure_level gap sits well
         # above that - off by default here so tests not about this
         # feature aren't coupled to it; ExtensionCapTests turns it back
-        # on locally.
+        # on locally. Same treatment for MAX_SL_ROI_PCT - MaxSlRoiTests
+        # turns it back on locally.
         self.extension_patcher = patch.object(config, "MAX_ENTRY_EXTENSION_R", 0)
         self.extension_patcher.start()
+        self.sl_roi_patcher = patch.object(config, "MAX_SL_ROI_PCT", 0)
+        self.sl_roi_patcher.start()
 
     def tearDown(self):
         self.extension_patcher.stop()
+        self.sl_roi_patcher.stop()
 
     def _signal(self, side="BUY", entry_price=100, structure_level=98, atr=1):
         return {
@@ -539,6 +543,7 @@ class EntryExtensionCapTests(unittest.TestCase):
 
     def test_build_trade_plan_allows_an_entry_within_the_cap(self):
         with patch.object(config, "MAX_ENTRY_EXTENSION_R", 2.0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0), \
              patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
              patch.object(risk_manager, "calculate_position_size", return_value=10.0):
             plan, status = risk_manager.build_trade_plan(
@@ -555,6 +560,7 @@ class EntryExtensionCapTests(unittest.TestCase):
         # config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R (main.py) reads this
         # off the plan to decide market vs. limit routing per-signal.
         with patch.object(config, "MAX_ENTRY_EXTENSION_R", 2.0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0), \
              patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
              patch.object(risk_manager, "calculate_position_size", return_value=10.0):
             plan, status = risk_manager.build_trade_plan(
@@ -567,6 +573,90 @@ class EntryExtensionCapTests(unittest.TestCase):
 
         self.assertEqual(status, "OK")
         self.assertAlmostEqual(plan["entry_extension_r"], 1.0)  # (100-98)/2.0
+
+
+class MaxSlRoiTests(unittest.TestCase):
+    """See config.MAX_SL_ROI_PCT - real motivation (2026-08-14, operator
+    feedback): risk-based sizing already caps the ACCOUNT-level $ loss per
+    trade regardless of stop width, but the POSITION-level ROI% (PnL
+    against margin used, what the exchange UI shows) is a different
+    number entirely - ROI_at_SL = stop_distance_% * LEVERAGE, independent
+    of position size (quantity cancels out of the ratio), and wasn't
+    capped anywhere before this. Rejects outright, per explicit operator
+    choice, rather than shrinking the position to fit."""
+
+    def test_within_the_cap_is_not_too_high(self):
+        # 2% stop distance * 10x leverage = 20% ROI, under a 30% cap.
+        with patch.object(config, "MAX_SL_ROI_PCT", 30), \
+             patch.object(config, "LEVERAGE", 10):
+            too_high = risk_manager._stop_roi_too_high(risk_distance=2, entry_price=100)
+
+        self.assertFalse(too_high)
+
+    def test_beyond_the_cap_is_too_high(self):
+        # 4% stop distance * 10x leverage = 40% ROI, over a 30% cap.
+        with patch.object(config, "MAX_SL_ROI_PCT", 30), \
+             patch.object(config, "LEVERAGE", 10):
+            too_high = risk_manager._stop_roi_too_high(risk_distance=4, entry_price=100)
+
+        self.assertTrue(too_high)
+
+    def test_higher_leverage_lowers_the_stop_distance_that_trips_the_cap(self):
+        # Same 2% stop distance, but 20x leverage -> 40% ROI, over the cap.
+        with patch.object(config, "MAX_SL_ROI_PCT", 30), \
+             patch.object(config, "LEVERAGE", 20):
+            too_high = risk_manager._stop_roi_too_high(risk_distance=2, entry_price=100)
+
+        self.assertTrue(too_high)
+
+    def test_zero_cap_disables_the_check(self):
+        with patch.object(config, "MAX_SL_ROI_PCT", 0), \
+             patch.object(config, "LEVERAGE", 10):
+            too_high = risk_manager._stop_roi_too_high(risk_distance=100, entry_price=100)
+
+        self.assertFalse(too_high)
+
+    def test_zero_entry_price_does_not_crash(self):
+        with patch.object(config, "MAX_SL_ROI_PCT", 30):
+            too_high = risk_manager._stop_roi_too_high(risk_distance=2, entry_price=0)
+
+        self.assertFalse(too_high)
+
+    def test_build_trade_plan_rejects_a_stop_with_too_high_an_roi(self):
+        with patch.object(config, "MAX_SL_ROI_PCT", 30), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0):
+            plan, status = risk_manager.build_trade_plan(
+                {
+                    # 4% stop distance * 10x leverage = 40% ROI, over the cap.
+                    "signal": "BUY", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 96, "atr": 0,
+                },
+                balance=1000,
+            )
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "SL_ROI_TOO_HIGH")
+
+    def test_build_trade_plan_allows_a_stop_within_the_roi_cap(self):
+        with patch.object(config, "MAX_SL_ROI_PCT", 30), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(
+                {
+                    # 2% stop distance * 10x leverage = 20% ROI, under the cap.
+                    "signal": "BUY", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 98, "atr": 0,
+                },
+                balance=1000,
+            )
+
+        self.assertEqual(status, "OK")
 
 
 class ConfluenceSizeMultiplierTests(unittest.TestCase):

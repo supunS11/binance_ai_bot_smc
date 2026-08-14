@@ -13,6 +13,7 @@ looking at what already closed.
 was rejected (for the shadow journal) get that for free.
 """
 import config
+import cvd_divergence
 import liquidity_sweep
 import market_structure
 
@@ -105,6 +106,20 @@ def evaluate(
             ltf_candles, fvgs=ltf_analysis["fair_value_gaps"]
         )
 
+    # config.CVD_DIVERGENCE_TRIGGER_ENABLED - a fifth, alternative entry
+    # trigger: price's swing structure vs the CVD line at those same swing
+    # points (see cvd_divergence.py). Needs its own swing computation, not
+    # reused from pools/sweep above (only computed when
+    # LIQUIDITY_SWEEP_TRIGGER_ENABLED is on) - same zero-added-cost-when-
+    # off shape as every other optional trigger.
+    divergence = None
+
+    if config.CVD_DIVERGENCE_TRIGGER_ENABLED:
+        divergence_swings = market_structure.find_swing_points(ltf_candles)
+        divergence = cvd_divergence.detect_divergence(
+            divergence_swings, cvd_snapshot.get("history") or []
+        )
+
     # ema_value/btc_correlation/btc_return hoisted here (same gating as
     # before) because neither depends on direction - only the derived
     # ema_aligned/btc_aligned booleans do, computed per-direction inside
@@ -129,7 +144,8 @@ def evaluate(
 
     # Candidate list - same detection conditions and same priority order
     # as before (STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
-    # CHOCH_RETEST), but no longer short-circuited into if/elif: every
+    # CHOCH_RETEST > CVD_DIVERGENCE), but no longer short-circuited into
+    # if/elif: every
     # currently-qualifying trigger becomes a candidate, and the selection
     # logic below decides which one actually wins (see
     # config.TRIGGER_QUALITY_RANKING_ENABLED). Building the full list
@@ -195,6 +211,27 @@ def evaluate(
             "trigger_candle_open_time": None,
         })
 
+    if (
+        config.CVD_DIVERGENCE_TRIGGER_ENABLED
+        and divergence is not None
+        and (len(ltf_candles) - 1 - divergence["index"])
+            <= max(int(config.ORDER_FLOW_DIVERGENCE_LOOKBACK), 0)
+    ):
+        candidates.append({
+            "signal_trigger": "CVD_DIVERGENCE",
+            "direction": divergence["direction"],
+            "structure_level": divergence.get("level"),
+            # Deliberately None, same as CHOCH_RETEST above and for the
+            # same reason - divergence.get("open_time") is the OLD swing
+            # candle's open_time (already closed well before this tick),
+            # not a candle being entered on right now. Passing it through
+            # would make position_manager.resolve_break_confirmations
+            # compare that swing candle's close back against its own
+            # swing price (its own low/high) - trivially true almost
+            # every time, a meaningless "confirmation".
+            "trigger_candle_open_time": None,
+        })
+
     if not candidates:
         return _reject("NO_LIVE_STRUCTURE_BREAK")
 
@@ -231,6 +268,22 @@ def evaluate(
 
         if not market_structure.in_ote(zone, latest_price, direction):
             return _reject("NOT_IN_OTE")
+
+        # How deep into the range this entry's retracement actually is,
+        # using the SAME measure OTE_RETRACEMENT_MIN/MAX are expressed in
+        # (0 = at the range extreme, 1 = fully retraced to the opposite
+        # extreme) - purely diagnostic, not a second gate (in_ote above
+        # already enforces the MIN/MAX band). Real motivation (2026-08-14,
+        # operator feedback): signals were seen firing in discount/premium
+        # while the underlying move hadn't actually finished - journaling
+        # the real depth lets journal_analysis.py test whether shallower
+        # retracements within the qualifying band lose more, instead of
+        # guessing how much further to tighten OTE_RETRACEMENT_MIN.
+        zone_range = zone["range_high"] - zone["range_low"]
+        zone_retracement_pct = (
+            (zone["range_high"] - latest_price) / zone_range if direction == "BULLISH"
+            else (latest_price - zone["range_low"]) / zone_range
+        )
 
         order_block = market_structure.find_order_block(
             ltf_candles, len(ltf_candles) - 1, direction
@@ -430,6 +483,7 @@ def evaluate(
             "depth_imbalance": depth_imbalance,
             "atr": ltf_analysis.get("atr"),
             "premium_discount_zone": price_zone,
+            "zone_retracement_pct": zone_retracement_pct,
             "liquidity_pools": pools,
             "ema_value": ema_value,
             "ema_aligned": ema_aligned,

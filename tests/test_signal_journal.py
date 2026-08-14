@@ -123,6 +123,12 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["entry_extension_r"], "0.35")
 
+    def test_append_signal_writes_zone_retracement_pct(self):
+        signal_journal.append_signal(_signal(zone_retracement_pct=0.74), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["zone_retracement_pct"], "0.74")
+
     def test_zero_entry_price_does_not_crash_risk_distance_calc(self):
         signal_journal.append_signal(_signal(), _plan(entry_price=0))
         rows = self._read_rows()

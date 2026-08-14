@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import config
+import cvd_divergence
 import liquidity_sweep
 import market_structure
 import risk_manager
@@ -20,6 +21,8 @@ HTF_BEARISH = {"available": True, "trend": "BEARISH"}
 ZONE = {
     "available": True,
     "midpoint": 100,
+    "range_high": 110,
+    "range_low": 90,
     "bullish_ote_zone": (90, 95),
     "bearish_ote_zone": (105, 110),
 }
@@ -61,6 +64,10 @@ class SignalEngineTests(unittest.TestCase):
         fvg_retest_direction=None,
         fvg_retest_level=None,
         fvg_retest_open_time=0,
+        divergence_direction=None,
+        divergence_level=None,
+        divergence_index=5,
+        divergence_open_time=999,
         ema_value=85.0,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -86,6 +93,13 @@ class SignalEngineTests(unittest.TestCase):
             }
             if fvg_retest_direction else None
         )
+        divergence = (
+            {
+                "direction": divergence_direction, "level": divergence_level,
+                "index": divergence_index, "open_time": divergence_open_time,
+            }
+            if divergence_direction else None
+        )
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
         liquidation_snapshot = (
             LIQUIDATION_LONG_CLUSTER if liquidation_snapshot is None else liquidation_snapshot
@@ -102,7 +116,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
              patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
              patch.object(market_structure, "price_return", return_value=btc_return), \
-             patch.object(liquidity_sweep, "detect_sweep", return_value=sweep):
+             patch.object(liquidity_sweep, "detect_sweep", return_value=sweep), \
+             patch.object(cvd_divergence, "detect_divergence", return_value=divergence):
             return signal_engine.evaluate(
                 symbol, ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
@@ -117,6 +132,8 @@ class SignalEngineTests(unittest.TestCase):
         self.assertTrue(result["sweep_confluence"])
         self.assertEqual(result["premium_discount_zone"], "DISCOUNT")
         self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        # (range_high=110 - entry=93) / (range_high=110 - range_low=90)
+        self.assertAlmostEqual(result["zone_retracement_pct"], 0.85)
 
     def test_full_sell_signal_when_everything_aligns(self):
         result = self._run(
@@ -133,6 +150,8 @@ class SignalEngineTests(unittest.TestCase):
         self.assertTrue(result["sweep_confluence"])
         self.assertEqual(result["premium_discount_zone"], "PREMIUM")
         self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        # (entry=108 - range_low=90) / (range_high=110 - range_low=90)
+        self.assertAlmostEqual(result["zone_retracement_pct"], 0.9)
 
     def test_no_signal_when_htf_structure_unavailable(self):
         result = self._run(htf_structure={"available": False})
@@ -932,7 +951,8 @@ class SignalEngineTests(unittest.TestCase):
         # but would otherwise trip ENTRY_TOO_EXTENDED for reasons that have
         # nothing to do with what this test is checking.
         with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
-             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
             result = self._run(ltf_analysis=analysis, sweep_direction=None)
 
             plan, status = risk_manager.build_trade_plan(result, balance=1000)
@@ -944,7 +964,8 @@ class SignalEngineTests(unittest.TestCase):
         analysis = self._choch_analysis("BEARISH", event_price=85)
 
         with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
-             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
             result = self._run(
                 ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
                 depth={"available": True, "depth_imbalance": -0.2},
@@ -962,7 +983,8 @@ class SignalEngineTests(unittest.TestCase):
         analysis["live_break"] = {"broken": False}
 
         with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
-             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
             result = self._run(
                 ltf_analysis=analysis, sweep_direction=None,
                 fvg_retest_direction="BULLISH", fvg_retest_level=90,
@@ -978,13 +1000,135 @@ class SignalEngineTests(unittest.TestCase):
         analysis["live_break"] = {"broken": False}
 
         with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
-             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0):
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
             result = self._run(
                 ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
                 depth={"available": True, "depth_imbalance": -0.2},
                 htf_structure=HTF_BEARISH, ltf_analysis=analysis,
                 sweep_direction=None, ema_value=115.0,
                 fvg_retest_direction="BEARISH", fvg_retest_level=110,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    # config.CVD_DIVERGENCE_TRIGGER_ENABLED - price's swing structure vs
+    # the CVD line at those same swing points (cvd_divergence.py). Ranked
+    # last in priority: STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP
+    # > CHOCH_RETEST > CVD_DIVERGENCE. detect_divergence() itself is
+    # mocked here (see _run()'s divergence_* params) - its own logic is
+    # covered directly in test_cvd_divergence.py; these tests only prove
+    # signal_engine wires the candidate correctly (age gate, flag gate,
+    # structure_level/trigger_candle_open_time, priority).
+
+    def test_cvd_divergence_only_candidate_rejects_when_trigger_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_cvd_divergence_triggered_signal_when_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                divergence_open_time=555,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
+        self.assertEqual(result["structure_level"], 88)
+        # Deliberately None, not divergence_open_time - see signal_engine.py's
+        # comment: the divergence's open_time is the OLD swing candle, not
+        # a candle being entered on now, so no close-confirmation applies.
+        self.assertIsNone(result["trigger_candle_open_time"])
+
+    def test_cvd_divergence_ignored_when_too_old(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        # _ltf_candles() always produces a single candle at index 0, so
+        # "age" (len(ltf_candles)-1 - divergence_index) is 0 unless
+        # divergence_index is negative.
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "ORDER_FLOW_DIVERGENCE_LOOKBACK", 5):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                divergence_index=-10,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_choch_retest_takes_priority_over_cvd_divergence(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+            )
+
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+
+    def test_cvd_divergence_still_respects_htf_bias(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                htf_structure=HTF_BEARISH,
+            )
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_cvd_divergence_signal_produces_a_correctly_sided_stop_loss_for_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+            )
+
+            plan, status = risk_manager.build_trade_plan(result, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertLess(plan["sl_price"], plan["entry_price"])
+
+    def test_cvd_divergence_signal_produces_a_correctly_sided_stop_loss_for_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                divergence_direction="BEARISH", divergence_level=112,
             )
 
             plan, status = risk_manager.build_trade_plan(result, balance=1000)

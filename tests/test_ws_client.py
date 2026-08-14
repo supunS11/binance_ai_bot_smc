@@ -208,6 +208,39 @@ class RealtimeMarketDataMessageHandlingTests(unittest.TestCase):
 
         self.assertIsNone(feed.candles.latest("BTCUSDT"))
 
+    def test_handle_kline_does_not_finalize_cvd_candle_while_still_forming(self):
+        feed = self._feed()
+        feed._handle_kline({
+            "s": "BTCUSDT",
+            "k": {"t": 1000, "o": "1", "h": "2", "l": "0.5", "c": "1.8", "v": "10", "x": False},
+        })
+
+        self.assertEqual(feed.cvd.cvd_history("BTCUSDT"), [])
+
+    def test_handle_kline_finalizes_cvd_candle_on_close(self):
+        feed = self._feed()
+        feed._handle_kline({
+            "s": "BTCUSDT",
+            "k": {"t": 1000, "o": "1", "h": "2", "l": "0.5", "c": "1.8", "v": "10", "x": True},
+        })
+
+        history = feed.cvd.cvd_history("BTCUSDT")
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["open_time"], 1000)
+
+    def test_handle_kline_does_not_finalize_cvd_candle_for_the_htf_stream(self):
+        feed = self._feed()
+
+        with patch.object(config, "HTF_KLINE_INTERVAL", "1h"), \
+             patch.object(config, "WS_KLINE_INTERVAL", "5m"):
+            feed._handle_kline({
+                "s": "BTCUSDT",
+                "k": {"t": 1000, "o": "1", "h": "2", "l": "0.5", "c": "1.8", "v": "10", "x": True, "i": "1h"},
+            })
+
+        self.assertEqual(feed.cvd.cvd_history("BTCUSDT"), [])
+
     def test_handle_agg_trade_feeds_cvd_engine(self):
         feed = self._feed()
         feed._handle_agg_trade({"s": "BTCUSDT", "p": "100", "q": "1", "m": False, "T": 1000000})

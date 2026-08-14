@@ -191,6 +191,26 @@ def _bucket_extension_r(value):
     return ">=0.5R (should be rare - normally rejected outright)"
 
 
+def _bucket_zone_retracement(value):
+    """How deep into the range this entry's retracement actually was, in
+    the same 0..1 measure OTE_RETRACEMENT_MIN/MAX are expressed in - the
+    diagnostic for testing whether shallower qualifying retracements lose
+    more than deeper ones, instead of guessing how far to tighten
+    OTE_RETRACEMENT_MIN (see config.py comment on that setting)."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if value < 0.705:
+        return "<0.705 (shallow - pre-tightening band)"
+    if value < 0.75:
+        return "0.705-0.75"
+    if value < 0.79:
+        return "0.75-0.79"
+    return ">=0.79 (deep)"
+
+
 def _bucket_long_short_ratio(value):
     try:
         value = float(value)
@@ -414,6 +434,7 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
     lines += _breakdown_lines(resolved, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "entry extension (chase distance from the level)", lambda t: _bucket_extension_r(t.get("entry_extension_r")))
+    lines += _breakdown_lines(resolved, "zone retracement depth", lambda t: _bucket_zone_retracement(t.get("zone_retracement_pct")))
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
     lines += _breakdown_lines(resolved, "EMA aligned (informational)", lambda t: t.get("ema_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")
@@ -451,6 +472,7 @@ def summarize(journal_path=None, since_timestamp=None):
         lines += _breakdown_lines(near_zero_mfe_losses, "side (BUY/SELL)", lambda t: t.get("side", "unknown") or "unknown")
         lines += _breakdown_lines(near_zero_mfe_losses, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
         lines += _breakdown_lines(near_zero_mfe_losses, "entry extension (chase distance from the level)", lambda t: _bucket_extension_r(t.get("entry_extension_r")))
+        lines += _breakdown_lines(near_zero_mfe_losses, "zone retracement depth", lambda t: _bucket_zone_retracement(t.get("zone_retracement_pct")))
         lines += _breakdown_lines(near_zero_mfe_losses, "HTF trend", lambda t: t.get("htf_trend", "unknown") or "unknown")
         lines += _breakdown_lines(near_zero_mfe_losses, "CVD score strength", lambda t: _bucket_cvd(t.get("cvd_score")))
         lines += _breakdown_lines(near_zero_mfe_losses, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")

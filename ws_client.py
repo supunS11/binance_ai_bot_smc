@@ -463,6 +463,12 @@ class RealtimeMarketData:
         else:
             self.candles.update(symbol, candle)
 
+            # Only the LTF stream feeds CVD divergence (cvd_divergence.py
+            # compares CVD against LTF swing points, same timeframe every
+            # other trigger uses) - the HTF stream never calls this.
+            if candle["closed"]:
+                self.cvd.finalize_candle(symbol, candle["open_time"])
+
     def _handle_agg_trade(self, data):
         symbol = str(data.get("s") or "").upper()
 
