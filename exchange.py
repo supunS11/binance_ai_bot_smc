@@ -8,6 +8,8 @@ built in a later phase, not here.
 """
 from collections import deque
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+from pathlib import Path
+import json
 import re
 import threading
 import time
@@ -353,6 +355,22 @@ def _store_cached_kline_df(key, df):
         _kline_cache[key] = (time.time(), df.copy(deep=True))
 
 
+def _klines_to_df(klines):
+    """Shared parsing for the raw list-of-lists futures_klines returns -
+    used by both get_klines (live, most-recent-`limit`) and
+    get_historical_klines (backtest.py, arbitrary past range) so both
+    produce the exact same DataFrame shape."""
+    df = pd.DataFrame(klines, columns=[
+        'time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'qav', 'trades', 'tbbav', 'tbqav', 'ignore'
+    ])
+
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = df[col].astype(float)
+
+    return df
+
+
 def get_klines(symbol, interval, limit=200):
     try:
         cache_key = _kline_cache_key(symbol, interval, limit)
@@ -370,14 +388,7 @@ def get_klines(symbol, interval, limit=200):
             limit=limit,
         )
 
-        df = pd.DataFrame(klines, columns=[
-            'time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'qav', 'trades', 'tbbav', 'tbqav', 'ignore'
-        ])
-
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-
+        df = _klines_to_df(klines)
         _store_cached_kline_df(cache_key, df)
         return df.copy(deep=True)
 
@@ -1451,6 +1462,245 @@ def get_long_short_ratio(symbol):
 
     except Exception as exc:
         log_warning(f"{symbol} long/short ratio fetch error: {exc}")
+        return None
+
+
+# =========================
+# HISTORICAL DATA (BACKTESTING ONLY) - not called anywhere in the live
+# trading loop. Unlike get_klines/get_24h_quote_volumes/get_funding_rates
+# above (which only ever look at "right now"), these fetch an arbitrary
+# past [start_time_ms, end_time_ms) range, for backtest.py/backtest_feed.py
+# to replay through the real signal_engine/risk_manager/position_manager
+# code instead of a separate reimplementation. Each result is disk-cached
+# under data/backtest_cache/, keyed to its exact symbol/range - since
+# historical data never changes, the cache has no TTL (contrast the live
+# _kline_cache above, which deliberately expires after 5s).
+# =========================
+_BACKTEST_CACHE_DIR = Path(__file__).resolve().parent / "data" / "backtest_cache"
+
+KLINE_INTERVAL_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
+}
+
+
+def _backtest_cache_path(kind, symbol, interval, start_time_ms, end_time_ms):
+    _BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    interval_part = f"_{interval}" if interval else ""
+    return _BACKTEST_CACHE_DIR / f"{kind}_{symbol}{interval_part}_{int(start_time_ms)}_{int(end_time_ms)}.json"
+
+
+def _read_backtest_cache(path):
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_backtest_cache(path, records):
+    try:
+        with open(path, "w") as fh:
+            json.dump(records, fh)
+    except OSError as exc:
+        log_warning(f"backtest cache write failed ({path.name}): {exc}")
+
+
+def get_historical_klines(symbol, interval, start_time_ms, end_time_ms):
+    """Same DataFrame shape as get_klines() (see _klines_to_df), but for
+    an arbitrary past [start_time_ms, end_time_ms) range instead of "the
+    most recent `limit` candles" - backtest_feed.py's primary data
+    source. Paginates in Binance's own 1500-candle-per-call max, since a
+    multi-month range at a fine interval easily exceeds that in one call.
+    None on a genuine fetch error; an empty list means the range legitimately
+    has no data (e.g. before the symbol existed)."""
+    symbol = symbol.upper()
+    interval_ms = KLINE_INTERVAL_MS.get(interval)
+
+    if interval_ms is None:
+        log_error(f"{symbol} historical klines error: unknown interval {interval}")
+        return None
+
+    cache_path = _backtest_cache_path("klines", symbol, interval, start_time_ms, end_time_ms)
+    cached = _read_backtest_cache(cache_path)
+
+    if cached is not None:
+        return _klines_to_df(cached)
+
+    all_rows = []
+    cursor = int(start_time_ms)
+    end_time_ms = int(end_time_ms)
+
+    try:
+        while cursor < end_time_ms:
+            batch = _public_rest_call(
+                f"futures_klines_historical:{symbol}:{interval}",
+                client.futures_klines,
+                weight=config.KLINE_REQUEST_WEIGHT,
+                symbol=symbol, interval=interval,
+                startTime=cursor, endTime=end_time_ms, limit=1500,
+            )
+
+            if not batch:
+                break
+
+            all_rows.extend(batch)
+            last_open_time = int(batch[-1][0])
+
+            if len(batch) < 1500 or last_open_time + interval_ms > end_time_ms:
+                break
+
+            cursor = last_open_time + interval_ms
+
+        _write_backtest_cache(cache_path, all_rows)
+        return _klines_to_df(all_rows)
+
+    except Exception as exc:
+        log_error(f"{symbol} historical klines error: {exc}")
+        return None
+
+
+_AGG_TRADES_LOOKBACK_ERROR_HINT = "restricted to recent"
+_AGG_TRADES_MAX_LOOKBACK_MS = 2 * 86_400_000  # empirically confirmed below
+
+
+def get_historical_agg_trades(symbol, start_time_ms, end_time_ms):
+    """Raw list of aggTrade dicts (Binance's own shape: p=price, q=qty,
+    T=timestamp ms, m=isBuyerMaker) covering [start_time_ms, end_time_ms) -
+    backtest_feed.py replays these through the real order_flow.CVDEngine.
+    record_trade() to reconstruct historical CVD the same way the live
+    feed builds it from the real-time aggTrade stream. Binance's REST
+    aggTrades endpoint caps each individual startTime/endTime query at a
+    1-hour window regardless of `limit`, so this paginates on two axes:
+    1-hour outer windows, and up-to-1000-trades inner pages within a
+    window for busy symbols/periods.
+
+    Binance ALSO rejects any startTime older than roughly 2 days before
+    the real current time on this endpoint at all (APIError -4166,
+    "Search window is restricted to recent 2 days only") - confirmed
+    empirically, not documented anywhere obvious. There is no historical
+    aggTrade archive reachable through this endpoint beyond that; CVD
+    reconstruction is only possible for the most recent ~2 days of any
+    backtest range, regardless of how far back start_time_ms asks for.
+    When a window hits that specific error, everything older is skipped
+    in one jump (not retried hour-by-hour) and whatever portion of the
+    requested range WAS within the recent-2-day window is still returned
+    - a shorter-than-requested result means exactly this, not a bug.
+    Never cached when truncated this way (the "recent 2 days" boundary
+    moves with real time, so caching a degraded result under a fixed
+    range key would lock in less data than a later run could actually
+    fetch for the same nominal range)."""
+    symbol = symbol.upper()
+    cache_path = _backtest_cache_path("aggtrades", symbol, None, start_time_ms, end_time_ms)
+    cached = _read_backtest_cache(cache_path)
+
+    if cached is not None:
+        return cached
+
+    one_hour_ms = 3_600_000
+    all_trades = []
+    window_start = int(start_time_ms)
+    end_time_ms = int(end_time_ms)
+    truncated = False
+
+    while window_start < end_time_ms:
+        window_end = min(window_start + one_hour_ms, end_time_ms)
+        cursor = window_start
+
+        try:
+            while cursor < window_end:
+                batch = _public_rest_call(
+                    f"futures_aggregate_trades:{symbol}",
+                    client.futures_aggregate_trades,
+                    weight=20,
+                    symbol=symbol, startTime=cursor, endTime=window_end, limit=1000,
+                )
+
+                if not batch:
+                    break
+
+                all_trades.extend(batch)
+                last_ts = int(batch[-1]["T"])
+
+                if len(batch) < 1000:
+                    break
+
+                cursor = last_ts + 1
+
+        except Exception as exc:
+            if _AGG_TRADES_LOOKBACK_ERROR_HINT in str(exc):
+                skip_to = int(time.time() * 1000) - _AGG_TRADES_MAX_LOOKBACK_MS + one_hour_ms
+
+                if skip_to > window_start:
+                    truncated = True
+                    window_start = skip_to
+                    continue
+
+            log_error(f"{symbol} historical aggTrades error: {exc}")
+            return all_trades or None
+
+        window_start += one_hour_ms
+
+    if truncated:
+        log_warning(
+            f"{symbol} historical aggTrades truncated to Binance's ~2-day "
+            "lookback limit - CVD unavailable for the older portion of this range"
+        )
+    else:
+        _write_backtest_cache(cache_path, all_trades)
+
+    return all_trades
+
+
+def get_historical_funding_rates(symbol, start_time_ms, end_time_ms):
+    """List of {"fundingTime": ms, "fundingRate": float} dicts covering
+    [start_time_ms, end_time_ms) - funding settles every 8h, so even a
+    multi-month range is a handful of records, but this still paginates
+    (1000/call) for correctness on very long ranges."""
+    symbol = symbol.upper()
+    cache_path = _backtest_cache_path("funding", symbol, None, start_time_ms, end_time_ms)
+    cached = _read_backtest_cache(cache_path)
+
+    if cached is not None:
+        return cached
+
+    all_rows = []
+    cursor = int(start_time_ms)
+    end_time_ms = int(end_time_ms)
+
+    try:
+        while cursor < end_time_ms:
+            batch = _public_rest_call(
+                f"futures_funding_rate:{symbol}",
+                client.futures_funding_rate,
+                weight=1,
+                symbol=symbol, startTime=cursor, endTime=end_time_ms, limit=1000,
+            )
+
+            if not batch:
+                break
+
+            all_rows.extend(batch)
+            last_ts = int(batch[-1]["fundingTime"])
+
+            if len(batch) < 1000:
+                break
+
+            cursor = last_ts + 1
+
+        parsed = [
+            {"fundingTime": int(row["fundingTime"]), "fundingRate": _safe_float_local(row.get("fundingRate"))}
+            for row in all_rows
+        ]
+        _write_backtest_cache(cache_path, parsed)
+        return parsed
+
+    except Exception as exc:
+        log_error(f"{symbol} historical funding rate error: {exc}")
         return None
 
 
