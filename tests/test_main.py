@@ -734,5 +734,101 @@ class PollPositionsDispatchTests(unittest.TestCase):
         positions.poll_shadow_pending_entry.assert_not_called()
 
 
+class RefreshWatchlistTests(unittest.TestCase):
+    """config.WATCHLIST_REFRESH_SECONDS - main._refresh_watchlist re-ranks
+    by volume and soft-restarts the feed (RealtimeMarketData has no live
+    add/remove-symbol path) only when the resulting symbol set actually
+    changed, always keeping any symbol with an open position."""
+
+    def _positions_with(self, open_symbols):
+        positions = MagicMock()
+        positions.positions = {symbol: {} for symbol in open_symbols}
+        return positions
+
+    def test_pinned_scan_symbols_is_a_noop(self):
+        old_feed = MagicMock()
+        positions = self._positions_with([])
+
+        with patch.object(config, "SCAN_SYMBOLS", ["BTCUSDT"]), \
+             patch.object(main, "_select_symbols") as select:
+            symbols, feed = main._refresh_watchlist(old_feed, positions, ["BTCUSDT"])
+
+        select.assert_not_called()
+        old_feed.stop.assert_not_called()
+        self.assertIs(feed, old_feed)
+        self.assertEqual(symbols, ["BTCUSDT"])
+
+    def test_empty_selection_keeps_the_current_list(self):
+        old_feed = MagicMock()
+        positions = self._positions_with([])
+
+        with patch.object(config, "SCAN_SYMBOLS", []), \
+             patch.object(main, "_select_symbols", return_value=[]):
+            symbols, feed = main._refresh_watchlist(old_feed, positions, ["BTCUSDT"])
+
+        old_feed.stop.assert_not_called()
+        self.assertIs(feed, old_feed)
+        self.assertEqual(symbols, ["BTCUSDT"])
+
+    def test_unchanged_symbol_set_does_not_rebuild_the_feed(self):
+        old_feed = MagicMock()
+        positions = self._positions_with([])
+
+        with patch.object(config, "SCAN_SYMBOLS", []), \
+             patch.object(main, "_select_symbols", return_value=["BTCUSDT", "ETHUSDT"]):
+            symbols, feed = main._refresh_watchlist(
+                old_feed, positions, ["ETHUSDT", "BTCUSDT"]  # same set, different order
+            )
+
+        old_feed.stop.assert_not_called()
+        self.assertIs(feed, old_feed)
+
+    def test_changed_selection_rebuilds_the_feed(self):
+        old_feed = MagicMock()
+        new_feed = MagicMock()
+        positions = self._positions_with([])
+
+        with patch.object(config, "SCAN_SYMBOLS", []), \
+             patch.object(main, "_select_symbols", return_value=["BTCUSDT", "ETHUSDT"]), \
+             patch.object(main, "RealtimeMarketData", return_value=new_feed) as ctor:
+            symbols, feed = main._refresh_watchlist(old_feed, positions, ["BTCUSDT"])
+
+        old_feed.stop.assert_called_once()
+        ctor.assert_called_once_with(["BTCUSDT", "ETHUSDT"], shutdown_event=main.shutdown_event)
+        new_feed.start.assert_called_once()
+        self.assertIs(feed, new_feed)
+        self.assertEqual(symbols, ["BTCUSDT", "ETHUSDT"])
+
+    def test_open_position_symbol_is_kept_even_if_it_dropped_out_on_volume(self):
+        old_feed = MagicMock()
+        new_feed = MagicMock()
+        positions = self._positions_with(["OLDCOINUSDT"])
+
+        with patch.object(config, "SCAN_SYMBOLS", []), \
+             patch.object(main, "_select_symbols", return_value=["BTCUSDT", "ETHUSDT"]), \
+             patch.object(main, "RealtimeMarketData", return_value=new_feed) as ctor:
+            symbols, feed = main._refresh_watchlist(
+                old_feed, positions, ["BTCUSDT", "OLDCOINUSDT"]
+            )
+
+        ctor.assert_called_once_with(
+            ["BTCUSDT", "ETHUSDT", "OLDCOINUSDT"], shutdown_event=main.shutdown_event
+        )
+        self.assertEqual(symbols, ["BTCUSDT", "ETHUSDT", "OLDCOINUSDT"])
+
+    def test_open_position_symbol_already_in_the_fresh_list_is_not_duplicated(self):
+        old_feed = MagicMock()
+        new_feed = MagicMock()
+        positions = self._positions_with(["BTCUSDT"])
+
+        with patch.object(config, "SCAN_SYMBOLS", []), \
+             patch.object(main, "_select_symbols", return_value=["BTCUSDT", "ETHUSDT"]), \
+             patch.object(main, "RealtimeMarketData", return_value=new_feed) as ctor:
+            symbols, feed = main._refresh_watchlist(old_feed, positions, ["ETHUSDT"])
+
+        ctor.assert_called_once_with(["BTCUSDT", "ETHUSDT"], shutdown_event=main.shutdown_event)
+        self.assertEqual(symbols, ["BTCUSDT", "ETHUSDT"])
+
+
 if __name__ == "__main__":
     unittest.main()

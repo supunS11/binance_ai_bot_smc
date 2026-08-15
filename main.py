@@ -324,6 +324,58 @@ def _log_heartbeat(feed, symbols, positions, reject_counts=None, reject_symbols=
         )
 
 
+def _refresh_watchlist(feed, positions, current_symbols):
+    """config.WATCHLIST_REFRESH_SECONDS - real gap found live (2026-08-15):
+    this setting existed in config but nothing ever called it -
+    _select_symbols() only ran once, at startup, so a symbol that was
+    top-400-by-volume at boot but later drifted below
+    MIN_24H_QUOTE_VOLUME_USDT just sat there as a permanently-dead
+    QUOTE_VOLUME_TOO_LOW slot until the next full process restart (real
+    heartbeat data: ~17-20% of the watchlist most heartbeats). Re-ranks
+    and swaps in whatever currently qualifies instead.
+
+    No-op for a pinned config.SCAN_SYMBOLS list - there's nothing to
+    re-rank. Symbols with an open position (any stage, including a still-
+    pending limit fill) are always kept even if they'd otherwise drop out
+    on volume - _poll_positions/_resolve_break_confirmations still need
+    their candle feed regardless of whether they're still scan candidates.
+
+    RealtimeMarketData has no live add/remove-symbol path (its symbol set
+    is fixed at construction), so this is a soft-restart - stop the feed,
+    build a fresh one, start it - not an incremental update. That means a
+    real cost every time the symbol set actually changes: the new feed's
+    start() re-seeds REST kline history for every symbol in the new list
+    (same as a full process restart's cost, just recurring), and the
+    caller's single-threaded main loop blocks for that duration with no
+    position polling or signal evaluation happening. Skipped entirely
+    when the computed set is unchanged from last time to avoid paying
+    that cost for no reason."""
+    if config.SCAN_SYMBOLS:
+        return current_symbols, feed
+
+    fresh = _select_symbols()
+
+    if not fresh:
+        log_warning("Watchlist refresh: symbol selection returned nothing, keeping the current list")
+        return current_symbols, feed
+
+    open_symbols = list(positions.positions.keys())
+    merged = list(dict.fromkeys(list(fresh) + [s for s in open_symbols if s not in fresh]))
+
+    if set(merged) == set(current_symbols):
+        return current_symbols, feed
+
+    log_info(
+        f"Refreshing watchlist | {len(current_symbols)} -> {len(merged)} symbols "
+        f"({len(open_symbols)} held open for existing positions)"
+    )
+
+    feed.stop()
+    new_feed = RealtimeMarketData(merged, shutdown_event=shutdown_event)
+    new_feed.start()
+    return merged, new_feed
+
+
 def main():
     exchange.sync_client_time()
 
@@ -357,6 +409,14 @@ def main():
     # throttle being a no-op - see exchange._private_rest_call) directly
     # contributed to a real Binance IP ban (-1003 Way too many requests).
     poll_every_ticks = max(round(config.POSITION_POLL_INTERVAL_SECONDS / eval_interval), 1)
+    # config.WATCHLIST_REFRESH_SECONDS<=0 disables the refresh entirely
+    # (same "0 disables" convention as MIN_STOP_DISTANCE_PCT etc.) rather
+    # than falling through to max(...,1) and refreshing every tick, which
+    # would tear the feed down constantly.
+    watchlist_refresh_every_ticks = (
+        max(round(config.WATCHLIST_REFRESH_SECONDS / eval_interval), 1)
+        if config.WATCHLIST_REFRESH_SECONDS > 0 else None
+    )
     tick = 0
     reject_counts = Counter()
     reject_symbols = {}
@@ -376,6 +436,9 @@ def main():
                 balance = _current_balance()
                 _poll_positions(feed, positions)
                 _resolve_break_confirmations(feed, positions)
+
+            if watchlist_refresh_every_ticks and tick % watchlist_refresh_every_ticks == 0:
+                symbols, feed = _refresh_watchlist(feed, positions, symbols)
 
             for symbol in symbols:
                 _evaluate_symbol(
