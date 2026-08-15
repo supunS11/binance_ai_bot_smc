@@ -1271,6 +1271,107 @@ class TrailStopIfImprovedTests(unittest.TestCase):
         self.assertTrue(manager.has_open_position("BTCUSDT"))
 
 
+class TrailProfitProtectionIfImprovedTests(unittest.TestCase):
+    """The continuous trailing companion to the profit-protection arm -
+    see risk_manager.compute_profit_protection_trailing_floor and
+    position_manager._trail_profit_protection_if_improved. Entry=100,
+    tp1=102 (see _plan()) -> tp1 ROI at LEVERAGE=10 is 20%."""
+
+    def _manager_with_position(self, peak_price=101.2, sl_price=100.6):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "sl_order": {"algoId": "sl1"},
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register(_plan(), execution_result)
+        position = manager.positions["BTCUSDT"]
+        position["stage"] = BREAKEVEN_ACTIVE
+        position["profit_protection_applied"] = True
+        position["profit_protection_profit_locked"] = True
+        position["profit_protection_peak_price"] = peak_price
+        position["sl_price"] = sl_price
+        return manager
+
+    def test_not_armed_is_a_noop(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["profit_protection_applied"] = False
+
+        with patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_profit_protection_if_improved(
+                manager.positions["BTCUSDT"], 105.0
+            )
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_missing_current_price_is_a_noop(self):
+        manager = self._manager_with_position()
+
+        with patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_profit_protection_if_improved(
+                manager.positions["BTCUSDT"], None
+            )
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_new_peak_ratchets_the_stop_up(self):
+        # LOCK_PCT_OF_TP1=10 -> floor=100.2 (fixed); RETRACE_PCT=50 of the
+        # entry->102.4 gain (2.4) retained = 1.2 -> retrace floor=101.2.
+        # max(100.2, 101.2)=101.2, which beats the current sl_price=100.6.
+        manager = self._manager_with_position(peak_price=101.2, sl_price=100.6)
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}) as place:
+            outcome = manager._trail_profit_protection_if_improved(
+                manager.positions["BTCUSDT"], 102.4
+            )
+
+        self.assertIsNone(outcome)
+        place.assert_called_once_with("BTCUSDT", "BUY", 101.2)
+        position = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(position["sl_price"], 101.2)
+        self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+
+    def test_pullback_below_peak_keeps_the_remembered_peak_and_does_not_loosen(self):
+        manager = self._manager_with_position(peak_price=102.4, sl_price=101.2)
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "place_stop_loss") as place:
+            outcome = manager._trail_profit_protection_if_improved(
+                manager.positions["BTCUSDT"], 101.8
+            )
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+        position = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+        self.assertAlmostEqual(position["sl_price"], 101.2)
+
+    def test_replace_failure_leaves_sl_price_untouched(self):
+        manager = self._manager_with_position(peak_price=101.2, sl_price=100.6)
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "_fetch_open_position_detail", side_effect=RuntimeError("timeout")):
+            outcome = manager._trail_profit_protection_if_improved(
+                manager.positions["BTCUSDT"], 102.4
+            )
+
+        self.assertIsNone(outcome)
+        self.assertAlmostEqual(manager.positions["BTCUSDT"]["sl_price"], 100.6)
+
+
 class BreakevenStopOutcomeTests(unittest.TestCase):
     def test_trailing_takes_precedence_over_early_lock(self):
         position = {"trailing_stop_locked_profit": True, "early_breakeven_profit_locked": True}
@@ -1525,6 +1626,39 @@ class PollShadowTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["mae_price"], 98.5)
         self.assertEqual(position["mfe_price"], 101)
+
+    def test_profit_protection_arms_then_keeps_trailing_the_peak(self):
+        # entry=100, tp1=102 -> tp1 ROI=20% at LEVERAGE=10. Arm trigger
+        # (60% of that)=101.2. LOCK_PCT_OF_TP1=10% -> floor=100.2 fixed;
+        # RETRACE_PCT=50% of the entry->peak gain retained.
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50):
+            manager = self._manager_with_position()
+            manager.poll_shadow("BTCUSDT", _candle(high=101.2, low=100.5, close=101.2))
+
+            position = manager.positions["BTCUSDT"]
+            self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+            self.assertTrue(position["profit_protection_applied"])
+            self.assertAlmostEqual(position["profit_protection_peak_price"], 101.2)
+            self.assertAlmostEqual(position["sl_price"], 100.6)  # retrace: (1.2)*0.5
+
+            # A new higher peak (102.4) should pull the floor up further,
+            # ratchet-only - the low here (100.7) stays above the old
+            # sl_price (100.6) so this candle doesn't close the trade.
+            manager.poll_shadow("BTCUSDT", _candle(high=102.4, low=100.7))
+
+            self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+            self.assertAlmostEqual(position["sl_price"], 101.2)  # retrace: (2.4)*0.5
+
+            # A pullback that doesn't make a new peak must not loosen the
+            # stop back down.
+            manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=101.3))
+
+            self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+            self.assertAlmostEqual(position["sl_price"], 101.2)
 
     def test_mae_mfe_disabled_leaves_tracking_at_entry(self):
         with patch.object(config, "MAE_TRACKING_ENABLED", False):
@@ -2160,15 +2294,21 @@ class ProfitProtectionPollLiveTests(PollLiveTests):
     PROFIT_PROTECTION_ENABLED off by default so an unmocked
     exchange.get_mark_price() can't hijack unrelated tests)."""
 
-    def test_profit_protection_promotes_before_tp1_and_locks_the_configured_roi(self):
+    def test_profit_protection_promotes_before_tp1_and_locks_the_trailing_floor(self):
         # _plan() BUY: entry=100, tp1=102 -> tp1 move=2, tp1 ROI=(2/100)*
-        # 10*100=20%, 60% of that=12% -> lock distance=(12/100)/10*100=1.2
-        # -> lock price=101.2 (see ComputeProfitProtectionLockPriceTests).
+        # 10*100=20%. Arm trigger: 60% of that=12% -> trigger price=101.2
+        # (see ComputeProfitProtectionLockPriceTests) - mark price reaches
+        # it exactly, so peak_price seeds at 101.2 too. Floor: worst-case
+        # LOCK_PCT_OF_TP1=10% of TP1 ROI=2% -> 100.2; retrace RETRACE_PCT=
+        # 50% of the entry->peak gain (1.2) retained = 0.6 -> 100.6. Floor
+        # is the max of the two (100.6) - retrace dominates here.
         manager = self._manager_with_position()
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
              patch.object(config, "LEVERAGE", 10), \
              patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
              patch.object(exchange, "get_mark_price", return_value=101.2), \
              patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
              patch.object(exchange, "get_open_algo_orders", return_value=[]), \
@@ -2181,8 +2321,9 @@ class ProfitProtectionPollLiveTests(PollLiveTests):
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertTrue(position["profit_protection_applied"])
         self.assertTrue(position["profit_protection_profit_locked"])
-        self.assertAlmostEqual(position["sl_price"], 101.2)
-        new_sl.assert_called_once_with("BTCUSDT", "BUY", 101.2)
+        self.assertAlmostEqual(position["profit_protection_peak_price"], 101.2)
+        self.assertAlmostEqual(position["sl_price"], 100.6)
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 100.6)
 
     def test_below_the_lock_price_does_not_promote(self):
         manager = self._manager_with_position()
@@ -2218,6 +2359,43 @@ class ProfitProtectionPollLiveTests(PollLiveTests):
         position = manager.positions["BTCUSDT"]
         self.assertTrue(position["profit_protection_profit_locked"])
         self.assertFalse(position["early_breakeven_applied"])
+
+    def test_continues_trailing_after_arming_on_a_later_poll(self):
+        # Same arm as test_profit_protection_promotes_before_tp1_and_locks_
+        # the_trailing_floor (SL -> 100.6), then a later poll with a higher
+        # mark price (102.4) should ratchet the stop further via the
+        # BREAKEVEN_ACTIVE branch of poll_live, not just the one-time arm.
+        manager = self._manager_with_position()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "get_mark_price", return_value=101.2), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_locked"}):
+            manager.poll_live("BTCUSDT")  # arms, SL -> 100.6
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "get_mark_price", return_value=102.4), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}) as trail_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        trail_sl.assert_called_once_with("BTCUSDT", "BUY", 101.2)
+        position = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+        self.assertAlmostEqual(position["sl_price"], 101.2)
 
 
 def _pending_order_status(status, executed_qty=0.0, avg_price=0.0, orig_qty=1.0):

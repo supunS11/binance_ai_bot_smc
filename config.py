@@ -190,6 +190,32 @@ CHOP_FILTER_LOOKBACK_CANDLES = env_int("CHOP_FILTER_LOOKBACK_CANDLES", 14)
 BTC_CORRELATION_ENABLED = env_bool("BTC_CORRELATION_ENABLED", "True")
 CORRELATION_LOOKBACK_CANDLES = env_int("CORRELATION_LOOKBACK_CANDLES", 20)
 CORRELATION_REFERENCE_SYMBOL = os.getenv("CORRELATION_REFERENCE_SYMBOL", "BTCUSDT").upper()
+# HTF bias freshness check. Real motivation (2026-08-15, traced directly
+# against real Binance history): htf_structure's trend comes from
+# structure_state() applied to the HTF (4h) candles using the SAME
+# SWING_LEFT/SWING_RIGHT=4 the fast-reacting LTF uses - on a 4h chart
+# that means a swing needs 16 REAL hours on each side before it's even
+# confirmed, so the "last confirmed swing" AGAINST_HTF_BIAS compares
+# against can be stale by many hours relative to what price is actually
+# doing right now. Confirmed live: CATIUSDT's htf_trend read BULLISH for
+# a full 21-hour stretch (2026-08-09 20:03 UTC - 2026-08-10 17:16 UTC)
+# while real 4h price actually declined ~4.3% (0.04686 -> 0.04484, mostly
+# lower closes, not sideways chop) - 6 BUY signals fired into that
+# stretch: 4 losses, 2 breakeven scratches, zero wins. This adds a
+# second, faster-updating HTF read - a plain EMA on the HTF candles,
+# recomputed fresh every candle instead of needing 16h to confirm a new
+# swing - and requires REAL, CURRENT price (not the stale swing
+# structure) to still agree with it. Risk-REDUCING by construction (only
+# ever rejects, never accepts more risk that wasn't already being taken)
+# - ships live immediately rather than defaulting off, same as
+# MIN_STOP_DISTANCE_ATR_MULTIPLE/MAX_SL_ROI_PCT.
+HTF_TREND_FRESHNESS_ENABLED = env_bool("HTF_TREND_FRESHNESS_ENABLED", "True")
+# Period (in HTF candles) for the freshness EMA - 20 on the default 4h
+# HTF_KLINE_INTERVAL is ~80 real hours (~3.3 days): long enough to still
+# be a genuine higher-timeframe read, short enough to update every
+# candle instead of needing 16h to confirm a swing. Starting value, not
+# yet calibrated against real trade data.
+HTF_TREND_EMA_PERIOD = env_int("HTF_TREND_EMA_PERIOD", 20)
 
 # =========================
 # SIGNAL ENGINE - order-flow confirmation thresholds
@@ -735,6 +761,22 @@ PROFIT_PROTECTION_ENABLED = env_bool("PROFIT_PROTECTION_ENABLED", "False")
 PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 = env_float(
     "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60
 )
+# 2026-08-15, explicit operator report: locking the SL at the exact
+# activation price left ~zero room between the stop and current price
+# the moment it fired, so ordinary noise closed the trade right at
+# activation instead of letting it run. Fix (mirrors v7's
+# evaluate_route_profit_protection trigger_roi/lock_roi/retrace_pct
+# shape): once armed, the SL now trails a cushion behind the best price
+# reached since arming instead of jumping once to the activation price
+# and stopping. PROFIT_PROTECTION_LOCK_PCT_OF_TP1 is the worst-case
+# floor (same TP1-relative scaling as ACTIVATION_PCT_OF_TP1, deliberately
+# smaller); PROFIT_PROTECTION_RETRACE_PCT is how much of the gain since
+# entry to the peak is allowed to give back before the trailing stop
+# catches up. Starting values, not yet calibrated against real trade data.
+PROFIT_PROTECTION_LOCK_PCT_OF_TP1 = env_float(
+    "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25
+)
+PROFIT_PROTECTION_RETRACE_PCT = env_float("PROFIT_PROTECTION_RETRACE_PCT", 50)
 # Replaces the fixed EARLY_BREAKEVEN_LOCK_R_MULTIPLE distance with the
 # most recent CONFIRMED swing point in the trade's favor
 # (market_structure.structure_state's last_swing_low/last_swing_high),

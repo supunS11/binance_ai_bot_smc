@@ -83,6 +83,7 @@ class SignalEngineTests(unittest.TestCase):
         ema_pullback_level=None,
         ema_pullback_open_time=555,
         ema_value=85.0,
+        htf_trend_ema=None,
         oi_snapshot=None,
         liquidation_snapshot=None,
         quote_volume_usdt=None,
@@ -149,6 +150,17 @@ class SignalEngineTests(unittest.TestCase):
         )
         btc_candles = ["btc_candle_placeholder"] if btc_candles == "default" else btc_candles
 
+        # Two distinct callers share this one mocked function: the
+        # existing informational LTF ema_value (called with just
+        # ltf_candles, no period=) and the new HTF_TREND_FRESHNESS_ENABLED
+        # gate's htf_trend_ema (always called with an explicit period= -
+        # see signal_engine.py). Routing on whether period was passed
+        # keeps them independently controllable - htf_trend_ema defaults
+        # to None (gate is a no-op) so no existing test is affected
+        # unless it explicitly opts in.
+        def _ema_side_effect(candles, period=None):
+            return htf_trend_ema if period is not None else ema_value
+
         with patch.object(market_structure, "structure_state", return_value=htf_structure), \
              patch.object(market_structure, "premium_discount_zone", return_value=zone), \
              patch.object(market_structure, "analyze", return_value=ltf_analysis), \
@@ -158,7 +170,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest), \
              patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest), \
              patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback), \
-             patch.object(market_structure, "exponential_moving_average", return_value=ema_value), \
+             patch.object(market_structure, "exponential_moving_average", side_effect=_ema_side_effect), \
              patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
              patch.object(market_structure, "price_return", return_value=btc_return), \
              patch.object(liquidity_sweep, "detect_sweep", return_value=sweep), \
@@ -229,6 +241,54 @@ class SignalEngineTests(unittest.TestCase):
     def test_no_signal_against_htf_bias(self):
         result = self._run(htf_structure=HTF_BEARISH)
         self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    # config.HTF_TREND_FRESHNESS_ENABLED - a second, faster-updating HTF
+    # read (a plain EMA on the HTF candles) that can catch a stale swing-
+    # confirmed htf_trend AGAINST_HTF_BIAS alone would miss. Default
+    # ltf_close=93.0; htf_trend_ema defaults to None in _run() (a no-op)
+    # so every test above this point is unaffected unless it opts in.
+
+    def test_buy_rejected_when_price_has_fallen_below_the_htf_trend_ema(self):
+        # latest_price=93 < htf_trend_ema=95 - the swing-confirmed trend
+        # says BULLISH (HTF_BULLISH default), but real price has already
+        # slipped back below the faster-updating HTF average.
+        result = self._run(htf_trend_ema=95.0)
+        self.assertEqual(result["reason"], "HTF_TREND_STALE")
+
+    def test_buy_allowed_when_price_is_still_above_the_htf_trend_ema(self):
+        result = self._run(htf_trend_ema=90.0)
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_sell_rejected_when_price_has_risen_above_the_htf_trend_ema(self):
+        result = self._run(
+            ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+            ema_value=115.0, htf_trend_ema=105.0,
+        )
+        self.assertEqual(result["reason"], "HTF_TREND_STALE")
+
+    def test_sell_allowed_when_price_is_still_below_the_htf_trend_ema(self):
+        result = self._run(
+            ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+            ema_value=115.0, htf_trend_ema=115.0,
+        )
+        self.assertEqual(result["signal"], "SELL")
+
+    def test_disabled_flag_skips_the_check_even_when_price_disagrees(self):
+        with patch.object(config, "HTF_TREND_FRESHNESS_ENABLED", False):
+            result = self._run(htf_trend_ema=95.0)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_no_htf_history_yet_does_not_block_the_signal(self):
+        # htf_trend_ema=None (too little HTF history) - absence never
+        # blocks a signal on its own, same convention as every other
+        # optional confirmation.
+        result = self._run(htf_trend_ema=None)
+        self.assertEqual(result["signal"], "BUY")
 
     def test_no_signal_when_price_not_in_discount_for_buy(self):
         result = self._run(ltf_close=105.0)

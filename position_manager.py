@@ -172,6 +172,12 @@ class PositionManager:
             # promotion moment - see _is_profit_protection_candidate).
             "profit_protection_applied": False,
             "profit_protection_profit_locked": False,
+            # Best price reached since profit protection armed - None
+            # until arming, seeded with the arm-time price, then updated
+            # every poll while still trailing. See risk_manager.
+            # compute_profit_protection_trailing_floor/
+            # _trail_profit_protection_if_improved.
+            "profit_protection_peak_price": None,
             # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
             # a post-TP1 trailing stop replacement actually locked in more
             # than flat breakeven (see _trail_stop_if_improved and the
@@ -239,6 +245,12 @@ class PositionManager:
             # promotion moment - see _is_profit_protection_candidate).
             "profit_protection_applied": False,
             "profit_protection_profit_locked": False,
+            # Best price reached since profit protection armed - None
+            # until arming, seeded with the arm-time price, then updated
+            # every poll while still trailing. See risk_manager.
+            # compute_profit_protection_trailing_floor/
+            # _trail_profit_protection_if_improved.
+            "profit_protection_peak_price": None,
             # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
             # a post-TP1 trailing stop replacement actually locked in more
             # than flat breakeven (see _trail_stop_if_improved and the
@@ -431,6 +443,12 @@ class PositionManager:
             # promotion moment - see _is_profit_protection_candidate).
             "profit_protection_applied": False,
             "profit_protection_profit_locked": False,
+            # Best price reached since profit protection armed - None
+            # until arming, seeded with the arm-time price, then updated
+            # every poll while still trailing. See risk_manager.
+            # compute_profit_protection_trailing_floor/
+            # _trail_profit_protection_if_improved.
+            "profit_protection_peak_price": None,
             # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - set True only if
             # a post-TP1 trailing stop replacement actually locked in more
             # than flat breakeven (see _trail_stop_if_improved and the
@@ -826,14 +844,57 @@ class PositionManager:
 
     @staticmethod
     def _profit_protection_lock_price(position):
-        """Where the stop goes on profit-protection activation, and also
-        the trigger price itself - see risk_manager.
-        compute_profit_protection_lock_price: per explicit operator
-        choice, the same ROI% that triggers activation is what gets
-        locked, so one price serves both purposes."""
+        """The ARM trigger price only - see risk_manager.
+        compute_profit_protection_lock_price. Once armed, the stop no
+        longer jumps straight to this price; _profit_protection_trailing_
+        floor takes over (see its docstring and config.py's comment on
+        PROFIT_PROTECTION_LOCK_PCT_OF_TP1 for why)."""
         return risk_manager.compute_profit_protection_lock_price(
             position["entry_price"], position["side"], position["tp1_price"]
         )
+
+    @staticmethod
+    def _profit_protection_trailing_floor(position, peak_price):
+        """Where the stop actually gets set, both at arm time and on
+        every subsequent trail - see risk_manager.
+        compute_profit_protection_trailing_floor."""
+        return risk_manager.compute_profit_protection_trailing_floor(
+            position["entry_price"], position["side"], position["tp1_price"], peak_price
+        )
+
+    def _trail_profit_protection_if_improved(self, position, current_price):
+        """Continuous companion to the one-time arm above: once armed,
+        keeps updating position["profit_protection_peak_price"] with the
+        best price seen and re-derives the trailing floor from it every
+        call, replacing the real SL only when that's strictly more
+        favorable than the current one (ratchet-only, same discipline and
+        the same shared _replace_sl_order helper as _trail_stop_if_
+        improved - the two run independently and never loosen each
+        other's work). Returns a close-outcome string only if the replace
+        attempt forced a market-close of the remainder (-2021), otherwise
+        None. No-op for a position that never armed, or without a usable
+        current_price."""
+        if not position.get("profit_protection_applied"):
+            return None
+
+        if current_price is None or current_price <= 0:
+            return None
+
+        side = position["side"]
+        peak_price = position.get("profit_protection_peak_price")
+        peak_price = current_price if peak_price is None else (
+            max(peak_price, current_price) if side == "BUY" else min(peak_price, current_price)
+        )
+        position["profit_protection_peak_price"] = peak_price
+
+        candidate = self._profit_protection_trailing_floor(position, peak_price)
+
+        if candidate is None or not _more_favorable(side, candidate, position["sl_price"]):
+            return None
+
+        return self._replace_sl_order(
+            position, candidate, "Profit protection trailing stop", close_if_not_open=False
+        )[0]
 
     def _profit_protection_price_reached(self, position, current_price):
         """Has price reached the profit-protection lock price yet? Shared
@@ -888,14 +949,15 @@ class PositionManager:
                 profit_protection_candidate
                 and self._profit_protection_price_reached(position, current_price)
             ):
-                lock_price = self._profit_protection_lock_price(position)
+                position["profit_protection_peak_price"] = current_price
+                lock_price = self._profit_protection_trailing_floor(position, current_price)
 
                 if lock_price is not None:
                     position["profit_protection_applied"] = True
                     position["profit_protection_profit_locked"] = True
                     self._promote_to_breakeven(
                         position,
-                        reason="Profit protection (ROI-of-TP1 lock)",
+                        reason="Profit protection (ROI-of-TP1 trailing arm)",
                         target_price=lock_price,
                     )
                     return None
@@ -947,6 +1009,18 @@ class PositionManager:
             if tp2_status == "FINISHED":
                 exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "TP2_HIT")
+
+            if position.get("profit_protection_applied"):
+                # Extra mark-price fetch, same "only pay for it when a
+                # position could actually use it" discipline as the
+                # TP1_PENDING branch above - only positions that armed
+                # profit protection need this.
+                outcome = self._trail_profit_protection_if_improved(
+                    position, exchange.get_mark_price(symbol)
+                )
+
+                if outcome is not None:
+                    return outcome
 
             return self._trail_stop_if_improved(position, candles)
 
@@ -1158,7 +1232,9 @@ class PositionManager:
             if self._is_profit_protection_candidate(position) and self._profit_protection_price_reached(
                 position, latest_candle["close"]
             ):
-                lock_price = self._profit_protection_lock_price(position)
+                arm_price = latest_candle["close"]
+                position["profit_protection_peak_price"] = arm_price
+                lock_price = self._profit_protection_trailing_floor(position, arm_price)
 
                 if lock_price is not None:
                     position["profit_protection_applied"] = True
@@ -1166,7 +1242,7 @@ class PositionManager:
                     position["stage"] = BREAKEVEN_ACTIVE
                     position["sl_price"] = lock_price
                     log_info(
-                        f"{symbol} [SHADOW] profit protection (ROI-of-TP1 lock) | "
+                        f"{symbol} [SHADOW] profit protection (ROI-of-TP1 trailing arm) | "
                         f"SL -> {position['sl_price']}"
                     )
                     return None
@@ -1218,6 +1294,22 @@ class PositionManager:
 
             if hit_tp2:
                 return self._close(symbol, "SHADOW_TP2_HIT")
+
+            if position.get("profit_protection_applied"):
+                peak_source = high if side == "BUY" else low
+                peak_price = position.get("profit_protection_peak_price")
+                peak_price = peak_source if peak_price is None else (
+                    max(peak_price, peak_source) if side == "BUY" else min(peak_price, peak_source)
+                )
+                position["profit_protection_peak_price"] = peak_price
+
+                candidate = self._profit_protection_trailing_floor(position, peak_price)
+
+                if candidate is not None and _more_favorable(side, candidate, position["sl_price"]):
+                    position["sl_price"] = candidate
+                    log_info(
+                        f"{symbol} [SHADOW] profit protection trailing stop | SL -> {candidate}"
+                    )
 
             if config.STRUCTURE_STOP_MANAGEMENT_ENABLED and candles:
                 candidate = _structure_stop_candidate(position, candles)

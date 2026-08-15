@@ -179,18 +179,14 @@ def compute_early_breakeven_price(entry_price, side, risk_distance):
     return entry_price - lock_distance
 
 
-def compute_profit_protection_lock_price(entry_price, side, tp1_price):
-    """config.PROFIT_PROTECTION_ENABLED - the price at which unrealized
-    ROI reaches PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1% of what TP1
-    itself would pay out in ROI (at LEVERAGE). Used as BOTH the
-    activation trigger (position_manager checks "has price reached this
-    yet") and the lock target (move SL exactly here) - per explicit
-    operator choice, protection locks in the full ROI that triggered it,
-    not a smaller cushion below it (contrast EARLY_BREAKEVEN_R_MULTIPLE/
-    EARLY_BREAKEVEN_LOCK_R_MULTIPLE, which deliberately are two different
-    values). None if TP1's own ROI can't be computed (missing/degenerate
-    tp1_price, zero entry_price, or LEVERAGE<=0) - callers must treat
-    None as "not available yet", not "reached"."""
+def _price_at_tp1_roi_fraction(entry_price, side, tp1_price, fraction_pct):
+    """Price at which unrealized ROI (at LEVERAGE) equals fraction_pct%
+    of what TP1 itself would pay out in ROI. Shared scaling used by both
+    the profit-protection arm trigger (PROFIT_PROTECTION_ACTIVATION_PCT_
+    OF_TP1) and its trailing floor (PROFIT_PROTECTION_LOCK_PCT_OF_TP1) -
+    same TP1-relative math, different fraction. None if TP1's own ROI
+    can't be computed (missing/degenerate tp1_price, zero entry_price,
+    or LEVERAGE<=0) - callers must treat None as "not available yet"."""
     if entry_price <= 0 or tp1_price is None:
         return None
 
@@ -204,10 +200,60 @@ def compute_profit_protection_lock_price(entry_price, side, tp1_price):
     if leverage <= 0:
         return None
 
-    activation_pct = max(float(config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1), 0) / 100
-    target_roi_pct = tp1_roi_pct * activation_pct
-    lock_distance = (target_roi_pct / 100) / leverage * entry_price
-    return entry_price + lock_distance if side == "BUY" else entry_price - lock_distance
+    fraction = max(float(fraction_pct), 0) / 100
+    target_roi_pct = tp1_roi_pct * fraction
+    distance = (target_roi_pct / 100) / leverage * entry_price
+    return entry_price + distance if side == "BUY" else entry_price - distance
+
+
+def compute_profit_protection_lock_price(entry_price, side, tp1_price):
+    """config.PROFIT_PROTECTION_ENABLED - the price at which unrealized
+    ROI reaches PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1% of what TP1
+    itself would pay out in ROI. This is the ARM trigger only
+    (position_manager checks "has price reached this yet") - once armed,
+    the stop itself trails via compute_profit_protection_trailing_floor
+    instead of jumping straight to this same price (2026-08-15: locking
+    the SL exactly at the trigger price left ~zero room between the stop
+    and current price the instant it fired, so ordinary noise on the very
+    next tick closed the trade immediately - explicit operator report,
+    fixed by separating "enough profit to arm" from "where the stop
+    actually sits" the same way v7's evaluate_route_profit_protection
+    separates trigger_roi from lock_roi/retrace_pct)."""
+    return _price_at_tp1_roi_fraction(
+        entry_price, side, tp1_price, config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1
+    )
+
+
+def compute_profit_protection_trailing_floor(entry_price, side, tp1_price, peak_price):
+    """Where the SL actually gets set once profit protection has armed -
+    never below the PROFIT_PROTECTION_LOCK_PCT_OF_TP1 price (the
+    worst-case guaranteed lock), otherwise PROFIT_PROTECTION_RETRACE_PCT
+    of the gain from entry to the best price reached since arming
+    (peak_price) is allowed to give back before the stop catches up.
+    Ratchet-only in intent - callers (position_manager) still compare
+    the result against the current sl_price via _more_favorable and skip
+    a replace that isn't actually an improvement, since peak_price can
+    only move in the position's favor but a shrinking TP1-relative floor
+    on its own would not guarantee that.
+
+    None only when the arm-time lock price itself can't be computed
+    (same missing-data cases as compute_profit_protection_lock_price);
+    a missing/invalid peak_price just falls back to that lock price."""
+    lock_price = _price_at_tp1_roi_fraction(
+        entry_price, side, tp1_price, config.PROFIT_PROTECTION_LOCK_PCT_OF_TP1
+    )
+
+    if lock_price is None or peak_price is None or entry_price <= 0:
+        return lock_price
+
+    peak_price = float(peak_price)
+    retrace_pct = min(max(float(config.PROFIT_PROTECTION_RETRACE_PCT), 0), 100)
+    retained_distance = abs(peak_price - entry_price) * (1 - retrace_pct / 100)
+    retrace_price = (
+        entry_price + retained_distance if side == "BUY" else entry_price - retained_distance
+    )
+
+    return max(lock_price, retrace_price) if side == "BUY" else min(lock_price, retrace_price)
 
 
 def _entry_extension_r(signal, entry_price, side, risk_distance):

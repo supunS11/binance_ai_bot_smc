@@ -47,6 +47,9 @@ _kline_cache = {}
 _kline_cache_lock = threading.RLock()
 _kline_cache_ttl_seconds = 5
 
+_leverage_cache = {}  # symbol -> confirmed leverage value
+_leverage_cache_lock = threading.RLock()
+
 _BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
 _RATE_LIMIT_RE = re.compile(r"(code=-1003|too many requests)", re.IGNORECASE)
 
@@ -473,6 +476,22 @@ def normalize_trigger_price(symbol, side, order_type, price):
         rounding = "up" if take_profit else "down"
 
     return normalize_order_price(symbol, price, rounding=rounding)
+
+
+def _format_price_for_api(symbol, value):
+    """Fixed-point decimal string for a price/trigger field going to the
+    exchange - NEVER scientific notation. Real bug found live
+    (NEIROUSDT, 2026-08-10, 100% reproducible on every attempt): Python's
+    default float-to-string conversion silently switches to scientific
+    notation below ~1e-4 (e.g. 6.29e-05 for a low-priced symbol like
+    this), and Binance's REST API rejects that outright (-1102
+    "mandatory parameter ... was not sent, was empty/null, or
+    malformed") - an entire tier of low-priced symbols could never
+    successfully place a real SL/TP/limit order, no matter how good the
+    signal was. Uses the symbol's own reported pricePrecision so the
+    formatted string still respects its tick size."""
+    precision = max(int(get_symbol_price_rules(symbol).get("precision", 8)), 0)
+    return f"{float(value):.{precision}f}"
 
 
 def get_symbol_quantity_rules(symbol, order_type="MARKET"):
@@ -930,6 +949,23 @@ def get_open_algo_orders(symbol):
 
 
 def setup_leverage(symbol):
+    """Cached per symbol for the life of the process - real bug found
+    live (MTLUSDT/JOEUSDT, 2026-08-10): this used to make a real
+    futures_change_leverage call on EVERY entry attempt, even for a
+    symbol whose leverage was already confirmed minutes/hours earlier,
+    burning private REST rate-limit budget for no reason - directly
+    causing genuinely valid signals to die with "leverage Nx not
+    available" purely because this redundant call happened to land while
+    Binance's private REST backoff was active. Only a real leverage
+    change would ever need this re-checked, and that never happens
+    without a restart (config.LEVERAGE is read once at startup), which
+    naturally clears the cache anyway."""
+    symbol = symbol.upper()
+
+    with _leverage_cache_lock:
+        if _leverage_cache.get(symbol) == config.LEVERAGE:
+            return True
+
     try:
         response = _private_rest_call(
             f"futures_change_leverage:{symbol}",
@@ -943,6 +979,9 @@ def setup_leverage(symbol):
         if actual != config.LEVERAGE:
             log_warning(f"{symbol} leverage mismatch | REQUESTED={config.LEVERAGE} | ACTUAL={actual}")
             return False
+
+        with _leverage_cache_lock:
+            _leverage_cache[symbol] = actual
 
         log_info(f"{symbol} leverage set: {actual}x")
         return True
@@ -1019,6 +1058,8 @@ def place_limit_order(symbol, side, quantity, price):
     if price <= 0:
         raise ValueError(f"{symbol} entry price is invalid")
 
+    price = _format_price_for_api(symbol, price)
+
     return _private_rest_call(
         f"futures_create_order:{symbol}:limit",
         client.futures_create_order,
@@ -1076,6 +1117,8 @@ def place_stop_loss(symbol, side, trigger_price):
     if trigger_price <= 0:
         raise ValueError(f"{symbol} SL trigger price is invalid")
 
+    trigger_price = _format_price_for_api(symbol, trigger_price)
+
     return place_algo_order(
         symbol=symbol,
         side=close_side,
@@ -1101,6 +1144,8 @@ def place_take_profit_partial(symbol, side, quantity, trigger_price):
     if trigger_price <= 0:
         raise ValueError(f"{symbol} TP1 trigger price is invalid")
 
+    trigger_price = _format_price_for_api(symbol, trigger_price)
+
     return place_algo_order(
         symbol=symbol,
         side=close_side,
@@ -1122,6 +1167,8 @@ def place_take_profit_full(symbol, side, trigger_price):
 
     if trigger_price <= 0:
         raise ValueError(f"{symbol} TP2 trigger price is invalid")
+
+    trigger_price = _format_price_for_api(symbol, trigger_price)
 
     return place_algo_order(
         symbol=symbol,

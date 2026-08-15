@@ -350,6 +350,87 @@ class ComputeProfitProtectionLockPriceTests(unittest.TestCase):
         self.assertIsNone(price)
 
 
+class ComputeProfitProtectionTrailingFloorTests(unittest.TestCase):
+    """Where the SL actually gets set once profit protection has armed -
+    the max (BUY) / min (SELL) of a fixed worst-case floor
+    (PROFIT_PROTECTION_LOCK_PCT_OF_TP1) and a cushion behind the best
+    price reached so far (PROFIT_PROTECTION_RETRACE_PCT of the entry ->
+    peak gain). entry=100, tp1=110 -> tp1 ROI=10/100*10*100=100%."""
+
+    def test_retrace_dominates_when_peak_has_run_far_beyond_the_floor(self):
+        # LOCK_PCT_OF_TP1=10% of 100%=10% ROI -> distance=1 -> floor=101.
+        # RETRACE_PCT=50% of (peak-entry=8) retained=4 -> retrace=104.
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", 110, 108)
+
+        self.assertAlmostEqual(price, 104)
+
+    def test_lock_floor_dominates_right_at_arming(self):
+        # peak_price == entry + a tiny move just past the trigger: the
+        # retrace cushion off such a small peak is smaller than the fixed
+        # worst-case floor, so the floor wins instead.
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 50), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 90):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", 110, 100.5)
+
+        self.assertAlmostEqual(price, 105)  # 50% of 100% ROI -> distance=5
+
+    def test_sell_side_mirrors_buy(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "SELL", 90, 92)
+
+        self.assertAlmostEqual(price, 96)  # mirror of the BUY retrace-dominates case
+
+    def test_retrace_never_gives_back_more_than_the_full_peak_gain(self):
+        # RETRACE_PCT=0 -> the entire gain since entry is retained, so the
+        # floor sits exactly at the peak itself.
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 0):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", 110, 106)
+
+        self.assertAlmostEqual(price, 106)
+
+    def test_retrace_pct_100_falls_back_to_the_lock_floor(self):
+        # RETRACE_PCT=100 -> none of the gain is retained by the retrace
+        # side of the formula (retrace_price collapses to entry_price),
+        # so the fixed lock floor always wins.
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 100):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", 110, 108)
+
+        self.assertAlmostEqual(price, 101)
+
+    def test_retrace_pct_out_of_range_is_clamped(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 150):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", 110, 108)
+
+        self.assertAlmostEqual(price, 101)  # clamped to 100 -> same as retrace_pct=100 above
+
+    def test_none_peak_price_falls_back_to_the_lock_floor(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10):
+            price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", 110, None)
+
+        self.assertAlmostEqual(price, 101)
+
+    def test_none_tp1_price_returns_none(self):
+        price = risk_manager.compute_profit_protection_trailing_floor(100, "BUY", None, 105)
+        self.assertIsNone(price)
+
+    def test_zero_entry_price_returns_none(self):
+        price = risk_manager.compute_profit_protection_trailing_floor(0, "BUY", 110, 105)
+        self.assertIsNone(price)
+
+
 class BuildTradePlanTests(unittest.TestCase):
     def setUp(self):
         # MAX_ENTRY_EXTENSION_R defaults to 0.5 in config, but this

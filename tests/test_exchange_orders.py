@@ -17,7 +17,8 @@ class OrderParameterTests(unittest.TestCase):
 
     def test_place_stop_loss_sends_trigger_price_not_stop_price(self):
         with patch.object(exchange, "place_algo_order") as mock_place, \
-             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p):
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
             exchange.place_stop_loss("BTCUSDT", "BUY", 98.0)
 
         _, kwargs = mock_place.call_args
@@ -28,7 +29,8 @@ class OrderParameterTests(unittest.TestCase):
     def test_place_take_profit_partial_sends_trigger_price_not_stop_price(self):
         with patch.object(exchange, "place_algo_order") as mock_place, \
              patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
-             patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q):
+             patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
             exchange.place_take_profit_partial("BTCUSDT", "BUY", 0.5, 102.0)
 
         _, kwargs = mock_place.call_args
@@ -38,13 +40,113 @@ class OrderParameterTests(unittest.TestCase):
 
     def test_place_take_profit_full_sends_trigger_price_not_stop_price(self):
         with patch.object(exchange, "place_algo_order") as mock_place, \
-             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p):
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
             exchange.place_take_profit_full("BTCUSDT", "BUY", 104.0)
 
         _, kwargs = mock_place.call_args
         self.assertEqual(kwargs["triggerPrice"], 104.0)
         self.assertNotIn("stopPrice", kwargs)
         self.assertEqual(kwargs["closePosition"], "true")
+
+
+class FormatPriceForApiTests(unittest.TestCase):
+    """Real bug found live (NEIROUSDT, 2026-08-10, 100% reproducible):
+    passing a raw Python float for a low-priced symbol's trigger/limit
+    price serializes as scientific notation (e.g. 6.29e-05), which
+    Binance's API rejects outright (-1102 malformed parameter). This
+    formats a plain fixed-point decimal string instead."""
+
+    def test_low_priced_symbol_never_produces_scientific_notation(self):
+        with patch.object(
+            exchange, "get_symbol_price_rules", return_value={"precision": 8}
+        ):
+            result = exchange._format_price_for_api("NEIROUSDT", 6.29e-05)
+
+        self.assertNotIn("e", result.lower())
+        self.assertEqual(result, "0.00006290")
+
+    def test_uses_the_symbols_own_price_precision(self):
+        with patch.object(
+            exchange, "get_symbol_price_rules", return_value={"precision": 2}
+        ):
+            result = exchange._format_price_for_api("BTCUSDT", 100.5)
+
+        self.assertEqual(result, "100.50")
+
+    def test_negative_precision_is_clamped_to_zero(self):
+        with patch.object(
+            exchange, "get_symbol_price_rules", return_value={"precision": -1}
+        ):
+            result = exchange._format_price_for_api("BTCUSDT", 100.5)
+
+        self.assertEqual(result, "100")
+
+    def test_missing_precision_falls_back_to_eight_decimals(self):
+        with patch.object(exchange, "get_symbol_price_rules", return_value={}):
+            result = exchange._format_price_for_api("BTCUSDT", 100.5)
+
+        self.assertEqual(result, "100.50000000")
+
+
+class SetupLeverageCachingTests(unittest.TestCase):
+    """Real bug found live (MTLUSDT/JOEUSDT, 2026-08-10): setup_leverage
+    used to make a real futures_change_leverage call on every single
+    entry attempt, burning private REST rate-limit budget for no reason
+    and directly causing valid signals to die with "leverage Nx not
+    available" whenever that redundant call landed during a backoff
+    window."""
+
+    def setUp(self):
+        exchange._leverage_cache.clear()
+
+    def tearDown(self):
+        exchange._leverage_cache.clear()
+
+    def test_second_call_for_the_same_symbol_skips_the_real_api_call(self):
+        with patch.object(
+            exchange.client, "futures_change_leverage",
+            return_value={"leverage": config.LEVERAGE},
+        ) as mock_call:
+            exchange.setup_leverage("BTCUSDT")
+            result = exchange.setup_leverage("BTCUSDT")
+
+        mock_call.assert_called_once()
+        self.assertTrue(result)
+
+    def test_different_symbols_each_get_a_real_call(self):
+        with patch.object(
+            exchange.client, "futures_change_leverage",
+            return_value={"leverage": config.LEVERAGE},
+        ) as mock_call:
+            exchange.setup_leverage("BTCUSDT")
+            exchange.setup_leverage("ETHUSDT")
+
+        self.assertEqual(mock_call.call_count, 2)
+
+    def test_a_leverage_mismatch_is_not_cached_and_can_be_retried(self):
+        with patch.object(
+            exchange.client, "futures_change_leverage",
+            return_value={"leverage": config.LEVERAGE + 1},
+        ) as mock_call:
+            first = exchange.setup_leverage("BTCUSDT")
+            second = exchange.setup_leverage("BTCUSDT")
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(mock_call.call_count, 2)
+
+    def test_an_exception_is_not_cached_and_can_be_retried(self):
+        with patch.object(
+            exchange.client, "futures_change_leverage",
+            side_effect=Exception("boom"),
+        ) as mock_call:
+            first = exchange.setup_leverage("BTCUSDT")
+            second = exchange.setup_leverage("BTCUSDT")
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(mock_call.call_count, 2)
 
 
 def _exchange_info(symbol, lot_size_max, market_lot_size_max):
@@ -210,6 +312,11 @@ class PrivateRestWeightTests(unittest.TestCase):
         self.rate_limit_mock.assert_called_once_with(5)
 
     def test_setup_leverage_is_weighted(self):
+        # setup_leverage now caches per symbol (see SetupLeverageCachingTests)
+        # - an empty cache here guarantees the real call actually happens,
+        # regardless of what other tests in this run already cached.
+        exchange._leverage_cache.clear()
+
         with patch.object(
             exchange.client, "futures_change_leverage",
             return_value={"leverage": config.LEVERAGE},
@@ -560,6 +667,7 @@ class LimitOrderTests(unittest.TestCase):
     def test_sends_limit_type_and_gtc(self):
         with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
              patch.object(exchange, "normalize_order_price", return_value=100.0), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v), \
              patch.object(exchange.client, "futures_create_order", return_value={}) as mock_order:
             exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
 

@@ -64,6 +64,20 @@ def evaluate(
     if not htf_structure.get("available"):
         return _reject("HTF_STRUCTURE_UNAVAILABLE")
 
+    # config.HTF_TREND_FRESHNESS_ENABLED - a second, faster-updating HTF
+    # read alongside htf_structure's swing-confirmed trend (see its
+    # config.py comment for the real evidence: a stale swing-confirmed
+    # bias can persist for many hours after real price has already moved
+    # against it, since a swing needs 16 real hours to confirm on the 4h
+    # HTF). None with too little HTF history yet - same as every other
+    # optional confirmation, absence never blocks a signal on its own.
+    htf_trend_ema = None
+
+    if config.HTF_TREND_FRESHNESS_ENABLED:
+        htf_trend_ema = market_structure.exponential_moving_average(
+            htf_candles, period=config.HTF_TREND_EMA_PERIOD
+        )
+
     zone = market_structure.premium_discount_zone(htf_candles)
 
     if not zone.get("available"):
@@ -359,6 +373,13 @@ def evaluate(
 
         if htf_side and side != htf_side:
             return _reject(f"AGAINST_HTF_BIAS htf={htf_structure.get('trend')} ltf={direction}")
+
+        if htf_trend_ema is not None:
+            if side == "BUY" and latest_price < htf_trend_ema:
+                return _reject("HTF_TREND_STALE")
+
+            if side == "SELL" and latest_price > htf_trend_ema:
+                return _reject("HTF_TREND_STALE")
 
         price_zone = market_structure.zone_for_price(zone, latest_price)
 
