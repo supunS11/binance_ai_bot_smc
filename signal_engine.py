@@ -26,6 +26,12 @@ def _reject(reason, **extra):
     return {"signal": None, "reason": reason, **extra}
 
 
+# Plain reference to the function above, captured before _evaluate_direction
+# (inside evaluate()) locally shadows the name `_reject` with a trigger-
+# tagging wrapper - see its definition for why.
+_reject_plain = _reject
+
+
 def long_short_favorable(side, long_short_ratio):
     """Contrarian reading of the global long/short account ratio - don't
     buy into an already long-crowded market or short into an already
@@ -363,6 +369,27 @@ def evaluate(
         placeholders in the success dict - the caller overlays the
         winning candidate's real values afterward."""
         nonlocal pools, sweep
+
+        # Which trigger(s) actually attempted this direction - a rejection
+        # inside this function currently can't be told apart by trigger at
+        # all (gates run once per direction, shared across every candidate
+        # that direction has), so main.py's reject tally has never been
+        # able to answer "how often does CVD_DIVERGENCE specifically die
+        # at CVD_NOT_CONFIRMED" - only "how often does CVD_NOT_CONFIRMED
+        # fire". Shadows the module-level _reject for the rest of this
+        # function only, so every existing `return _reject(...)` call
+        # below picks this up with zero changes to each call site. Purely
+        # additive (a new "triggers" key, `reason` itself untouched) -
+        # deliberately not baked into the reason string, so this can't
+        # affect any existing test or the main reject-reason tally's
+        # existing keys/counts.
+        _triggers_for_direction = sorted({
+            candidate["signal_trigger"] for candidate in candidates
+            if candidate["direction"] == direction
+        })
+
+        def _reject(reason, **extra):
+            return _reject_plain(reason, triggers=_triggers_for_direction, **extra)
 
         side = _BULLISH_TO_SIDE.get(direction)
 

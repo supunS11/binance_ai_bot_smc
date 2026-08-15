@@ -1810,6 +1810,66 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result_b["signal_trigger"], "STRUCTURE_BREAK")
 
 
+class RejectTriggerTaggingTests(unittest.TestCase):
+    """A direction-level rejection (inside _evaluate_direction) now also
+    carries which trigger(s) actually attempted that direction - purely
+    additive (a new "triggers" key; `reason` itself is untouched, so this
+    can never affect main.py's existing reject-reason tally or any test
+    asserting on `reason` alone). Delegates to SignalEngineTests._run
+    (verified self-independent) rather than subclassing it, which would
+    otherwise re-run all of SignalEngineTests' own tests again under this
+    class too."""
+
+    def _run(self, **kwargs):
+        return SignalEngineTests._run(self, **kwargs)
+
+    def test_single_trigger_is_tagged_on_rejection(self):
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run(htf_structure=HTF_BEARISH)  # AGAINST_HTF_BIAS
+
+        self.assertTrue(result["reason"].startswith("AGAINST_HTF_BIAS"))
+        self.assertEqual(result["triggers"], ["STRUCTURE_BREAK"])
+
+    def test_multiple_triggers_sharing_the_direction_are_all_tagged(self):
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(
+                htf_structure=HTF_BEARISH,  # AGAINST_HTF_BIAS for both
+                sweep_direction="BULLISH", sweep_level=90.0,
+            )
+
+        self.assertTrue(result["reason"].startswith("AGAINST_HTF_BIAS"))
+        self.assertEqual(result["triggers"], ["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"])
+
+    def test_reason_string_itself_is_unaffected_by_tagging(self):
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run(htf_structure=HTF_BEARISH)
+
+        self.assertEqual(result["reason"], "AGAINST_HTF_BIAS htf=BEARISH ltf=BULLISH")
+
+    def test_early_rejection_before_any_candidate_has_no_triggers_key(self):
+        # NO_LIVE_STRUCTURE_BREAK fires before any direction/candidate is
+        # resolved - _evaluate_direction (and its trigger tagging) is
+        # never reached at all.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run(ltf_analysis={
+                "available": True, "live_break": {"broken": False},
+                "fair_value_gaps": [], "atr": 1.0,
+            })
+
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+        self.assertNotIn("triggers", result)
+
+    def test_passing_signal_has_no_triggers_key(self):
+        # triggers is a rejection-diagnostic field only - a real signal
+        # already carries signal_trigger (the winning candidate's own
+        # trigger), which is the meaningful field once something passes.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertNotIn("triggers", result)
+
+
 class LongShortFavorableTests(unittest.TestCase):
     """signal_engine.long_short_favorable - called from main.py once the
     on-demand long_short_ratio fetch resolves (see

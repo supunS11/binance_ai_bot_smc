@@ -127,6 +127,7 @@ class SignalStabilityTracker:
 def _evaluate_symbol(
     feed, symbol, positions, balance,
     reject_counts=None, reject_symbols=None, stability=None,
+    reject_trigger_counts=None, reject_trigger_symbols=None,
 ):
     """`reject_counts`/`reject_symbols` (optional) tally why candidates
     don't convert to a trade - signal_engine.evaluate()'s `reason`, plus a
@@ -139,7 +140,19 @@ def _evaluate_symbol(
     This makes that visible via the heartbeat instead of guessing.
     Deliberately excludes the has_open_position/cooldown/max_positions
     early-exits above - those are routine operational skips, not signal-
-    quality rejections, and would just dilute the tally."""
+    quality rejections, and would just dilute the tally.
+
+    `reject_trigger_counts`/`reject_trigger_symbols` (optional, separate
+    from the pair above - never mixed into the same tally) - a second,
+    finer-grained breakdown answering "which TRIGGER dies at this gate",
+    not just "how often does this gate fire". Real gap: gates run once per
+    DIRECTION, shared across every candidate sharing it (see signal_engine.
+    _evaluate_direction's own docstring), so a plain rejection has never
+    been attributable to one specific trigger before - see signal_engine.
+    evaluate()'s new `triggers` field on a reject dict. Kept as an entirely
+    separate tally/heartbeat line rather than folded into reject_counts'
+    existing keys, so the established top-8 heartbeat summary's format and
+    counts are completely unaffected by this."""
     if positions.has_open_position(symbol):
         return
 
@@ -174,7 +187,18 @@ def _evaluate_symbol(
     if not result.get("signal"):
         if stability is not None:
             stability.reset(symbol)
-        _tally_reject(reject_counts, reject_symbols, symbol, result.get("reason") or "UNKNOWN")
+
+        reason = result.get("reason") or "UNKNOWN"
+        _tally_reject(reject_counts, reject_symbols, symbol, reason)
+
+        triggers = result.get("triggers")
+
+        if triggers:
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"{reason} | triggers={','.join(triggers)}",
+            )
+
         return
 
     if stability is not None and not stability.confirm(
@@ -293,23 +317,41 @@ def _resolve_break_confirmations(feed, positions):
     positions.resolve_break_confirmations(feed.candles)
 
 
-def _log_heartbeat(feed, symbols, positions, reject_counts=None, reject_symbols=None):
+def _reject_summary_line(counts, symbols_by_reason, top_n=8):
+    """Shared formatting for both reject-tally heartbeat lines (the
+    original reason-only one and the newer trigger-tagged one) - same
+    "top N by count, with a capped sample of symbols" shape either way."""
+    top = sorted(counts.items(), key=lambda kv: -kv[1])[:top_n]
+    parts = []
+
+    for reason, count in top:
+        sample = (symbols_by_reason or {}).get(reason, [])
+        more = ",..." if sample and count > len(sample) else ""
+        symbols_note = f"[{','.join(sample)}{more}]" if sample else ""
+        parts.append(f"{reason}={count}{symbols_note}")
+
+    return " ".join(parts)
+
+
+def _log_heartbeat(
+    feed, symbols, positions, reject_counts=None, reject_symbols=None,
+    reject_trigger_counts=None, reject_trigger_symbols=None,
+):
     log_info(
         f"Heartbeat | WATCHING={len(symbols)} | OPEN_POSITIONS={positions.open_count()} "
         f"| MODE={config.EXECUTION_MODE}"
     )
 
     if reject_counts:
-        top = sorted(reject_counts.items(), key=lambda kv: -kv[1])[:8]
-        parts = []
+        log_info(f"  REJECTED since last heartbeat | {_reject_summary_line(reject_counts, reject_symbols)}")
 
-        for reason, count in top:
-            sample = (reject_symbols or {}).get(reason, [])
-            more = ",..." if sample and count > len(sample) else ""
-            symbols_note = f"[{','.join(sample)}{more}]" if sample else ""
-            parts.append(f"{reason}={count}{symbols_note}")
-
-        log_info(f"  REJECTED since last heartbeat | {' '.join(parts)}")
+    # See _evaluate_symbol's docstring on reject_trigger_counts - entirely
+    # separate from the line above, never mixed into it.
+    if reject_trigger_counts:
+        log_info(
+            f"  REJECTED BY TRIGGER since last heartbeat | "
+            f"{_reject_summary_line(reject_trigger_counts, reject_trigger_symbols)}"
+        )
 
     for symbol in list(positions.positions.keys()):
         position = positions.positions[symbol]
@@ -420,6 +462,8 @@ def main():
     tick = 0
     reject_counts = Counter()
     reject_symbols = {}
+    reject_trigger_counts = Counter()
+    reject_trigger_symbols = {}
     stability = SignalStabilityTracker()
     # Balance barely changes tick-to-tick, so it's refreshed on the same
     # cadence as position polling rather than every eval tick - otherwise
@@ -442,13 +486,19 @@ def main():
 
             for symbol in symbols:
                 _evaluate_symbol(
-                    feed, symbol, positions, balance, reject_counts, reject_symbols, stability
+                    feed, symbol, positions, balance, reject_counts, reject_symbols, stability,
+                    reject_trigger_counts, reject_trigger_symbols,
                 )
 
             if tick % heartbeat_every == 0:
-                _log_heartbeat(feed, symbols, positions, reject_counts, reject_symbols)
+                _log_heartbeat(
+                    feed, symbols, positions, reject_counts, reject_symbols,
+                    reject_trigger_counts, reject_trigger_symbols,
+                )
                 reject_counts.clear()
                 reject_symbols.clear()
+                reject_trigger_counts.clear()
+                reject_trigger_symbols.clear()
 
     except KeyboardInterrupt:
         log_warning("Shutdown requested (KeyboardInterrupt)")

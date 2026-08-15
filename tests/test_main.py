@@ -233,6 +233,89 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
 
         self.assertEqual(len(reject_counts), 0)
 
+    def test_triggers_field_is_tallied_separately_when_present(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter()
+        reject_trigger_counts = Counter()
+
+        with patch.object(
+            signal_engine, "evaluate",
+            return_value={"signal": None, "reason": "AGAINST_HTF_BIAS", "triggers": ["STRUCTURE_BREAK"]},
+        ):
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, None, None,
+                reject_trigger_counts,
+            )
+
+        self.assertEqual(reject_counts["AGAINST_HTF_BIAS"], 1)
+        self.assertEqual(reject_trigger_counts["AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK"], 1)
+
+    def test_multiple_triggers_are_joined_in_the_trigger_tally_key(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_trigger_counts = Counter()
+
+        with patch.object(
+            signal_engine, "evaluate",
+            return_value={
+                "signal": None, "reason": "AGAINST_HTF_BIAS",
+                "triggers": ["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"],
+            },
+        ):
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, Counter(), None, None,
+                reject_trigger_counts,
+            )
+
+        self.assertEqual(
+            reject_trigger_counts["AGAINST_HTF_BIAS | triggers=LIQUIDITY_SWEEP,STRUCTURE_BREAK"], 1
+        )
+
+    def test_missing_triggers_field_does_not_touch_the_trigger_tally(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_trigger_counts = Counter()
+
+        with patch.object(
+            signal_engine, "evaluate", return_value={"signal": None, "reason": "NO_LIVE_STRUCTURE_BREAK"}
+        ):
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, Counter(), None, None,
+                reject_trigger_counts,
+            )
+
+        self.assertEqual(len(reject_trigger_counts), 0)
+
+    def test_reject_trigger_counts_none_is_safe_and_does_not_raise(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(
+            signal_engine, "evaluate",
+            return_value={"signal": None, "reason": "AGAINST_HTF_BIAS", "triggers": ["STRUCTURE_BREAK"]},
+        ):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+    def test_trigger_sample_symbols_are_tracked_when_provided(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_trigger_counts = Counter()
+        reject_trigger_symbols = {}
+
+        with patch.object(
+            signal_engine, "evaluate",
+            return_value={"signal": None, "reason": "AGAINST_HTF_BIAS", "triggers": ["STRUCTURE_BREAK"]},
+        ):
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, Counter(), None, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        self.assertEqual(
+            reject_trigger_symbols["AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK"], ["BTCUSDT"]
+        )
+
 
 class SignalStabilityTrackerTests(unittest.TestCase):
     """Real motivation (2026-08-12, live): IOTXUSDT was rejected for
@@ -549,6 +632,55 @@ class LogHeartbeatRejectSummaryTests(unittest.TestCase):
         logged = " ".join(call.args[0] for call in log_mock.call_args_list)
         self.assertIn("UNKNOWN=3 ", logged + " ")
         self.assertNotIn("UNKNOWN=3[", logged)
+
+    def test_reject_trigger_counts_get_their_own_separate_line(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter({"AGAINST_HTF_BIAS": 5})
+        reject_trigger_counts = Counter({"AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK": 3})
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(
+                feed, ["BTCUSDT"], positions, reject_counts, None,
+                reject_trigger_counts, None,
+            )
+
+        lines = [call.args[0] for call in log_mock.call_args_list]
+        self.assertTrue(any(line.startswith("  REJECTED since last heartbeat") for line in lines))
+        trigger_lines = [line for line in lines if line.startswith("  REJECTED BY TRIGGER")]
+        self.assertEqual(len(trigger_lines), 1)
+        self.assertIn("AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK=3", trigger_lines[0])
+
+    def test_empty_reject_trigger_counts_logs_no_trigger_line(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, Counter(), None, Counter())
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertNotIn("REJECTED BY TRIGGER", logged)
+
+    def test_reject_trigger_counts_defaults_to_none_without_raising(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        main._log_heartbeat(feed, ["BTCUSDT"], positions, Counter())
+
+    def test_trigger_symbol_sample_is_included(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_trigger_counts = Counter({"AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK": 1})
+        reject_trigger_symbols = {"AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK": ["BTCUSDT"]}
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(
+                feed, ["BTCUSDT"], positions, Counter(), None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("AGAINST_HTF_BIAS | triggers=STRUCTURE_BREAK=1[BTCUSDT]", logged)
 
 
 class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
