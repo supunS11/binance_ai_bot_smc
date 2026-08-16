@@ -408,6 +408,27 @@ def evaluate(
             if side == "SELL" and latest_price > htf_trend_ema:
                 return _reject("HTF_TREND_STALE")
 
+        # config.EFFICIENCY_RATIO_GATE_ENABLED - genuine chop (price
+        # round-tripping, no real directional move) is a failure mode
+        # neither AGAINST_HTF_BIAS nor HTF_TREND_STALE can catch:
+        # structure_state()'s swing-confirmed trend can only ever report
+        # BULLISH or BEARISH, never "no real trend right now", so it
+        # freezes on a stale read through genuine chop instead of
+        # recognizing it - and chop doesn't move price decisively away
+        # from the EMA either, so HTF_TREND_STALE reads "still fine" the
+        # whole time. Checked here (before zone/OTE/OB-FVG/CVD/depth)
+        # since it's a market-regime fact independent of where within a
+        # move the entry sits - fetched early on purpose, ltf_analysis
+        # already has it for free from the top of evaluate().
+        efficiency_ratio = ltf_analysis.get("efficiency_ratio")
+
+        if (
+            config.EFFICIENCY_RATIO_GATE_ENABLED
+            and efficiency_ratio is not None
+            and efficiency_ratio < config.EFFICIENCY_RATIO_CHOP_THRESHOLD
+        ):
+            return _reject("MARKET_CHOPPY")
+
         price_zone = market_structure.zone_for_price(zone, latest_price)
 
         if side == "BUY" and price_zone != "DISCOUNT":
@@ -551,12 +572,6 @@ def evaluate(
 
         sweep_confluence = bool(sweep and sweep["direction"] == direction)
 
-        # Chop/volatility regime: informational only, NOT a gate. A
-        # structure break inside a low-efficiency (choppy, round-
-        # tripping) market is weaker evidence than the same break inside
-        # a genuinely trending one - see market_structure.efficiency_ratio.
-        efficiency_ratio = ltf_analysis.get("efficiency_ratio")
-
         # BTC correlation: informational only, NOT a gate - see
         # config.BTC_CORRELATION_ENABLED. Most alts move because BTC
         # moves, not from their own structure; skipped entirely when
@@ -581,9 +596,12 @@ def evaluate(
         # mechanism is disabled today on real negative evidence from its
         # existing 5 fields - mixing new, unvalidated ones into it would
         # contaminate any future read of either). Kept independently
-        # named/journaled so journal_analysis.py can evaluate each on
-        # its own merits before any decision to fold it into sizing (or
-        # promote it to a real gate).
+        # named/journaled so journal_analysis.py can evaluate each on its
+        # own merits before any decision to fold it into sizing. Note
+        # efficiency_ratio itself is now ALSO a real gate above
+        # (config.EFFICIENCY_RATIO_GATE_ENABLED, checked earlier in this
+        # function) - this boolean is a separate, informational-only
+        # reading of the same underlying value, unaffected by that.
         efficiency_favorable = (
             efficiency_ratio > config.EFFICIENCY_RATIO_CHOP_THRESHOLD
             if efficiency_ratio is not None else None

@@ -301,10 +301,27 @@ LONG_SHORT_RATIO_ENABLED = env_bool("LONG_SHORT_RATIO_ENABLED", "True")
 # confluence_fields/confluence_ratio (see CONFLUENCE_SIZING_ENABLED below:
 # that mechanism is disabled on real negative evidence already, so mixing
 # new unvalidated fields into it would contaminate any future read of
-# either). Deliberately not gates either, same evidence-first treatment as
-# every other informational field above - promote to a real gate only if
-# journal_analysis.py's breakdown ever shows real separation.
+# either). funding_rate/long_short_ratio stay informational-only for now;
+# efficiency_ratio was promoted to a real gate below - see
+# EFFICIENCY_RATIO_GATE_ENABLED.
 EFFICIENCY_RATIO_CHOP_THRESHOLD = env_float("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3)
+# 2026-08-16, real evidence: a 29h window where every single signal read
+# htf_trend=BULLISH while BTC (and a directly-traced traded symbol,
+# POWERUSDT) were both genuinely flat/choppy the whole time, not trending -
+# structure_state()'s swing-confirmed HTF trend can only ever report
+# BULLISH or BEARISH, never "no real trend right now", so it freezes on a
+# stale read through genuine chop instead of recognizing it.
+# journal_analysis.py's efficiency-ratio breakdown for that exact window:
+# zero trades in the "trending" bucket, 80% loss rate in "choppy" (<0.3),
+# 100% in "moderate" (0.3-0.6) though that bucket was only n=3; 70% of
+# losses ran real favorable distance (0.2R-1.0R+) before reversing - the
+# whipsaw signature of a directional strategy trading a range. Gates only
+# the "choppy" (<0.3) bucket for now (explicit operator choice, 2026-08-16)
+# - the "moderate" bucket's 100% loss rate is real but too thin (n=3) to
+# set a permanent cutoff on yet. Risk-reducing by construction (only ever
+# rejects) so ships live immediately, same precedent as
+# HTF_TREND_FRESHNESS_ENABLED/MIN_STOP_DISTANCE_ATR_MULTIPLE.
+EFFICIENCY_RATIO_GATE_ENABLED = env_bool("EFFICIENCY_RATIO_GATE_ENABLED", "True")
 FUNDING_RATE_ADVERSE_THRESHOLD = env_float("FUNDING_RATE_ADVERSE_THRESHOLD", 0.0005)
 LONG_SHORT_RATIO_CROWD_THRESHOLD = env_float("LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0)
 # Require the LTF candle that broke structure to have actually CLOSED

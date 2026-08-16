@@ -290,6 +290,53 @@ class SignalEngineTests(unittest.TestCase):
         result = self._run(htf_trend_ema=None)
         self.assertEqual(result["signal"], "BUY")
 
+    def test_market_choppy_rejects_below_the_threshold(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(ltf_analysis=analysis)
+
+        self.assertEqual(result["reason"], "MARKET_CHOPPY")
+
+    def test_market_choppy_allows_at_or_above_the_threshold(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.3)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(ltf_analysis=analysis)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_market_choppy_gate_disabled_lets_a_choppy_signal_through(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3), \
+             patch.object(config, "EFFICIENCY_RATIO_GATE_ENABLED", False):
+            result = self._run(ltf_analysis=analysis)
+
+        self.assertEqual(result["signal"], "BUY")
+        # Still journaled/available as an informational reading even
+        # though the gate itself is off.
+        self.assertFalse(result["efficiency_favorable"])
+
+    def test_no_efficiency_data_yet_does_not_block_the_signal(self):
+        # LTF_BULLISH_BREAK carries no efficiency_ratio key - absence
+        # never blocks a signal on its own, same convention as every
+        # other optional confirmation.
+        result = self._run()
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_market_choppy_applies_to_sell_the_same_way(self):
+        analysis = dict(LTF_BEARISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+            )
+
+        self.assertEqual(result["reason"], "MARKET_CHOPPY")
+
     def test_no_signal_when_price_not_in_discount_for_buy(self):
         result = self._run(ltf_close=105.0)
         self.assertIn("NOT_IN_DISCOUNT", result["reason"])
@@ -501,9 +548,15 @@ class SignalEngineTests(unittest.TestCase):
         self.assertTrue(result["efficiency_favorable"])
 
     def test_efficiency_favorable_false_below_the_chop_threshold(self):
+        # EFFICIENCY_RATIO_GATE_ENABLED off here on purpose - this test is
+        # about the informational efficiency_favorable boolean specifically,
+        # not the real MARKET_CHOPPY gate (see MarketChoppyGateTests) - an
+        # efficiency_ratio this low would otherwise be rejected before ever
+        # reaching the success dict this test reads.
         analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
 
-        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3), \
+             patch.object(config, "EFFICIENCY_RATIO_GATE_ENABLED", False):
             result = self._run(ltf_analysis=analysis)
 
         self.assertFalse(result["efficiency_favorable"])
