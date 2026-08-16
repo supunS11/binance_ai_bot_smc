@@ -474,6 +474,45 @@ TRIGGER_QUALITY_EDGE_ATR_MULTIPLE = env_float("TRIGGER_QUALITY_EDGE_ATR_MULTIPLE
 # argument above actually holds, not just on the strength of that
 # argument alone.
 OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED = env_bool("OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", "False")
+# 2026-08-16, code-audit finding, part of the same trigger/gate-matching
+# initiative as OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED above - CVD_DIVERGENCE
+# fires when price and CVD *disagree* at swing points (a higher high with
+# weaker CVD = absorption -> SELL). CVD_NOT_CONFIRMED then separately
+# requires the RECENT-WINDOW CVD score to already *agree* with that same
+# new direction - potentially self-defeating, since it could filter this
+# trigger down to only its latest, most-obvious (worst risk/reward)
+# setups, rejecting the early ones the trigger exists to catch. When True,
+# CVD_DIVERGENCE candidates skip CVD_NOT_CONFIRMED specifically (NOT the
+# ORDER_FLOW_DATA_UNAVAILABLE/ORDER_FLOW_SCORE_UNAVAILABLE checks just
+# above it in the pipeline - those are "is there any data at all", not a
+# threshold comparison, and apply the same regardless of trigger). Default
+# OFF, same reasoning as OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED: this can
+# only ever ACCEPT more candidates, so it needs real per-trigger outcome
+# evidence, not just the argument above, before enabling. As of this
+# writing CVD_NOT_CONFIRMED has not shown up at all in the trigger-tagged
+# reject tally (main.py's REJECTED BY TRIGGER heartbeat line) - there is
+# currently no evidence either way, not evidence against a mismatch.
+CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED = env_bool(
+    "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", "False"
+)
+# 2026-08-16, code-audit finding, same initiative: MARKET_CHOPPY
+# (EFFICIENCY_RATIO_GATE_ENABLED above) requires the broader market to
+# read as "trending" - a real fit for the 6 trend/breakout-following
+# triggers, but CVD_DIVERGENCE/OI_DIVERGENCE/LIQUIDATION_SWEEP_CONFIRMED
+# are reversal/exhaustion signals, and reversal-at-a-range-extreme is a
+# legitimate setup INSIDE genuine chop, not despite it - this gate may be
+# rejecting exactly the setups those three are best suited to catch. When
+# True, those three specific triggers skip MARKET_CHOPPY; every other
+# trigger stays gated by it. Default OFF, same reasoning as the two
+# settings above - only ACCEPTS more candidates, needs real per-trigger
+# evidence first. As of this writing, none of these three triggers have
+# appeared ANYWHERE in the MARKET_CHOPPY trigger-tagged reject tally
+# (only the 6 trend-following triggers have) - meaning they are not
+# currently generating enough candidates to test this hypothesis at all,
+# not that the hypothesis has been checked and found lacking.
+MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED = env_bool(
+    "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", "False"
+)
 # Fifth entry trigger: price makes a new swing extreme (fractal swing
 # point, the same detector STRUCTURE_BREAK/LIQUIDITY_SWEEP already use)
 # that the CVD line does NOT confirm - classic order-flow divergence/

@@ -419,8 +419,18 @@ def evaluate(
         # already has it for free from the top of evaluate().
         efficiency_ratio = ltf_analysis.get("efficiency_ratio")
 
+        # config.MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED - see its
+        # config.py comment. Reversal/exhaustion triggers can be valid
+        # setups inside genuine chop, unlike the trend/breakout-following
+        # ones this gate was evidenced against.
+        chop_gate_applies = not (
+            config.MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED
+            and trigger in ("CVD_DIVERGENCE", "OI_DIVERGENCE", "LIQUIDATION_SWEEP_CONFIRMED")
+        )
+
         if (
-            config.EFFICIENCY_RATIO_GATE_ENABLED
+            chop_gate_applies
+            and config.EFFICIENCY_RATIO_GATE_ENABLED
             and efficiency_ratio is not None
             and efficiency_ratio < config.EFFICIENCY_RATIO_CHOP_THRESHOLD
         ):
@@ -549,6 +559,17 @@ def evaluate(
 
         min_cvd = config.SIGNAL_MIN_CVD_SCORE
 
+        # config.CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED - see its
+        # config.py comment. Only skips the threshold comparison just
+        # below, never the ORDER_FLOW_DATA_UNAVAILABLE/ORDER_FLOW_SCORE_
+        # UNAVAILABLE checks above (those are "is there any data at all",
+        # not a direction-agreement comparison, and apply the same
+        # regardless of trigger).
+        cvd_confirmation_applies = not (
+            config.CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED
+            and trigger == "CVD_DIVERGENCE"
+        )
+
         # Reason deliberately doesn't embed the raw score/imbalance value
         # (same for DEPTH_OPPOSING and QUOTE_VOLUME_TOO_LOW below) - a
         # continuous value baked into the reason string means every
@@ -557,11 +578,12 @@ def evaluate(
         # into one meaningful count. The per-symbol detail that used to
         # live in the number now lives in the tally's symbol sample
         # instead.
-        if side == "BUY" and cvd_score < min_cvd:
-            return _reject("CVD_NOT_CONFIRMED")
+        if cvd_confirmation_applies:
+            if side == "BUY" and cvd_score < min_cvd:
+                return _reject("CVD_NOT_CONFIRMED")
 
-        if side == "SELL" and cvd_score > -min_cvd:
-            return _reject("CVD_NOT_CONFIRMED")
+            if side == "SELL" and cvd_score > -min_cvd:
+                return _reject("CVD_NOT_CONFIRMED")
 
         depth_imbalance = None
 

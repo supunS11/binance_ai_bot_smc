@@ -393,6 +393,90 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result["reason"], "NOT_IN_OTE")
 
+    def test_market_choppy_gate_still_applies_to_structure_break_when_scoped(self):
+        # sweep_direction=None - _run()'s own default ("BULLISH") would
+        # otherwise also produce a LIQUIDITY_SWEEP candidate; harmless here
+        # (LIQUIDITY_SWEEP isn't in the exempt trigger set either) but kept
+        # off anyway to isolate STRUCTURE_BREAK cleanly, same convention as
+        # the OTE gate tests above.
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3), \
+             patch.object(config, "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertEqual(result["reason"], "MARKET_CHOPPY")
+
+    def test_market_choppy_gate_skipped_for_cvd_divergence_when_scoped(self):
+        # live_break disabled + sweep_direction=None so CVD_DIVERGENCE is
+        # the only candidate - otherwise STRUCTURE_BREAK/LIQUIDITY_SWEEP
+        # would also fire, and being higher-priority, would win and still
+        # get gated on MARKET_CHOPPY themselves.
+        analysis = dict(LTF_BULLISH_BREAK, live_break={"broken": False}, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=91.0,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
+
+    def test_market_choppy_gate_applies_to_every_trigger_by_default(self):
+        analysis = dict(LTF_BULLISH_BREAK, live_break={"broken": False}, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=91.0,
+            )
+
+        self.assertEqual(result["reason"], "MARKET_CHOPPY")
+
+    def test_cvd_confirmation_gate_still_applies_to_structure_break_when_scoped(self):
+        with patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15), \
+             patch.object(config, "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", True):
+            result = self._run(cvd={"available": True, "cvd_score": 0.05}, sweep_direction=None)
+
+        self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
+
+    def test_cvd_confirmation_gate_skipped_for_cvd_divergence_when_scoped(self):
+        # live_break disabled + sweep_direction=None so CVD_DIVERGENCE is
+        # the only candidate, same isolation as the MARKET_CHOPPY tests
+        # above.
+        analysis = dict(LTF_BULLISH_BREAK, live_break={"broken": False})
+
+        with patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=91.0,
+                cvd={"available": True, "cvd_score": 0.05},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
+
+    def test_cvd_confirmation_gate_applies_to_every_trigger_by_default(self):
+        analysis = dict(LTF_BULLISH_BREAK, live_break={"broken": False})
+
+        with patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=91.0,
+                cvd={"available": True, "cvd_score": 0.05},
+            )
+
+        self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
+
     def test_no_signal_without_order_block_or_fvg_when_required(self):
         analysis = dict(LTF_BULLISH_BREAK)
         analysis["fair_value_gaps"] = []
