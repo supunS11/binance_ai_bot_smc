@@ -357,14 +357,11 @@ def evaluate(
     if not candidates:
         return _reject("NO_LIVE_STRUCTURE_BREAK")
 
-    def _evaluate_direction(direction):
-        """Everything below this point in the original single-candidate
-        design (side resolution through the confluence roll-up) depends
-        only on `direction`/`side` - never on which trigger produced it,
-        confirmed by inspection before this refactor. So candidates that
-        share a direction always pass or fail identically, and this only
-        ever needs to run once per DISTINCT direction actually attempted
-        (see the caller below), not once per candidate. `structure_level`/
+    def _evaluate_direction(direction, trigger):
+        """Everything below this point depends only on `direction`/`side`
+        for every gate except NOT_IN_OTE (see config.OTE_GATE_STRUCTURE_
+        BREAK_ONLY_ENABLED) - which is why the caller now dedupes on
+        (direction, trigger), not direction alone. `structure_level`/
         `trigger_candle_open_time`/`signal_trigger` are left as None
         placeholders in the success dict - the caller overlays the
         winning candidate's real values afterward."""
@@ -437,7 +434,29 @@ def evaluate(
         if side == "SELL" and price_zone != "PREMIUM":
             return _reject(f"NOT_IN_PREMIUM price_zone={price_zone}")
 
-        if not market_structure.in_ote(zone, latest_price, direction):
+        # config.OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED - NOT_IN_OTE checks
+        # whether CURRENT PRICE sits within a Fibonacci retracement band
+        # of the OVERALL HTF range - the classic "break, then retrace to
+        # OTE" setup, a real fit for STRUCTURE_BREAK specifically. Every
+        # other trigger already anchors its own entry to a DIFFERENT, more
+        # specific zone that has no structural reason to also coincide
+        # with that band: OB_FVG_RETEST/ORDER_BLOCK_RETEST to the FVG/
+        # order block's own price range, LIQUIDITY_SWEEP/LIQUIDATION_
+        # SWEEP_CONFIRMED to wherever the swept pool sits, CVD_DIVERGENCE/
+        # OI_DIVERGENCE/CHOCH_RETEST to a swing point, EMA_PULLBACK to the
+        # EMA's location. Ships OFF (unlike this session's other gates -
+        # this one can only ever ACCEPT more, the opposite risk direction
+        # from HTF_TREND_FRESHNESS_ENABLED/EFFICIENCY_RATIO_GATE_ENABLED,
+        # so it needs real per-trigger outcome evidence before enabling
+        # live, not just the structural code-reading argument that
+        # motivated it - see journal_analysis.py once enough trades
+        # accumulate under it).
+        ote_required = (
+            not config.OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED
+            or trigger == "STRUCTURE_BREAK"
+        )
+
+        if ote_required and not market_structure.in_ote(zone, latest_price, direction):
             return _reject("NOT_IN_OTE")
 
         # How deep into the range this entry's retracement actually is,
@@ -680,23 +699,30 @@ def evaluate(
     # Selection: unchanged single-candidate path when
     # TRIGGER_QUALITY_RANKING_ENABLED is off (byte-identical to the old
     # if/elif chain - only ever attempts candidates[0], the same one the
-    # old code would have picked). When on, attempt every candidate's
-    # direction (deduped via pipeline_results - at most 2 distinct
-    # directions ever exist among up to 4 candidates, and at most ONE of
-    # them can ever pass: the HTF-bias gate and the premium/discount zone
-    # gate are each independently deterministic/exclusive per tick, so
-    # opposite-direction candidates can never both survive gating).
+    # old code would have picked). When on, attempt every candidate.
+    # Deduped via pipeline_results keyed on (direction, trigger), not
+    # direction alone - most gates still give every same-direction
+    # candidate an identical verdict (see config.OTE_GATE_STRUCTURE_BREAK_
+    # ONLY_ENABLED's comment for the one that no longer does), but once
+    # ANY gate can vary by trigger, two same-direction candidates can no
+    # longer be assumed interchangeable. Real cost: up to len(candidates)
+    # gate-cascade runs per tick instead of at most 2 - negligible at this
+    # bot's scale (candidate counts per tick are rarely more than 2-3, and
+    # nonlocal pools/sweep still only ever compute once regardless - see
+    # their own guard below).
     selected = candidates if config.TRIGGER_QUALITY_RANKING_ENABLED else [candidates[0]]
     pipeline_results = {}
     passing = []
 
     for candidate in selected:
         direction = candidate["direction"]
+        trigger = candidate["signal_trigger"]
+        key = (direction, trigger)
 
-        if direction not in pipeline_results:
-            pipeline_results[direction] = _evaluate_direction(direction)
+        if key not in pipeline_results:
+            pipeline_results[key] = _evaluate_direction(direction, trigger)
 
-        result = pipeline_results[direction]
+        result = pipeline_results[key]
 
         if result["signal"] is not None:
             passing.append((candidate, result))
@@ -706,7 +732,8 @@ def evaluate(
         # today's reject-tally behavior exactly in the (common)
         # single-candidate case, and avoids inventing a new composite
         # reject string that would fragment main.py's reject-reason tally.
-        return pipeline_results[selected[0]["direction"]]
+        first = selected[0]
+        return pipeline_results[(first["direction"], first["signal_trigger"])]
 
     if len(passing) == 1:
         winner_candidate, winner_result = passing[0]

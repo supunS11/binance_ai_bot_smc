@@ -430,8 +430,10 @@ STRUCTURE_BREAK_EXTRA_CONFIRM_TICKS = env_int("STRUCTURE_BREAK_EXTRA_CONFIRM_TIC
 # Instead of the fixed STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
 # CHOCH_RETEST priority order (first match wins, nothing else attempted),
 # gather every currently-qualifying trigger, gate each one for real (HTF
-# bias/zone/OTE/OB-FVG/CVD/depth - all direction-only, so this is at most
-# 2 pipeline runs per tick, not 4), and among the survivors prefer
+# bias/zone/OTE/OB-FVG/CVD/depth - most of these are direction-only, so in
+# practice this is usually 1-2 full pipeline runs per tick, not one per
+# candidate; see OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED below for the one
+# gate that can now vary by trigger too), and among the survivors prefer
 # whichever candidate's structure_level sits closest to current price
 # (least already-chased - same philosophy as MAX_ENTRY_EXTENSION_R)
 # INSTEAD of the fixed-priority default, but only when the edge is real -
@@ -452,6 +454,26 @@ TRIGGER_QUALITY_RANKING_ENABLED = env_bool("TRIGGER_QUALITY_RANKING_ENABLED", "F
 # (always take the best-scored candidate, no margin required) - not
 # recommended given the flapping risk above.
 TRIGGER_QUALITY_EDGE_ATR_MULTIPLE = env_float("TRIGGER_QUALITY_EDGE_ATR_MULTIPLE", 0.25)
+# 2026-08-16, code-audit finding (not yet backed by outcome data - see
+# below): NOT_IN_OTE requires current price to sit within a Fibonacci
+# retracement band of the OVERALL HTF range - the classic "structure
+# break, then retrace to OTE" setup. That's a real fit for STRUCTURE_BREAK
+# specifically, but every other trigger already anchors its own entry to
+# a DIFFERENT, more specific zone with no structural reason to also land
+# in that band (an FVG/order block's own price range, wherever a swept
+# liquidity pool sits, a swing point for the divergence triggers, the EMA
+# for EMA_PULLBACK) - forcing them through it as well can only ever reject
+# otherwise-valid setups those triggers already positioned correctly by
+# their own logic. When True, NOT_IN_OTE only applies to STRUCTURE_BREAK
+# candidates; every other trigger skips it. Default OFF, deliberately
+# unlike this session's other new gates: this one can only ever ACCEPT
+# more candidates, the opposite risk direction from HTF_TREND_FRESHNESS_
+# ENABLED/EFFICIENCY_RATIO_GATE_ENABLED, so - unlike those - it ships
+# inert until real per-trigger outcome evidence (journal_analysis.py,
+# once enough trades accumulate under it) confirms the code-reading
+# argument above actually holds, not just on the strength of that
+# argument alone.
+OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED = env_bool("OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", "False")
 # Fifth entry trigger: price makes a new swing extreme (fractal swing
 # point, the same detector STRUCTURE_BREAK/LIQUIDITY_SWEEP already use)
 # that the CVD line does NOT confirm - classic order-flow divergence/

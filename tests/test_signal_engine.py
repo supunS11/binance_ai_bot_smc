@@ -346,6 +346,44 @@ class SignalEngineTests(unittest.TestCase):
         result = self._run(ltf_close=99.0)
         self.assertEqual(result["reason"], "NOT_IN_OTE")
 
+    def test_ote_gate_still_applies_to_structure_break_when_scoped(self):
+        # sweep_direction=None - _run()'s own default ("BULLISH") would
+        # otherwise also produce a LIQUIDITY_SWEEP candidate, which (once
+        # the new flag is on) skips OTE and could win the ranking instead
+        # of STRUCTURE_BREAK, defeating this test's isolation.
+        with patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", True):
+            result = self._run(ltf_close=99.0, sweep_direction=None)
+
+        self.assertEqual(result["reason"], "NOT_IN_OTE")
+
+    def test_ote_gate_skipped_for_non_structure_break_triggers_when_scoped(self):
+        # live_break disabled so OB_FVG_RETEST is the only candidate -
+        # otherwise STRUCTURE_BREAK would also fire here and, being
+        # higher-priority, would win and still get gated on OTE itself.
+        analysis = dict(LTF_BULLISH_BREAK, live_break={"broken": False})
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", True):
+            result = self._run(
+                ltf_close=99.0, ltf_analysis=analysis,
+                fvg_retest_direction="BULLISH", fvg_retest_level=91.0,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+
+    def test_ote_gate_applies_to_every_trigger_by_default(self):
+        analysis = dict(LTF_BULLISH_BREAK, live_break={"broken": False})
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", False):
+            result = self._run(
+                ltf_close=99.0, ltf_analysis=analysis,
+                fvg_retest_direction="BULLISH", fvg_retest_level=91.0,
+            )
+
+        self.assertEqual(result["reason"], "NOT_IN_OTE")
+
     def test_no_signal_without_order_block_or_fvg_when_required(self):
         analysis = dict(LTF_BULLISH_BREAK)
         analysis["fair_value_gaps"] = []
@@ -1818,11 +1856,21 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(on_result["signal_trigger"], "LIQUIDITY_SWEEP")
         self.assertEqual(on_result["structure_level"], 89)
 
-    def test_direction_pipeline_runs_once_even_with_two_same_direction_candidates(self):
+    def test_direction_pipeline_runs_once_per_distinct_trigger_not_once_per_direction(self):
         # STRUCTURE_BREAK and LIQUIDITY_SWEEP both fire BULLISH here -
-        # ranking has real candidates to choose between, but since they
-        # share a direction the shared gate pipeline must still only run
-        # once (cached by direction), not once per candidate.
+        # ranking has real candidates to choose between. Since
+        # OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED (and any future gate like
+        # it) means two same-direction candidates can now get genuinely
+        # different verdicts, the shared gate pipeline is deduped on
+        # (direction, trigger), not direction alone - so it runs once per
+        # distinct trigger sharing this direction (2 here), not once
+        # total. find_liquidity_pools/detect_sweep stay at 1 regardless -
+        # both are cached via `nonlocal` at the top of evaluate() itself,
+        # computed once before any per-direction pipeline run happens.
+        # LIQUIDATION_SWEEP_CONFIRMED explicitly disabled - real .env has
+        # it on, and it would otherwise also fire BULLISH here (a real,
+        # currently-enabled 9th trigger, not part of what this test is
+        # isolating).
         with patch.object(market_structure, "structure_state", return_value=HTF_BULLISH), \
              patch.object(market_structure, "premium_discount_zone", return_value=ZONE), \
              patch.object(market_structure, "analyze", return_value=LTF_BULLISH_BREAK), \
@@ -1835,6 +1883,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "price_return", return_value=0.02), \
              patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 92}) as mock_detect, \
              patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
              patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True):
             result = signal_engine.evaluate(
                 "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
@@ -1845,7 +1894,7 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertEqual(mock_pools.call_count, 1)
         self.assertEqual(mock_detect.call_count, 1)
-        self.assertEqual(mock_ob.call_count, 1)
+        self.assertEqual(mock_ob.call_count, 2)
 
     def test_hysteresis_keeps_the_winner_stable_across_a_small_price_move(self):
         # Same two close-scoring candidates as the "sticks with default"
