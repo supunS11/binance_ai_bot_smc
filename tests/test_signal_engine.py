@@ -342,8 +342,17 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIn("NOT_IN_DISCOUNT", result["reason"])
 
     def test_no_signal_when_not_in_ote(self):
-        # 99 is still < midpoint(100) -> discount, but outside (90, 95) OTE
-        result = self._run(ltf_close=99.0)
+        # 99 is still < midpoint(100) -> discount, but outside (90, 95) OTE.
+        # OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED pinned False - this test
+        # predates that flag and is about the base OTE check applying at
+        # all, not trigger-scoping (see OteGateStructureBreakOnlyTests-
+        # style tests above for that) - without pinning it, whatever the
+        # real .env happens to have it set to would decide whether the
+        # default sweep_direction="BULLISH" candidate this fixture also
+        # produces skips OTE and wins instead of STRUCTURE_BREAK.
+        with patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", False):
+            result = self._run(ltf_close=99.0)
+
         self.assertEqual(result["reason"], "NOT_IN_OTE")
 
     def test_ote_gate_still_applies_to_structure_break_when_scoped(self):

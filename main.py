@@ -223,7 +223,22 @@ def _evaluate_symbol(
 
     if status != "OK":
         _tally_reject(reject_counts, reject_symbols, symbol, f"PLAN_REJECTED:{status}")
-        log_info(f"{symbol} signal found but plan rejected | REASON={status}")
+        # trigger/entry_price/structure_level (all already computed by
+        # signal_engine, zero extra cost) - real gap found live (2026-08-16):
+        # ENTRY_TOO_EXTENDED was ~99% of everything reaching this point for
+        # some symbols (GALAUSDT/PNUTUSDT, real-price-traced), repeating for
+        # an hour+ straight with nothing in the log to tell apart "price
+        # genuinely keeps running away" (a real, working reject - see
+        # HUMAUSDT's trace the same day) from "structure_level itself is
+        # stale/fixed while price just chops nearby" (a real bug candidate).
+        # structure_level logged here across repeated occurrences for the
+        # same symbol is the direct tell: constant -> stale reference;
+        # moving with price -> genuinely still-extending trend.
+        log_info(
+            f"{symbol} signal found but plan rejected | REASON={status} "
+            f"trigger={result.get('signal_trigger')} entry~={result.get('entry_price')} "
+            f"structure_level={result.get('structure_level')}"
+        )
         return
 
     # Carried through to the position so resolve_break_confirmations() can
