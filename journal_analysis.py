@@ -58,6 +58,14 @@ WIN_OUTCOMES = {
     # precedence over EARLY_BREAKEVEN_PROFIT_HIT when both flags could
     # apply (_breakeven_stop_outcome).
     "TRAILING_STOP_PROFIT_HIT", "SHADOW_TRAILING_STOP_PROFIT_HIT",
+    # config.PROFIT_PROTECTION_ENABLED - a genuine profit lock from the
+    # profit-protection trailing floor (position_manager._trail_profit_
+    # protection_if_improved), same "real win" category as TRAILING_STOP_
+    # PROFIT_HIT above - just a different trailing mechanism reaching the
+    # same outcome. Found missing 2026-08-17 via a real-log cross-check:
+    # 5 PROFIT_PROTECTION_HIT closes in one 40h window were silently
+    # falling to UNKNOWN instead of WIN.
+    "PROFIT_PROTECTION_HIT", "SHADOW_PROFIT_PROTECTION_HIT",
 }
 
 
@@ -83,23 +91,38 @@ def load_trades(journal_path=None):
     the whole time. Blank fields never overwrite an already-populated one
     on either side, since both rows only ever carry their own half of the
     data (signal-time fields are always blank on the outcome row, and
-    vice versa)."""
-    path = Path(journal_path) if journal_path else JOURNAL_PATH
+    vice versa).
 
-    if not path.exists():
+    Reads the target file AND every signal_journal.bak_*.csv sibling
+    (signal_journal.py's _ensure_header rotates the whole file to one of
+    these any time FIELDNAMES changes shape - confirmed live 2026-08-17:
+    ~30 rotations since Aug 8 left ~95% of real trade history sitting in
+    backup files this function never used to look at, so every evidence-
+    based read this project has ever done was drawn from whatever sliver
+    of data happened to land after the MOST RECENT rotation). trade_id
+    embeds a millisecond timestamp at creation (_make_trade_id), so rows
+    from different files can never collide - a plain merge across all of
+    them is safe. Each file is parsed with its OWN header (not the current
+    FIELDNAMES), so an old file missing a field that was added later just
+    leaves it blank for those rows, same as any other missing field."""
+    path = Path(journal_path) if journal_path else JOURNAL_PATH
+    matching_files = sorted(path.parent.glob(f"{path.stem}*.csv"))
+
+    if not matching_files:
         return {}
 
     trades = {}
 
-    with open(path, newline="") as handle:
-        for row in csv.DictReader(handle):
-            trade_id = row.get("trade_id")
+    for file_path in matching_files:
+        with open(file_path, newline="") as handle:
+            for row in csv.DictReader(handle):
+                trade_id = row.get("trade_id")
 
-            if not trade_id:
-                continue
+                if not trade_id:
+                    continue
 
-            existing = trades.setdefault(trade_id, {})
-            existing.update({k: v for k, v in row.items() if v != ""})
+                existing = trades.setdefault(trade_id, {})
+                existing.update({k: v for k, v in row.items() if v != ""})
 
     return trades
 

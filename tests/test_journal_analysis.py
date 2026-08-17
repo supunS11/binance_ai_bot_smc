@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,6 +68,19 @@ def _write_outcome_only(path, trade_id, symbol, outcome, mae_r_multiple=None, mf
         )
 
 
+def _write_csv(path, fieldnames, rows):
+    """Raw CSV writer (bypasses signal_journal entirely) - used only by
+    the cross-file-rotation tests below, which need files carrying
+    DIFFERENT, deliberately-old-shaped headers (exactly what a real
+    signal_journal.bak_*.csv rotation leaves behind), not the current
+    live schema _write_trade above always writes."""
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 class ClassifyTests(unittest.TestCase):
     def test_sl_hit_variants_are_loss(self):
         self.assertEqual(ja.classify("SL_HIT"), "LOSS")
@@ -92,6 +106,16 @@ class ClassifyTests(unittest.TestCase):
         # from the post-TP1 structure-based trailing stop.
         self.assertEqual(ja.classify("TRAILING_STOP_PROFIT_HIT"), "WIN")
         self.assertEqual(ja.classify("SHADOW_TRAILING_STOP_PROFIT_HIT"), "WIN")
+
+    def test_profit_protection_hit_is_win(self):
+        # config.PROFIT_PROTECTION_ENABLED - a real profit lock from the
+        # profit-protection trailing floor, same category as
+        # TRAILING_STOP_PROFIT_HIT above (a different trailing mechanism
+        # reaching the same outcome). Found missing 2026-08-17 via a real-
+        # log cross-check: 5 PROFIT_PROTECTION_HIT closes in one 40h
+        # window were silently falling to UNKNOWN instead of WIN.
+        self.assertEqual(ja.classify("PROFIT_PROTECTION_HIT"), "WIN")
+        self.assertEqual(ja.classify("SHADOW_PROFIT_PROTECTION_HIT"), "WIN")
 
     def test_unknown_outcome_is_unknown(self):
         self.assertEqual(ja.classify("SOMETHING_ELSE"), "UNKNOWN")
@@ -529,6 +553,86 @@ class NearZeroMfeLossBreakdownTests(unittest.TestCase):
         report = ja.summarize(self.journal_path)
 
         self.assertNotIn("Near-zero-MFE LOSS trades only", report)
+
+
+class LoadTradesAcrossRotatedFilesTests(unittest.TestCase):
+    """signal_journal.py's _ensure_header rotates the WHOLE file to a
+    signal_journal.bak_<timestamp>.csv sibling any time FIELDNAMES changes
+    shape while a journal already exists (see its docstring). Confirmed
+    live 2026-08-17: ~30 such rotations since Aug 8 left ~95% of real
+    trade history sitting in backup files load_trades() never used to
+    read - every evidence-based read this project has ever done was drawn
+    from whatever sliver of data happened to land after the MOST RECENT
+    rotation. load_trades() now globs the target file's stem alongside
+    every same-stem sibling in its directory."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.dir = Path(self._tmpdir.name)
+        self.current = self.dir / "signal_journal.csv"
+
+    def test_returns_empty_dict_when_no_matching_files_exist(self):
+        self.assertEqual(ja.load_trades(self.current), {})
+
+    def test_merges_a_rotated_backup_file_alongside_the_current_one(self):
+        # Signal-time-only trade B, written before a rotation (schema-
+        # mismatch backup), only ever lands in the .bak file - the current
+        # file only knows about trade A. Both should still surface.
+        _write_csv(self.current, signal_journal.FIELDNAMES, [
+            {"trade_id": "A_1", "symbol": "BTCUSDT", "side": "BUY", "outcome": ""},
+        ])
+        _write_csv(self.dir / "signal_journal.bak_111.csv", ["trade_id", "symbol", "side", "outcome"], [
+            {"trade_id": "B_1", "symbol": "ETHUSDT", "side": "SELL", "outcome": ""},
+        ])
+
+        trades = ja.load_trades(self.current)
+
+        self.assertEqual(set(trades.keys()), {"A_1", "B_1"})
+        self.assertEqual(trades["B_1"]["symbol"], "ETHUSDT")
+
+    def test_a_trades_signal_row_in_the_backup_and_outcome_row_in_the_current_file_still_merge(self):
+        # The exact real-world scenario found live 2026-08-17: a position
+        # opened before a rotation, closed after it - its two halves end
+        # up in different files and must still join into one trade.
+        _write_csv(self.dir / "signal_journal.bak_111.csv", ["trade_id", "symbol", "side", "outcome"], [
+            {"trade_id": "C_1", "symbol": "LTCUSDT", "side": "BUY", "outcome": ""},
+        ])
+        _write_csv(self.current, signal_journal.FIELDNAMES, [
+            {"trade_id": "C_1", "symbol": "", "side": "", "outcome": "SL_HIT", "mae_r_multiple": "0.5"},
+        ])
+
+        trades = ja.load_trades(self.current)
+
+        self.assertEqual(trades["C_1"]["symbol"], "LTCUSDT")
+        self.assertEqual(trades["C_1"]["side"], "BUY")
+        self.assertEqual(trades["C_1"]["outcome"], "SL_HIT")
+        self.assertEqual(trades["C_1"]["mae_r_multiple"], "0.5")
+
+    def test_blank_fields_never_overwrite_an_already_populated_one_across_files(self):
+        _write_csv(self.dir / "signal_journal.bak_111.csv", signal_journal.FIELDNAMES, [
+            {"trade_id": "D_1", "symbol": "BTCUSDT", "side": "BUY", "outcome": ""},
+        ])
+        _write_csv(self.current, signal_journal.FIELDNAMES, [
+            {"trade_id": "D_1", "symbol": "", "side": "", "outcome": "TP2_HIT"},
+        ])
+
+        trades = ja.load_trades(self.current)
+
+        self.assertEqual(trades["D_1"]["symbol"], "BTCUSDT")
+        self.assertEqual(trades["D_1"]["outcome"], "TP2_HIT")
+
+    def test_a_file_with_a_different_stem_is_not_picked_up(self):
+        _write_csv(self.current, signal_journal.FIELDNAMES, [
+            {"trade_id": "A_1", "symbol": "BTCUSDT", "side": "BUY", "outcome": ""},
+        ])
+        _write_csv(self.dir / "backtest_signal_journal_999.csv", signal_journal.FIELDNAMES, [
+            {"trade_id": "Z_1", "symbol": "SOLUSDT", "side": "BUY", "outcome": ""},
+        ])
+
+        trades = ja.load_trades(self.current)
+
+        self.assertEqual(set(trades.keys()), {"A_1"})
 
 
 if __name__ == "__main__":
